@@ -1,0 +1,122 @@
+#include <cmath>
+#include <exception>
+#include <iostream>
+#include <stdexcept>
+
+#include "glm/gtc/matrix_transform.hpp"
+
+#include "polyscope/curve_network.h"
+#include "polyscope/point_cloud.h"
+#include "polyscope/polyscope.h"
+#include "polyscope/simple_triangle_mesh.h"
+#include "polyscope/volume_mesh.h"
+
+#include "scene/polyscope_scene_snapshot.h"
+
+namespace {
+
+void require(bool condition, const char* message) {
+  if (!condition) throw std::runtime_error(message);
+}
+
+} // namespace
+
+int main() {
+  try {
+    polyscope::init("openGL_mock");
+    polyscope::removeEverything();
+
+    std::vector<glm::vec3> vertices{
+        {-1.0f, 0.0f, -1.0f},
+        {1.0f, 0.0f, -1.0f},
+        {0.0f, 0.0f, 1.0f},
+    };
+    std::vector<glm::uvec3> faces{glm::uvec3(0, 1, 2)};
+
+    auto* mesh = polyscope::registerSimpleTriangleMesh("snapshot_mesh", vertices, faces);
+    mesh->setSurfaceColor(glm::vec3(0.2f, 0.4f, 0.8f));
+    mesh->setTransform(glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f)));
+
+    PolyscopeSceneSnapshot snapshot = capturePolyscopeSceneSnapshot();
+    require(snapshot.supportedMeshCount == 1, "expected exactly one supported mesh");
+    require(snapshot.scene.meshes.size() == 1, "expected exactly one extracted RT mesh");
+    require(snapshot.hostStructure != nullptr, "expected a host structure");
+    require(snapshot.hostName == "snapshot_mesh", "unexpected host structure name");
+    require(snapshot.hostTypeName == polyscope::SimpleTriangleMesh::structureTypeName, "unexpected host structure type");
+
+    const auto& rtMesh = snapshot.scene.meshes.front();
+    require(rtMesh.vertices.size() == 3, "unexpected vertex count");
+    require(rtMesh.indices.size() == 1, "unexpected face count");
+    require(std::abs(rtMesh.baseColorFactor.x - 0.2f) < 1e-5f, "unexpected mesh albedo");
+    require(std::abs(rtMesh.transform[3][0] - 1.0f) < 1e-5f, "unexpected transform x");
+    require(std::abs(rtMesh.transform[3][1] - 2.0f) < 1e-5f, "unexpected transform y");
+    require(std::abs(rtMesh.transform[3][2] - 3.0f) < 1e-5f, "unexpected transform z");
+
+    mesh->setEnabled(false);
+    PolyscopeSceneSnapshot disabledSnapshot = capturePolyscopeSceneSnapshot();
+    require(disabledSnapshot.scene.meshes.empty(), "disabled meshes should not be exported");
+    require(disabledSnapshot.supportedMeshCount == 0, "disabled meshes should not count as supported");
+
+    polyscope::removeEverything();
+    auto* pointCloud = polyscope::registerPointCloud("snapshot_points",
+                                                     std::vector<glm::vec3>{{-0.5f, 0.0f, 0.0f}, {0.5f, 0.0f, 0.0f}});
+    pointCloud->setPointColor(glm::vec3(0.9f, 0.3f, 0.1f));
+    pointCloud->setPointRadius(0.15, false);
+
+    auto* curveNetwork = polyscope::registerCurveNetwork(
+        "snapshot_curve", std::vector<glm::vec3>{{0.0f, 0.0f, 0.0f}, {0.0f, 0.6f, 0.0f}, {0.5f, 1.0f, 0.0f}},
+        std::vector<std::array<uint32_t, 2>>{{0, 1}, {1, 2}});
+    curveNetwork->setColor(glm::vec3(0.1f, 0.7f, 0.4f));
+    curveNetwork->setRadius(0.08f, false);
+
+    std::vector<glm::vec3> volumeVertices{
+        {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f},
+        {-0.5f, -0.5f, 0.5f},  {0.5f, -0.5f, 0.5f},  {0.5f, 0.5f, 0.5f},  {-0.5f, 0.5f, 0.5f},
+    };
+    std::vector<std::array<uint32_t, 8>> volumeCells{{0, 1, 2, 3, 4, 5, 6, 7}};
+    auto* volumeMesh = polyscope::registerVolumeMesh("snapshot_volume", volumeVertices, volumeCells);
+    volumeMesh->setColor(glm::vec3(0.2f, 0.5f, 0.9f));
+
+    PolyscopeSceneSnapshot mixedSnapshot = capturePolyscopeSceneSnapshot();
+    require(mixedSnapshot.supportedMeshCount == 3, "expected point, curve, and volume structures to be exported");
+    require(mixedSnapshot.scene.meshes.size() == 2, "expected two generated RT meshes (point cloud + volume)");
+    require(mixedSnapshot.scene.curveNetworks.size() == 1, "expected one curve network");
+
+    bool foundPointCloud = false;
+    bool foundVolumeMesh = false;
+    for (const auto& rtMesh2 : mixedSnapshot.scene.meshes) {
+      if (rtMesh2.name == "snapshot_points") {
+        foundPointCloud = true;
+        require(!rtMesh2.vertices.empty() && !rtMesh2.indices.empty(), "point cloud should generate triangles");
+      }
+      if (rtMesh2.name == "snapshot_volume") {
+        foundVolumeMesh = true;
+        require(!rtMesh2.indices.empty(), "volume mesh should export its boundary triangles");
+      }
+    }
+    require(foundPointCloud, "point cloud export missing");
+    require(foundVolumeMesh, "volume mesh export missing");
+
+    const auto& curveNet = mixedSnapshot.scene.curveNetworks.front();
+    require(curveNet.name == "snapshot_curve", "curve network name mismatch");
+    require(!curveNet.primitives.empty(), "curve network should generate analytical primitives");
+    require(std::abs(curveNet.baseColor.x - 0.1f) < 1e-5f, "unexpected curve network color");
+
+    bool hasSpheres = false;
+    bool hasCylinders = false;
+    for (const auto& prim : curveNet.primitives) {
+      if (prim.type == rt::RTCurvePrimitiveType::Sphere) hasSpheres = true;
+      if (prim.type == rt::RTCurvePrimitiveType::Cylinder) hasCylinders = true;
+      require(prim.radius > 0.0f, "curve primitive should have positive radius");
+    }
+    require(hasSpheres, "curve network should contain sphere primitives for nodes");
+    require(hasCylinders, "curve network should contain cylinder primitives for edges");
+
+    polyscope::shutdown();
+    std::cout << "polyscope_scene_snapshot_test passed" << std::endl;
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "polyscope_scene_snapshot_test failed: " << e.what() << std::endl;
+    return 1;
+  }
+}

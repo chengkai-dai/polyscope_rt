@@ -1,0 +1,120 @@
+{
+  "asset": {
+    "version": "2.0"
+  },
+  "extensionsUsed": [
+    "KHR_lights_punctual"
+  ],
+  "extensions": {
+    "KHR_lights_punctual": {
+      "lights": [
+        {
+          "name": "test_point",
+          "type": "point",
+          "color": [
+            1.0,
+            0.95,
+            0.85
+          ],
+          "intensity": 25.0,
+          "range": 8.0
+        }
+      ]
+    }
+  },
+  "buffers": [
+    {
+      "uri": "light_emissive.bin",
+      "byteLength": 36
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 36
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "byteOffset": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3",
+      "min": [
+        -0.6,
+        -0.6,
+        0.0
+      ],
+      "max": [
+        0.6,
+        0.6,
+        0.0
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "emissive_material",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.2,
+          0.4,
+          0.9,
+          1.0
+        ],
+        "metallicFactor": 0.0,
+        "roughnessFactor": 1.0
+      },
+      "emissiveFactor": [
+        1.5,
+        0.4,
+        0.2
+      ],
+      "doubleSided": true
+    }
+  ],
+  "meshes": [
+    {
+      "name": "emissive_triangle",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0
+          },
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "mesh_node",
+      "mesh": 0
+    },
+    {
+      "name": "light_node",
+      "translation": [
+        0.0,
+        1.2,
+        1.5
+      ],
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 0
+        }
+      }
+    }
+  ],
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        1
+      ]
+    }
+  ],
+  "scene": 0
+}

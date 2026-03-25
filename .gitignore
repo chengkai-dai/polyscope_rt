@@ -1,0 +1,48 @@
+# ── OS / editor state ──
+.DS_Store
+**/.DS_Store
+Thumbs.db
+.cache/
+.polyscope.ini
+imgui.ini
+
+# ── IDE / editor config ──
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+*.swp
+*.swo
+*~
+
+# ── Local renders and logs ──
+render_*.png
+*.log
+
+# ── Build outputs ──
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+Makefile
+cmake_install.cmake
+
+# Metal shader build intermediates (in case they leak out of build/)
+*.air
+*.metallib
+
+# ── Cloned (non-submodule) third-party dependencies ──
+vk_toon_shader/
+
+# ── Downloadable sample assets ──
+tests/assets/BoxTextured/
+tests/assets/vk_toon_shader_robot/
+
+# ── Keep project-owned regression assets ──
+!tests/assets/golden/
+!tests/assets/golden/**
+!tests/assets/LightEmissive/
+!tests/assets/LightEmissive/**
