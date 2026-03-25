@@ -142,7 +142,7 @@ xcrun -sdk macosx --find metal   # verify
 git clone --recurse-submodules https://github.com/chengkai-dai/polyscope_rt.git
 cd polyscope_rt
 
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8
 ```
 
