@@ -18,6 +18,7 @@
 namespace gc  = geometrycentral;
 namespace gcs = geometrycentral::surface;
 namespace ps  = polyscope::rt;           // ← fallback to polyscope:: for non-RT
+// namespace ps  = polyscope;          
 
 
 static void registerGeodesicColorMap() {
@@ -172,6 +173,40 @@ int main(int argc, char** argv) {
           ->setMapRange({0.0f, static_cast<float>(maxDist)})
           ->setEnabled(true);
   psPoints->setPointRadius(0.0015f, /*isRelative=*/false);
+
+  // Compute face gradient of the geodesic distance field (= "geodesic flow")
+  // using the standard formula: ∇f = (1/2A) Σ_he s[he.vertex()] · (N × e_opp)
+  // where e_opp is the edge opposite to he.vertex() inside the face.
+  // Subsampled to every kVFStep-th face to keep tessellation manageable.
+  geometry->requireFaceNormals();
+  geometry->requireFaceAreas();
+
+  constexpr int kVFStep = 50;
+  std::vector<glm::vec3> faceGradVecs(mesh->nFaces(), glm::vec3(0.0f));
+
+  for (gcs::Face f : mesh->faces()) {
+    if (static_cast<int>(f.getIndex()) % kVFStep != 0) continue;
+
+    const gc::Vector3 N = geometry->faceNormals[f];
+    const double      A = geometry->faceAreas[f];
+    if (A < 1e-12) continue;
+
+    gc::Vector3 grad = gc::Vector3::zero();
+    for (gcs::Halfedge he : f.adjacentHalfedges()) {
+      // Edge opposite to he.vertex() runs from he.next().vertex() to he.next().next().vertex()
+      gc::Vector3 eOpp = geometry->inputVertexPositions[he.next().next().vertex()]
+                       - geometry->inputVertexPositions[he.next().vertex()];
+      grad += distToSource[he.vertex()] * gc::cross(N, eOpp);
+    }
+    grad /= (2.0 * A);
+    faceGradVecs[f.getIndex()] = {float(grad.x), float(grad.y), float(grad.z)};
+  }
+
+  auto* vfQty = psMesh->addFaceVectorQuantity("geodesic flow", faceGradVecs);
+  vfQty->setVectorColor({0.2f, 0.8f, 1.0f});
+  vfQty->setVectorRadius(0.0004, /*isRelative=*/false);
+  vfQty->setVectorLengthScale(0.015, /*isRelative=*/false);
+  vfQty->setEnabled(true);
 
   ps::show();
   return 0;

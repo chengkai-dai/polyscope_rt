@@ -9,6 +9,7 @@
 #include "polyscope/point_cloud.h"
 #include "polyscope/polyscope.h"
 #include "polyscope/simple_triangle_mesh.h"
+#include "polyscope/surface_mesh.h"
 #include "polyscope/volume_mesh.h"
 
 #include "scene/polyscope_scene_snapshot.h"
@@ -109,6 +110,47 @@ int main() {
     }
     require(hasSpheres, "curve network should contain sphere primitives for nodes");
     require(hasCylinders, "curve network should contain cylinder primitives for edges");
+
+    // -----------------------------------------------------------------------
+    // Vector field extraction tests
+    // -----------------------------------------------------------------------
+    polyscope::removeEverything();
+
+    // Register a tiny triangle mesh and add a vertex vector quantity.
+    std::vector<glm::vec3> triVerts{{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
+    std::vector<std::vector<uint32_t>> triFaces{{0, 1, 2}};
+    auto* smesh = polyscope::registerSurfaceMesh("vf_mesh", triVerts, triFaces);
+
+    std::vector<glm::vec3> vecs{{0.0f, 0.1f, 0.0f}, {0.0f, 0.2f, 0.0f}, {0.0f, 0.15f, 0.0f}};
+    auto* vfQty = smesh->addVertexVectorQuantity("vf", vecs);
+    vfQty->setEnabled(true);
+
+    PolyscopeSceneSnapshot vfSnapshot = capturePolyscopeSceneSnapshot();
+    require(!vfSnapshot.scene.vectorFields.empty(),
+            "enabled vertex vector quantity should produce an RTVectorField");
+
+    const rt::RTVectorField& vf = vfSnapshot.scene.vectorFields.front();
+    require(vf.name == "vf", "RTVectorField name should match quantity name");
+    require(vf.roots.size() == 3, "RTVectorField should have 3 roots (one per vertex)");
+    require(vf.directions.size() == 3, "RTVectorField should have 3 directions");
+    require(vf.radius > 0.0f, "RTVectorField radius should be positive");
+
+    // Disabling the quantity should remove it from the snapshot.
+    vfQty->setEnabled(false);
+    PolyscopeSceneSnapshot noVfSnapshot = capturePolyscopeSceneSnapshot();
+    require(noVfSnapshot.scene.vectorFields.empty(),
+            "disabled vector quantity should NOT produce an RTVectorField");
+
+    // Scene hash must change between enabled and disabled states.
+    require(vfSnapshot.scene.hash != noVfSnapshot.scene.hash,
+            "scene hash must differ when vector field is toggled on/off");
+
+    // Re-enable and change vector color — hash must change again.
+    vfQty->setEnabled(true);
+    vfQty->setVectorColor(glm::vec3(1.0f, 0.0f, 0.0f));
+    PolyscopeSceneSnapshot coloredVfSnapshot = capturePolyscopeSceneSnapshot();
+    require(coloredVfSnapshot.scene.hash != vfSnapshot.scene.hash,
+            "scene hash must change when vector field color changes");
 
     polyscope::shutdown();
     std::cout << "polyscope_scene_snapshot_test passed" << std::endl;

@@ -1079,11 +1079,12 @@ private:
     acc.texcoords.reserve(4096);
     acc.accelIndices.reserve(4096);
     acc.shaderTriangles.reserve(4096);
-    acc.materials.reserve(scene_.meshes.size() + scene_.curveNetworks.size());
+    acc.materials.reserve(scene_.meshes.size() + scene_.curveNetworks.size() + scene_.vectorFields.size());
 
     gatherMeshGpuData(acc);
-    gatherCurveGpuData(acc);    // also clears + fills pointPrimitives_ for sphere nodes
-    gatherPointBboxData(acc);   // appends point cloud spheres to pointPrimitives_
+    gatherVectorFieldGpuData(acc); // tessellates arrow cylinder+cone into triangle BLAS
+    gatherCurveGpuData(acc);       // also clears + fills pointPrimitives_ for sphere nodes
+    gatherPointBboxData(acc);      // appends point cloud spheres to pointPrimitives_
 
 
     // Insert a degenerate far-away triangle so the triangle BLAS is never empty,
@@ -1191,6 +1192,150 @@ private:
             simd_make_uint4(baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z, materialIndex);
         triangle.objectFlags = simd_make_uint4(meshObjectId, hasVertexNormals ? 1u : 0u, mesh.wireframe ? 1u : 0u, 0u);
         acc.shaderTriangles.push_back(triangle);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // gatherVectorFieldGpuData — CPU-tessellate each arrow (cylinder shaft +
+  // cone tip) and inject the resulting triangles into the same accumulator as
+  // mesh geometry.  Arrow proportions match Polyscope's shader constants:
+  //   tipLengthFrac = 0.2   (cone is 20% of total arrow length)
+  //   tipWidthFrac  = 0.6   (cone base radius = shaft radius / tipWidthFrac)
+  // ---------------------------------------------------------------------------
+  void gatherVectorFieldGpuData(SceneGpuAccumulator& acc) {
+    constexpr int   kSides        = 8;
+    constexpr float kTipLenFrac   = 0.2f;
+    constexpr float kTipRadMult   = 1.0f / 0.6f; // cone base ≈ 1.67× shaft radius
+
+    for (const rt::RTVectorField& vf : scene_.vectorFields) {
+      if (vf.roots.empty()) continue;
+
+      const uint32_t materialIndex = static_cast<uint32_t>(acc.materials.size());
+      const uint32_t objectId      = acc.nextObjectId++;
+
+      // One flat material per vector field (no textures).
+      MaterialShaderData mat{};
+      mat.baseColorFactor              = simd_make_float4(vf.color.r, vf.color.g, vf.color.b, 1.0f);
+      mat.baseColorTextureData         = simd_make_uint4(0u, 0u, 0u, 0u);
+      mat.metallicRoughnessNormal      = simd_make_float4(vf.metallic, vf.roughness, 1.0f, 0.0f);
+      mat.metallicRoughnessTextureData = simd_make_uint4(0u, 0u, 0u, 0u);
+      mat.emissiveFactor               = simd_make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+      mat.emissiveTextureData          = simd_make_uint4(0u, 0u, 0u, 0u);
+      mat.normalTextureData            = simd_make_uint4(0u, 0u, 0u, 0u);
+      mat.transmissionIor              = simd_make_float4(0.0f, 1.5f, 0.0f, 1.0f);
+      mat.wireframeEdgeData            = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      acc.materials.push_back(mat);
+
+      for (size_t ai = 0; ai < vf.roots.size(); ++ai) {
+        const glm::vec3& root = vf.roots[ai];
+        const glm::vec3& dir  = vf.directions[ai];
+
+        const float arrowLen = glm::length(dir);
+        if (arrowLen < 1e-7f) continue;
+
+        const glm::vec3 axis = dir / arrowLen;
+        const float shaftLen = arrowLen * (1.0f - kTipLenFrac);
+        const float tipLen   = arrowLen * kTipLenFrac;
+        const float shaftR   = vf.radius;
+        const float coneBaseR = shaftR * kTipRadMult;
+
+        // Build orthonormal tangent frame for axis.
+        glm::vec3 tang;
+        if (std::abs(axis.x) < 0.9f) tang = glm::normalize(glm::cross(axis, glm::vec3(1,0,0)));
+        else                          tang = glm::normalize(glm::cross(axis, glm::vec3(0,1,0)));
+        const glm::vec3 bitang = glm::normalize(glm::cross(axis, tang));
+
+        const glm::vec3 shaftEnd = root + axis * shaftLen;
+        const glm::vec3 tipEnd   = root + dir;
+
+        const uint32_t baseV = static_cast<uint32_t>(acc.positions.size());
+
+        // ---- Cylinder shaft ----
+        // Two rings: ring0 at root, ring1 at shaftEnd.
+        for (int side = 0; side < kSides; ++side) {
+          const float theta = static_cast<float>(side) / kSides * 6.2831853f;
+          const float c = std::cos(theta), s = std::sin(theta);
+          const glm::vec3 n = glm::normalize(tang * c + bitang * s);
+          const glm::vec3 r0 = root     + n * shaftR;
+          const glm::vec3 r1 = shaftEnd + n * shaftR;
+
+          acc.positions.push_back(simd_make_float4(r0.x, r0.y, r0.z, 1.0f));
+          acc.normals.push_back  (simd_make_float4(n.x,  n.y,  n.z,  0.0f));
+          acc.vertexColors.push_back(simd_make_float4(1,1,1,1));
+          acc.texcoords.push_back(simd_make_float2(0,0));
+
+          acc.positions.push_back(simd_make_float4(r1.x, r1.y, r1.z, 1.0f));
+          acc.normals.push_back  (simd_make_float4(n.x,  n.y,  n.z,  0.0f));
+          acc.vertexColors.push_back(simd_make_float4(1,1,1,1));
+          acc.texcoords.push_back(simd_make_float2(0,0));
+        }
+        // Two quads per side (each quad = 2 triangles).
+        for (int side = 0; side < kSides; ++side) {
+          const uint32_t a = baseV + static_cast<uint32_t>(side * 2);
+          const uint32_t b = baseV + static_cast<uint32_t>(side * 2 + 1);
+          const uint32_t c = baseV + static_cast<uint32_t>(((side + 1) % kSides) * 2);
+          const uint32_t d = baseV + static_cast<uint32_t>(((side + 1) % kSides) * 2 + 1);
+          const uint32_t m = materialIndex;
+          // tri 1: {a, c, b} so cross(c-a, b-a) points radially outward
+          TriangleShaderData t1{};
+          t1.indicesMaterial = simd_make_uint4(a, c, b, m);
+          t1.objectFlags     = simd_make_uint4(objectId, 1u, 0u, 0u); // 1u = has vertex normals
+          acc.shaderTriangles.push_back(t1);
+          acc.accelIndices.push_back({a, c, b});
+          // tri 2: {b, c, d} so cross(c-b, d-b) points radially outward
+          TriangleShaderData t2{};
+          t2.indicesMaterial = simd_make_uint4(b, c, d, m);
+          t2.objectFlags     = simd_make_uint4(objectId, 1u, 0u, 0u); // 1u = has vertex normals
+          acc.shaderTriangles.push_back(t2);
+          acc.accelIndices.push_back({b, c, d});
+        }
+
+        // ---- Cone tip ----
+        const uint32_t coneBase = static_cast<uint32_t>(acc.positions.size());
+        const float slopeAngle = std::atan2(coneBaseR, tipLen);
+        // Ring vertices at shaftEnd with outward-leaning normals.
+        for (int side = 0; side < kSides; ++side) {
+          const float theta = static_cast<float>(side) / kSides * 6.2831853f;
+          const float cs = std::cos(theta), sn = std::sin(theta);
+          const glm::vec3 radial  = tang * cs + bitang * sn;
+          const glm::vec3 rp = shaftEnd + radial * coneBaseR;
+          const glm::vec3 cn = glm::normalize(radial * std::cos(slopeAngle) +
+                                               axis   * std::sin(slopeAngle));
+          acc.positions.push_back(simd_make_float4(rp.x, rp.y, rp.z, 1.0f));
+          acc.normals.push_back  (simd_make_float4(cn.x, cn.y, cn.z, 0.0f));
+          acc.vertexColors.push_back(simd_make_float4(1,1,1,1));
+          acc.texcoords.push_back(simd_make_float2(0,0));
+        }
+        // Per-face apex vertices: one copy of tipEnd per face, each with the face's
+        // own outward-tilted normal (midpoint radial of that face + axis blend).
+        // Sharing a single apex vertex with normal=axis causes the path tracer to
+        // scatter bounce rays directly into the sky, washing the tip white.
+        const uint32_t coneApexBase = static_cast<uint32_t>(acc.positions.size());
+        for (int side = 0; side < kSides; ++side) {
+          const float thetaMid = (static_cast<float>(side) + 0.5f) / kSides * 6.2831853f;
+          const glm::vec3 radialMid = glm::normalize(tang * std::cos(thetaMid) +
+                                                     bitang * std::sin(thetaMid));
+          const glm::vec3 apexN = glm::normalize(radialMid * std::cos(slopeAngle) +
+                                                  axis      * std::sin(slopeAngle));
+          acc.positions.push_back(simd_make_float4(tipEnd.x, tipEnd.y, tipEnd.z, 1.0f));
+          acc.normals.push_back  (simd_make_float4(apexN.x, apexN.y, apexN.z, 0.0f));
+          acc.vertexColors.push_back(simd_make_float4(1,1,1,1));
+          acc.texcoords.push_back(simd_make_float2(0,0));
+        }
+
+        // Triangles: ring[i] → ring[i+1] → apex_face[i]
+        for (int side = 0; side < kSides; ++side) {
+          const uint32_t a     = coneBase     + static_cast<uint32_t>(side);
+          const uint32_t b     = coneBase     + static_cast<uint32_t>((side + 1) % kSides);
+          const uint32_t apexI = coneApexBase + static_cast<uint32_t>(side);
+          const uint32_t m = materialIndex;
+          TriangleShaderData t{};
+          t.indicesMaterial = simd_make_uint4(a, b, apexI, m);
+          t.objectFlags     = simd_make_uint4(objectId, 1u, 0u, 0u); // 1u = has vertex normals
+          acc.shaderTriangles.push_back(t);
+          acc.accelIndices.push_back({a, b, apexI});
+        }
       }
     }
   }

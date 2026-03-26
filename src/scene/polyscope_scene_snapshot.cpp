@@ -17,6 +17,8 @@
 #include "polyscope/surface_mesh.h"
 #include "polyscope/surface_color_quantity.h"
 #include "polyscope/surface_scalar_quantity.h"
+#include "polyscope/surface_vector_quantity.h"
+#include "polyscope/vector_quantity.h"
 #include "polyscope/volume_mesh.h"
 
 #include "scene/direct_rt_curve_registry.h"
@@ -332,6 +334,119 @@ void applyMaterialOverride(rt::RTMesh& mesh, const std::unordered_map<std::strin
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Vector-field helpers
+// ---------------------------------------------------------------------------
+
+// Convert one enabled VectorQuantity<T> to an RTVectorField.
+// dir = raw_vector * (lengthScale / lengthRange) — matches Polyscope's u_lengthMult.
+template <typename QT>
+rt::RTVectorField vectorQuantityToRT(polyscope::VectorQuantity<QT>& qty) {
+  rt::RTVectorField out;
+  out.color  = qty.getVectorColor();
+  out.radius = static_cast<float>(std::max(1e-5, qty.getVectorRadius()));
+
+  const double scale = qty.getVectorLengthScale();
+  const double range = qty.getVectorLengthRange();
+  const float  mult  = (range > 0.0) ? static_cast<float>(scale / range) : 1.0f;
+
+  qty.vectors.ensureHostBufferPopulated();
+  qty.vectorRoots.ensureHostBufferPopulated();
+
+  const size_t n = qty.vectors.data.size();
+  out.roots.reserve(n);
+  out.directions.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    out.roots.push_back(qty.vectorRoots.data[i]);
+    out.directions.push_back(qty.vectors.data[i] * mult);
+  }
+  return out;
+}
+
+// Convert one enabled TangentVectorQuantity<T> to an RTVectorField.
+// 3D direction = tangent.x * basisX + tangent.y * basisY, then scaled.
+template <typename QT>
+rt::RTVectorField tangentVectorQuantityToRT(polyscope::TangentVectorQuantity<QT>& qty) {
+  rt::RTVectorField out;
+  out.color  = qty.getVectorColor();
+  out.radius = static_cast<float>(std::max(1e-5, qty.getVectorRadius()));
+
+  const double scale = qty.getVectorLengthScale();
+  const double range = qty.getVectorLengthRange();
+  const float  mult  = (range > 0.0) ? static_cast<float>(scale / range) : 1.0f;
+
+  qty.tangentVectors.ensureHostBufferPopulated();
+  qty.tangentBasisX.ensureHostBufferPopulated();
+  qty.tangentBasisY.ensureHostBufferPopulated();
+  qty.vectorRoots.ensureHostBufferPopulated();
+
+  const size_t n = qty.tangentVectors.data.size();
+  out.roots.reserve(n);
+  out.directions.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    const glm::vec2& tv = qty.tangentVectors.data[i];
+    const glm::vec3 dir3 = tv.x * qty.tangentBasisX.data[i] + tv.y * qty.tangentBasisY.data[i];
+    out.roots.push_back(qty.vectorRoots.data[i]);
+    out.directions.push_back(dir3 * mult);
+  }
+  return out;
+}
+
+// Extract all enabled surface vector quantities from a SurfaceMesh.
+std::vector<rt::RTVectorField> makeRTVectorFields(polyscope::SurfaceMesh& mesh) {
+  std::vector<rt::RTVectorField> fields;
+  for (auto& [qName, qPtr] : mesh.quantities) {
+    if (!qPtr->isEnabled()) continue;
+
+    if (auto* q = dynamic_cast<polyscope::SurfaceVertexVectorQuantity*>(qPtr.get())) {
+      auto field = vectorQuantityToRT(*q);
+      field.name = qName;
+      if (!field.roots.empty()) fields.push_back(std::move(field));
+      continue;
+    }
+    if (auto* q = dynamic_cast<polyscope::SurfaceFaceVectorQuantity*>(qPtr.get())) {
+      auto field = vectorQuantityToRT(*q);
+      field.name = qName;
+      if (!field.roots.empty()) fields.push_back(std::move(field));
+      continue;
+    }
+    if (auto* q = dynamic_cast<polyscope::SurfaceFaceTangentVectorQuantity*>(qPtr.get())) {
+      auto field = tangentVectorQuantityToRT(*q);
+      field.name = qName;
+      if (!field.roots.empty()) fields.push_back(std::move(field));
+      continue;
+    }
+    if (auto* q = dynamic_cast<polyscope::SurfaceVertexTangentVectorQuantity*>(qPtr.get())) {
+      auto field = tangentVectorQuantityToRT(*q);
+      field.name = qName;
+      if (!field.roots.empty()) fields.push_back(std::move(field));
+      continue;
+    }
+    if (auto* q = dynamic_cast<polyscope::SurfaceOneFormTangentVectorQuantity*>(qPtr.get())) {
+      auto field = tangentVectorQuantityToRT(*q);
+      field.name = qName;
+      if (!field.roots.empty()) fields.push_back(std::move(field));
+      continue;
+    }
+  }
+  return fields;
+}
+
+void addVectorFieldsAndHash(PolyscopeSceneSnapshot& snapshot,
+                            std::vector<rt::RTVectorField>&& fields,
+                            std::string_view parentName) {
+  for (rt::RTVectorField& vf : fields) {
+    snapshot.supportedStructureCount++;
+    hashString(snapshot.scene.hash, parentName);
+    hashString(snapshot.scene.hash, vf.name);
+    hashBytes(snapshot.scene.hash, &vf.color[0], sizeof(float) * 3);
+    hashBytes(snapshot.scene.hash, &vf.radius, sizeof(float));
+    hashVector(snapshot.scene.hash, vf.roots);
+    hashVector(snapshot.scene.hash, vf.directions);
+    snapshot.scene.vectorFields.push_back(std::move(vf));
+  }
+}
+
 PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot() {
   static const std::unordered_map<std::string, rt::MaterialOverride> emptyOverrides;
   static const std::vector<rt::RTPunctualLight> emptyLights;
@@ -371,6 +486,10 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
           mesh.edgeWidth  = static_cast<float>(surfaceMesh->getEdgeWidth());
         }
         addMeshAndHash(snapshot, std::move(mesh), *structure);
+
+        // Also extract any enabled vector-field quantities attached to this mesh.
+        auto vfields = makeRTVectorFields(*surfaceMesh);
+        addVectorFieldsAndHash(snapshot, std::move(vfields), surfaceMesh->getName());
         continue;
       }
 

@@ -99,10 +99,24 @@ struct RTPointCloud {
   bool unlit = false;
 };
 
+// An enabled vector-field quantity from a SurfaceMesh.  Each arrow is a
+// (root, direction) pair where direction is already scaled to world-space
+// length (= raw_vector * lengthMult / lengthRange).
+struct RTVectorField {
+  std::string name;
+  std::vector<glm::vec3> roots;       // base positions (world space)
+  std::vector<glm::vec3> directions;  // scaled world-space vectors
+  glm::vec3 color{0.6f, 0.6f, 0.9f};
+  float radius   = 0.005f;            // shaft radius (world units)
+  float metallic = 0.0f;
+  float roughness = 0.4f;
+};
+
 struct RTScene {
   std::vector<RTMesh> meshes;
   std::vector<RTCurveNetwork> curveNetworks;
   std::vector<RTPointCloud> pointClouds;
+  std::vector<RTVectorField> vectorFields;
   std::vector<RTPunctualLight> lights;
   uint64_t hash = 0;
 };
