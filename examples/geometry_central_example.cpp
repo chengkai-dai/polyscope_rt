@@ -140,7 +140,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  polyscope::options::buildDefaultGuiPanels = false;
   ps::init();
   registerGeodesicColorMap();
 

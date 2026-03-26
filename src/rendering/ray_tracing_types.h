@@ -60,6 +60,10 @@ struct RTMesh {
   float opacity = polyscope::rt::builtinDefaultMaterial().opacity;
   bool doubleSided = false;
   bool unlit = polyscope::rt::builtinDefaultMaterial().unlit;
+
+  bool wireframe = false;
+  glm::vec3 edgeColor{0.0f, 0.0f, 0.0f};
+  float edgeWidth = 1.0f;
 };
 
 enum class RTCurvePrimitiveType : uint32_t {

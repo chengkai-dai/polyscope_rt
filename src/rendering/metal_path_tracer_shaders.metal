@@ -81,6 +81,7 @@ struct MaterialData {
   uint4 emissiveTextureData;
   uint4 normalTextureData;
   float4 transmissionIor;
+  float4 wireframeEdgeData;  // xyz = edge color, w = barycentric threshold (0 = disabled)
 };
 
 struct TextureData {
@@ -804,6 +805,23 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   out.opacity = clamp(material.transmissionIor.w, 0.0f, 1.0f);
   out.unlit = (material.transmissionIor.z > 0.5f);
   out.isInfinitePlane = false;
+
+  // Wireframe edge overlay: if enabled, override to edge color when close to any triangle edge.
+  if (tri.objectFlags.z != 0u) {
+    float edgeThreshold = material.wireframeEdgeData.w;
+    float minBary = min(w0, min(w1, w2));
+    if (minBary < edgeThreshold) {
+      float3 edgeCol = material.wireframeEdgeData.xyz;
+      out.baseColor   = edgeCol;
+      out.emissive    = edgeCol;
+      out.metallic    = 0.0f;
+      out.roughness   = 1.0f;
+      out.transmission = 0.0f;
+      out.opacity     = 1.0f;
+      out.unlit       = true;
+    }
+  }
+
   return out;
 }
 

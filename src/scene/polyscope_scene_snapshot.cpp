@@ -245,6 +245,9 @@ void addMeshAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTMesh&& mesh, polysco
   hashBytes(snapshot.scene.hash, &mesh.roughnessFactor, sizeof(float));
   hashBytes(snapshot.scene.hash, &mesh.emissiveFactor[0], sizeof(float) * 3);
   hashBytes(snapshot.scene.hash, &mesh.opacity, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.wireframe, sizeof(bool));
+  hashBytes(snapshot.scene.hash, &mesh.edgeColor[0], sizeof(float) * 3);
+  hashBytes(snapshot.scene.hash, &mesh.edgeWidth, sizeof(float));
 
   snapshot.scene.meshes.push_back(std::move(mesh));
 }
@@ -335,6 +338,11 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
         applyMaterialProfile(mesh, surfaceMesh->getMaterial());
         applyMaterialOverride(mesh, materialOverrides);
         if (mesh.vertices.empty() || mesh.indices.empty()) continue;
+        if (surfaceMesh->getEdgeWidth() > 0.0) {
+          mesh.wireframe  = true;
+          mesh.edgeColor  = surfaceMesh->getEdgeColor();
+          mesh.edgeWidth  = static_cast<float>(surfaceMesh->getEdgeWidth());
+        }
         addMeshAndHash(snapshot, std::move(mesh), *structure);
         continue;
       }

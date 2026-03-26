@@ -174,6 +174,7 @@ struct MaterialShaderData {
   simd_uint4 emissiveTextureData;
   simd_uint4 normalTextureData;
   simd_float4 transmissionIor;
+  simd_float4 wireframeEdgeData;  // xyz = edge color, w = barycentric threshold (0 = disabled)
 };
 
 struct TextureShaderData {
@@ -1048,6 +1049,9 @@ private:
       }
       material.transmissionIor =
           simd_make_float4(transmissionPacked, mesh.indexOfRefraction, mesh.unlit ? 1.0f : 0.0f, opacityPacked);
+      const float edgeBaryThreshold = mesh.wireframe ? (mesh.edgeWidth / 100.0f) : 0.0f;
+      material.wireframeEdgeData =
+          simd_make_float4(mesh.edgeColor.r, mesh.edgeColor.g, mesh.edgeColor.b, edgeBaryThreshold);
 
       if (mesh.hasBaseColorTexture && !mesh.baseColorTexture.pixels.empty()) {
         auto existing = textureLookup.find(mesh.baseColorTexture.cacheKey);
@@ -1161,7 +1165,7 @@ private:
         accelIndices.push_back({baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z});
         TriangleShaderData triangle{};
         triangle.indicesMaterial = simd_make_uint4(baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z, materialIndex);
-        triangle.objectFlags = simd_make_uint4(meshObjectId, hasVertexNormals ? 1u : 0u, 0u, 0u);
+        triangle.objectFlags = simd_make_uint4(meshObjectId, hasVertexNormals ? 1u : 0u, mesh.wireframe ? 1u : 0u, 0u);
         shaderTriangles.push_back(triangle);
       }
     }
