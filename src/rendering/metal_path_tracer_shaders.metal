@@ -1657,10 +1657,6 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
 
   float zNear = as_type<float>(atomic_load_explicit(&minmax[0], memory_order_relaxed));
   float zFar = as_type<float>(atomic_load_explicit(&minmax[1], memory_order_relaxed));
-  if (!(zFar > zNear)) {
-    output[pixelIndex(gid.x, gid.y, toon.width)] = float4(0.0f);
-    return;
-  }
 
   float3 A = sampleContourNormal(normals, objectIds, toon.width, toon.height, x - radius, y + radius);
   float3 B = sampleContourNormal(normals, objectIds, toon.width, toon.height, x, y + radius);
@@ -1677,24 +1673,29 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
   float3 gradX = k0 * C + k1 * E + k0 * H - k0 * A - k1 * D - k0 * F;
   float normalGradient = length(gradX) + length(gradY);
   float normalEdge = smoothstep(2.0f, 3.0f, normalGradient * toon.normalThreshold);
-
-  float Az = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y + radius, zNear, zFar);
-  float Bz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y + radius, zNear, zFar);
-  float Cz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y + radius, zNear, zFar);
-  float Dz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y, zNear, zFar);
-  float Ez = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y, zNear, zFar);
-  float Fz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y - radius, zNear, zFar);
-  float Gz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y - radius, zNear, zFar);
-  float Hz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y - radius, zNear, zFar);
-  float Xz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y, zNear, zFar);
-  float g = (fabs(Az + 2.0f * Bz + Cz - Fz - 2.0f * Gz - Hz) +
-             fabs(Cz + 2.0f * Ez + Hz - Az - 2.0f * Dz - Fz)) /
-            8.0f;
-  float l = (8.0f * Xz - Az - Bz - Cz - Dz - Ez - Fz - Gz - Hz) / 3.0f;
-  float depthEdge = smoothstep(0.03f, 0.1f, (l + g) * toon.depthThreshold);
-
   if (toon.enableNormalEdge == 0u) normalEdge = 0.0f;
-  if (toon.enableDepthEdge == 0u) depthEdge = 0.0f;
+
+  // Depth edge requires a valid scene depth range; skip when zNear == zFar
+  // (e.g. uniform-depth test scenes) — normal edge detection is unaffected.
+  float depthEdge = 0.0f;
+  if (zFar > zNear) {
+    float Az = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y + radius, zNear, zFar);
+    float Bz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y + radius, zNear, zFar);
+    float Cz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y + radius, zNear, zFar);
+    float Dz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y, zNear, zFar);
+    float Ez = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y, zNear, zFar);
+    float Fz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y - radius, zNear, zFar);
+    float Gz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y - radius, zNear, zFar);
+    float Hz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y - radius, zNear, zFar);
+    float Xz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y, zNear, zFar);
+    float g = (fabs(Az + 2.0f * Bz + Cz - Fz - 2.0f * Gz - Hz) +
+               fabs(Cz + 2.0f * Ez + Hz - Az - 2.0f * Dz - Fz)) /
+              8.0f;
+    float l = (8.0f * Xz - Az - Bz - Cz - Dz - Ez - Fz - Gz - Hz) / 3.0f;
+    depthEdge = smoothstep(0.03f, 0.1f, (l + g) * toon.depthThreshold);
+    if (toon.enableDepthEdge == 0u) depthEdge = 0.0f;
+  }
+
   float edge = clamp(normalEdge + depthEdge, 0.0f, 1.0f);
   output[pixelIndex(gid.x, gid.y, toon.width)] = float4(edge, edge, edge, 1.0f);
 }

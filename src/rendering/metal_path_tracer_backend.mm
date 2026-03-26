@@ -202,6 +202,79 @@ struct PointPrimitiveShaderData {
 
 simd_float4 makeFloat4(const glm::vec3& v, float w = 0.0f) { return simd_make_float4(v.x, v.y, v.z, w); }
 
+// ---------------------------------------------------------------------------
+// Scene-buffer accumulator — shared mutable state threaded through all gather*
+// helpers so that gatherMeshGpuData / gatherCurveGpuData / gatherPointBboxData
+// / gatherLightData can each append to the same flat arrays before a single
+// uploadSceneBuffers() call commits them to GPU.  Adding a new primitive type
+// (e.g. arrows) only requires one new gather* function.
+// ---------------------------------------------------------------------------
+struct SceneGpuAccumulator {
+  std::vector<simd_float4> positions;
+  std::vector<simd_float4> normals;
+  std::vector<simd_float4> vertexColors;
+  std::vector<simd_float2> texcoords;
+  std::vector<PackedTriangleIndices> accelIndices;
+  std::vector<TriangleShaderData> shaderTriangles;
+  std::vector<MaterialShaderData> materials;
+  std::vector<TextureShaderData> textures;
+  std::vector<simd_float4> texturePixels;
+  std::unordered_map<std::string, uint32_t> textureLookup;
+  std::unordered_map<std::string, uint32_t> objectIdLookup;
+  std::vector<PunctualLightShaderData> lights;
+  std::vector<CurvePrimitiveShaderData> curvePrimitives;
+  uint32_t nextObjectId = 1u;
+};
+
+uint32_t registerTextureInAcc(SceneGpuAccumulator& acc, const rt::RTTexture& tex) {
+  auto existing = acc.textureLookup.find(tex.cacheKey);
+  if (existing != acc.textureLookup.end()) return existing->second;
+  const uint32_t idx    = static_cast<uint32_t>(acc.textures.size());
+  const uint32_t offset = static_cast<uint32_t>(acc.texturePixels.size());
+  TextureShaderData td;
+  td.data = simd_make_uint4(offset, tex.width, tex.height, 0u);
+  acc.textures.push_back(td);
+  acc.textureLookup.emplace(tex.cacheKey, idx);
+  for (const glm::vec4& pixel : tex.pixels) {
+    acc.texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
+  }
+  return idx;
+}
+
+// Single source of truth for ToonShaderUniforms population — shared between
+// the main render path and MetalShaderTestHarness.  Templated so it accepts
+// both rt::RenderConfig and rt::MetalPostprocessTestInput, which share the
+// same field names (.toon, .renderMode, .lighting) but are distinct types.
+template <typename ConfigLike>
+ToonShaderUniforms makeToonShaderUniforms(const ConfigLike& config, uint32_t width, uint32_t height) {
+  ToonShaderUniforms toon;
+  toon.width = width;
+  toon.height = height;
+  toon.contourMethod = 2u;
+  toon.useFxaa = config.toon.useFxaa ? 1u : 0u;
+  toon.detailContourStrength =
+      config.toon.enabled && config.toon.enableDetailContour ? std::max(0.0f, config.toon.detailContourStrength) : 0.0f;
+  toon.depthThreshold = std::max(0.0f, config.toon.depthThreshold);
+  toon.normalThreshold = std::max(0.0f, config.toon.normalThreshold);
+  toon.edgeThickness = std::max(1.0f, config.toon.edgeThickness);
+  toon.exposure = config.renderMode == rt::RenderMode::Toon ? std::max(0.1f, config.toon.tonemapExposure)
+                                                            : std::max(0.1f, config.lighting.standardExposure);
+  toon.gamma = config.renderMode == rt::RenderMode::Toon ? std::max(0.1f, config.toon.tonemapGamma)
+                                                         : std::max(0.1f, config.lighting.standardGamma);
+  toon.saturation =
+      config.renderMode == rt::RenderMode::Toon ? 1.0f : std::max(0.0f, config.lighting.standardSaturation);
+  toon.objectContourStrength =
+      config.toon.enabled && config.toon.enableObjectContour ? std::max(0.0f, config.toon.objectContourStrength) : 0.0f;
+  toon.objectThreshold = std::max(0.0f, config.toon.objectThreshold);
+  toon.enableDetailContour = config.toon.enabled && config.toon.enableDetailContour ? 1u : 0u;
+  toon.enableObjectContour = config.toon.enabled && config.toon.enableObjectContour ? 1u : 0u;
+  toon.enableNormalEdge = config.toon.enableNormalEdge ? 1u : 0u;
+  toon.enableDepthEdge = config.toon.enableDepthEdge ? 1u : 0u;
+  toon.backgroundColor = makeFloat4(config.lighting.backgroundColor, 1.0f);
+  toon.edgeColor = makeFloat4(config.toon.edgeColor, 1.0f);
+  return toon;
+}
+
 std::string buildNSErrorMessage(NSError* error) {
   if (error == nil) return "unknown error";
 
@@ -507,19 +580,22 @@ public:
     hasPrevViewProj_ = false;
   }
 
+  // ---------------------------------------------------------------------------
+  // renderIteration — orchestrates uniform upload → path-trace → post-process.
+  // ---------------------------------------------------------------------------
   void renderIteration(const rt::RenderConfig& config) override {
     if (width_ == 0 || height_ == 0) {
       throw std::runtime_error("The render target size is invalid.");
     }
-    if (scene_.meshes.empty() && scene_.curveNetworks.empty() && scene_.pointClouds.empty()) {
-      throw std::runtime_error("No geometry was provided to the Metal ray tracer.");
-    }
+    // Allow an empty scene — buildSceneBuffers inserts dummy far-away geometry so the
+    // acceleration structure is always valid.  The ground plane, sky, and lights still render.
     if (pathTracePipelineState_ == nil || tonemapPipelineState_ == nil || objectContourPipelineState_ == nil ||
         detailContourPipelineState_ == nil || depthMinMaxPipelineState_ == nil || fxaaPipelineState_ == nil ||
         compositePipelineState_ == nil || meshCurveAcceleration_ == nil || pointAcceleration_ == nil) {
       throw std::runtime_error("The Metal ray tracing pipeline is not initialized.");
     }
 
+    // --- FrameUniforms ---------------------------------------------------------
     FrameUniforms frame;
     frame.renderMode = static_cast<uint32_t>(config.renderMode);
     frame.width = width_;
@@ -536,7 +612,8 @@ public:
     frame.toonBandCount = static_cast<uint32_t>(std::max(0, config.lighting.toonBandCount));
     frame.ambientFloor = std::max(0.0f, config.lighting.ambientFloor);
     frame.planeColorEnabled = makeFloat4(config.groundPlane.color, 1.0f);
-    frame.planeParams = simd_make_float4(config.groundPlane.height, config.groundPlane.metallic, config.groundPlane.roughness, config.groundPlane.reflectance);
+    frame.planeParams = simd_make_float4(config.groundPlane.height, config.groundPlane.metallic,
+                                         config.groundPlane.roughness, config.groundPlane.reflectance);
     if (config.enableMetalFX) {
       float jx = haltonSequence(frameIndex_ + 1, 2) - 0.5f;
       float jy = haltonSequence(frameIndex_ + 1, 3) - 0.5f;
@@ -550,109 +627,27 @@ public:
     }
     std::memcpy(frameBuffer_.contents, &frame, sizeof(FrameUniforms));
 
+    // --- LightingUniforms ------------------------------------------------------
     LightingUniforms lighting;
     lighting.backgroundColor = makeFloat4(config.lighting.backgroundColor, 1.0f);
     lighting.mainLightDirection = makeFloat4(glm::normalize(config.lighting.mainLightDirection), 0.0f);
     lighting.mainLightColorIntensity =
         makeFloat4(config.lighting.mainLightColor, std::max(config.lighting.mainLightIntensity, 0.0f));
-    lighting.environmentTintIntensity = makeFloat4(config.lighting.environmentTint, config.lighting.environmentIntensity);
-    lighting.areaLightCenterEnabled = makeFloat4(config.lighting.areaLightCenter, config.lighting.enableAreaLight ? 1.0f : 0.0f);
+    lighting.environmentTintIntensity =
+        makeFloat4(config.lighting.environmentTint, config.lighting.environmentIntensity);
+    lighting.areaLightCenterEnabled =
+        makeFloat4(config.lighting.areaLightCenter, config.lighting.enableAreaLight ? 1.0f : 0.0f);
     lighting.areaLightU = makeFloat4(config.lighting.areaLightU, 0.0f);
     lighting.areaLightV = makeFloat4(config.lighting.areaLightV, 0.0f);
     lighting.areaLightEmission = makeFloat4(config.lighting.areaLightEmission, 0.0f);
     std::memcpy(lightingBuffer_.contents, &lighting, sizeof(LightingUniforms));
 
-    @autoreleasepool {
-      id<MTLCommandBuffer> commandBuffer = [commandQueue_ commandBuffer];
-      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-
-      [encoder setComputePipelineState:pathTracePipelineState_];
-      [encoder setBuffer:positionBuffer_ offset:0 atIndex:0];
-      [encoder setBuffer:normalVertexBuffer_ offset:0 atIndex:1];
-      [encoder setBuffer:texcoordBuffer_ offset:0 atIndex:2];
-      [encoder setBuffer:triangleBuffer_ offset:0 atIndex:3];
-      [encoder setBuffer:materialBuffer_ offset:0 atIndex:4];
-      [encoder setBuffer:textureMetadataBuffer_ offset:0 atIndex:5];
-      [encoder setBuffer:texturePixelBuffer_ offset:0 atIndex:6];
-      [encoder setBuffer:lightBuffer_ offset:0 atIndex:7];
-      [encoder setBuffer:cameraBuffer_ offset:0 atIndex:8];
-      [encoder setBuffer:frameBuffer_ offset:0 atIndex:9];
-      [encoder setBuffer:lightingBuffer_ offset:0 atIndex:10];
-      [encoder setBuffer:accumulationBuffer_ offset:0 atIndex:11];
-      [encoder setBuffer:rawColorBuffer_ offset:0 atIndex:12];
-      [encoder setBuffer:depthBuffer_ offset:0 atIndex:13];
-      [encoder setBuffer:linearDepthBuffer_ offset:0 atIndex:14];
-      [encoder setBuffer:normalBuffer_ offset:0 atIndex:15];
-      [encoder setBuffer:objectIdBuffer_ offset:0 atIndex:16];
-      [encoder setAccelerationStructure:meshCurveAcceleration_ atBufferIndex:17];
-      [encoder useResource:meshCurveAcceleration_ usage:MTLResourceUsageRead];
-      [encoder setBuffer:diffuseAlbedoBuffer_ offset:0 atIndex:18];
-      [encoder setBuffer:specularAlbedoBuffer_ offset:0 atIndex:19];
-      [encoder setBuffer:roughnessAuxBuffer_ offset:0 atIndex:20];
-      [encoder setBuffer:motionVectorBuffer_ offset:0 atIndex:21];
-      [encoder setBuffer:vertexColorBuffer_ offset:0 atIndex:22];
-      [encoder setBuffer:curvePrimitiveBuffer_ offset:0 atIndex:23];
-      if (intersectionFunctionTable_ != nil) {
-        [encoder setIntersectionFunctionTable:intersectionFunctionTable_ atBufferIndex:24];
-      }
-      [encoder setBuffer:pointPrimitiveBuffer_ offset:0 atIndex:25];
-      [encoder setAccelerationStructure:pointAcceleration_ atBufferIndex:26];
-      if (triangleBLAS_ != nil && triangleBLAS_ != meshCurveAcceleration_) {
-        [encoder useResource:triangleBLAS_ usage:MTLResourceUsageRead];
-      }
-      if (curveBLAS_ != nil) {
-        [encoder useResource:curveBLAS_ usage:MTLResourceUsageRead];
-      }
-      if (curvePrimitiveBuffer_ != nil) {
-        [encoder useResource:curvePrimitiveBuffer_ usage:MTLResourceUsageRead];
-      }
-      if (pointAcceleration_ != nil) {
-        [encoder useResource:pointAcceleration_ usage:MTLResourceUsageRead];
-      }
-      if (pointBLAS_ != nil) {
-        [encoder useResource:pointBLAS_ usage:MTLResourceUsageRead];
-      }
-      if (pointPrimitiveBuffer_ != nil) {
-        [encoder useResource:pointPrimitiveBuffer_ usage:MTLResourceUsageRead];
-      }
-
-      dispatchThreads(encoder, pathTracePipelineState_);
-      [encoder endEncoding];
-
-      [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
-    }
-
-    ToonShaderUniforms toon;
-    toon.width = width_;
-    toon.height = height_;
-    toon.contourMethod = 2u;
-    toon.useFxaa = config.toon.useFxaa ? 1u : 0u;
-    toon.detailContourStrength =
-        config.toon.enabled && config.toon.enableDetailContour ? std::max(0.0f, config.toon.detailContourStrength) : 0.0f;
-    toon.depthThreshold = std::max(0.0f, config.toon.depthThreshold);
-    toon.normalThreshold = std::max(0.0f, config.toon.normalThreshold);
-    toon.edgeThickness = std::max(1.0f, config.toon.edgeThickness);
-    toon.exposure = config.renderMode == rt::RenderMode::Toon ? std::max(0.1f, config.toon.tonemapExposure)
-                                                                  : std::max(0.1f, config.lighting.standardExposure);
-    toon.gamma = config.renderMode == rt::RenderMode::Toon ? std::max(0.1f, config.toon.tonemapGamma)
-                                                               : std::max(0.1f, config.lighting.standardGamma);
-    toon.saturation =
-        config.renderMode == rt::RenderMode::Toon ? 1.0f : std::max(0.0f, config.lighting.standardSaturation);
-    toon.objectContourStrength =
-        config.toon.enabled && config.toon.enableObjectContour ? std::max(0.0f, config.toon.objectContourStrength) : 0.0f;
-    toon.objectThreshold = std::max(0.0f, config.toon.objectThreshold);
-    toon.enableDetailContour = config.toon.enabled && config.toon.enableDetailContour ? 1u : 0u;
-    toon.enableObjectContour = config.toon.enabled && config.toon.enableObjectContour ? 1u : 0u;
-    toon.enableNormalEdge = config.toon.enableNormalEdge ? 1u : 0u;
-    toon.enableDepthEdge = config.toon.enableDepthEdge ? 1u : 0u;
-    toon.backgroundColor = makeFloat4(config.lighting.backgroundColor, 1.0f);
-    toon.edgeColor = makeFloat4(config.toon.edgeColor, 1.0f);
+    // --- ToonShaderUniforms ----------------------------------------------------
+    ToonShaderUniforms toon = makeToonShaderUniforms(config, width_, height_);
     std::memcpy(toonBuffer_.contents, &toon, sizeof(ToonShaderUniforms));
 
-    bool needContours = config.toon.enabled &&
-                        (config.toon.enableDetailContour || config.toon.enableObjectContour);
-
+    bool needContours =
+        config.toon.enabled && (config.toon.enableDetailContour || config.toon.enableObjectContour);
     if (needContours) {
       uint32_t init[2];
       float big = 10000.0f;
@@ -661,197 +656,20 @@ public:
       std::memcpy(depthMinMaxBuffer_.contents, init, sizeof(init));
     }
 
+    // --- Pass 1: path-trace ----------------------------------------------------
     @autoreleasepool {
-      id<MTLCommandBuffer> commandBuffer = [commandQueue_ commandBuffer];
+      id<MTLCommandBuffer> cmdBuf = [commandQueue_ commandBuffer];
+      encodePathTracePass(cmdBuf);
+      [cmdBuf commit];
+      [cmdBuf waitUntilCompleted];
+    }
 
-      id<MTLComputeCommandEncoder> tonemapEncoder = [commandBuffer computeCommandEncoder];
-      [tonemapEncoder setComputePipelineState:tonemapPipelineState_];
-      [tonemapEncoder setBuffer:rawColorBuffer_ offset:0 atIndex:0];
-      [tonemapEncoder setBuffer:toonBuffer_ offset:0 atIndex:1];
-      [tonemapEncoder setBuffer:tonemappedBuffer_ offset:0 atIndex:2];
-      dispatchThreads(tonemapEncoder, tonemapPipelineState_);
-      [tonemapEncoder endEncoding];
-
-      if (needContours) {
-      id<MTLComputeCommandEncoder> depthMinMaxEncoder = [commandBuffer computeCommandEncoder];
-      [depthMinMaxEncoder setComputePipelineState:depthMinMaxPipelineState_];
-      [depthMinMaxEncoder setBuffer:linearDepthBuffer_ offset:0 atIndex:0];
-      [depthMinMaxEncoder setBuffer:depthMinMaxBuffer_ offset:0 atIndex:1];
-      [depthMinMaxEncoder setBuffer:toonBuffer_ offset:0 atIndex:2];
-      dispatchThreads(depthMinMaxEncoder, depthMinMaxPipelineState_);
-      [depthMinMaxEncoder endEncoding];
-
-      id<MTLComputeCommandEncoder> detailEncoder = [commandBuffer computeCommandEncoder];
-      [detailEncoder setComputePipelineState:detailContourPipelineState_];
-      [detailEncoder setBuffer:linearDepthBuffer_ offset:0 atIndex:0];
-      [detailEncoder setBuffer:normalBuffer_ offset:0 atIndex:1];
-      [detailEncoder setBuffer:objectIdBuffer_ offset:0 atIndex:2];
-      [detailEncoder setBuffer:toonBuffer_ offset:0 atIndex:3];
-      [detailEncoder setBuffer:depthMinMaxBuffer_ offset:0 atIndex:4];
-      [detailEncoder setBuffer:detailContourBuffer_ offset:0 atIndex:5];
-      dispatchThreads(detailEncoder, detailContourPipelineState_);
-      [detailEncoder endEncoding];
-
-      id<MTLComputeCommandEncoder> objectEncoder = [commandBuffer computeCommandEncoder];
-      [objectEncoder setComputePipelineState:objectContourPipelineState_];
-      [objectEncoder setBuffer:objectIdBuffer_ offset:0 atIndex:0];
-      [objectEncoder setBuffer:toonBuffer_ offset:0 atIndex:1];
-      [objectEncoder setBuffer:objectContourBuffer_ offset:0 atIndex:2];
-      dispatchThreads(objectEncoder, objectContourPipelineState_);
-      [objectEncoder endEncoding];
-      } // needContours
-
-      if (needContours) {
-        id<MTLBuffer> detailInput = detailContourBuffer_;
-        id<MTLBuffer> objectInput = objectContourBuffer_;
-        if (config.toon.useFxaa) {
-          id<MTLComputeCommandEncoder> detailFxaaEncoder = [commandBuffer computeCommandEncoder];
-          [detailFxaaEncoder setComputePipelineState:fxaaPipelineState_];
-          [detailFxaaEncoder setBuffer:detailContourBuffer_ offset:0 atIndex:0];
-          [detailFxaaEncoder setBuffer:toonBuffer_ offset:0 atIndex:1];
-          [detailFxaaEncoder setBuffer:detailContourFxaaBuffer_ offset:0 atIndex:2];
-          dispatchThreads(detailFxaaEncoder, fxaaPipelineState_);
-          [detailFxaaEncoder endEncoding];
-
-          id<MTLComputeCommandEncoder> objectFxaaEncoder = [commandBuffer computeCommandEncoder];
-          [objectFxaaEncoder setComputePipelineState:fxaaPipelineState_];
-          [objectFxaaEncoder setBuffer:objectContourBuffer_ offset:0 atIndex:0];
-          [objectFxaaEncoder setBuffer:toonBuffer_ offset:0 atIndex:1];
-          [objectFxaaEncoder setBuffer:objectContourFxaaBuffer_ offset:0 atIndex:2];
-          dispatchThreads(objectFxaaEncoder, fxaaPipelineState_);
-          [objectFxaaEncoder endEncoding];
-
-          detailInput = detailContourFxaaBuffer_;
-          objectInput = objectContourFxaaBuffer_;
-        }
-
-        id<MTLComputeCommandEncoder> compositeEncoder = [commandBuffer computeCommandEncoder];
-        [compositeEncoder setComputePipelineState:compositePipelineState_];
-        [compositeEncoder setBuffer:tonemappedBuffer_ offset:0 atIndex:0];
-        [compositeEncoder setBuffer:detailInput offset:0 atIndex:1];
-        [compositeEncoder setBuffer:objectInput offset:0 atIndex:2];
-        [compositeEncoder setBuffer:toonBuffer_ offset:0 atIndex:3];
-        [compositeEncoder setBuffer:outputBuffer_ offset:0 atIndex:4];
-        dispatchThreads(compositeEncoder, compositePipelineState_);
-        [compositeEncoder endEncoding];
-      } else {
-        // Standard mode: tonemap output is final, copy to outputBuffer
-        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-        [blit copyFromBuffer:tonemappedBuffer_ sourceOffset:0
-                    toBuffer:outputBuffer_ destinationOffset:0
-                        size:tonemappedBuffer_.length];
-        [blit endEncoding];
-      }
-
-      if (config.enableMetalFX && config.metalFXOutputWidth > 0 && config.metalFXOutputHeight > 0 &&
-          bufferToTexturePipelineState_ != nil && textureToBufferPipelineState_ != nil) {
-        ensureMetalFXResources(config.metalFXOutputWidth, config.metalFXOutputHeight);
-
-        if (metalFXDenoisedScaler_ != nil) {
-          auto encodeBufferToHalf4Texture = [&](id<MTLBuffer> buf, id<MTLTexture> tex) {
-            id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
-            [enc setComputePipelineState:bufferToTexturePipelineState_];
-            [enc setBuffer:buf offset:0 atIndex:0];
-            [enc setTexture:tex atIndex:0];
-            dispatchThreads(enc, bufferToTexturePipelineState_);
-            [enc endEncoding];
-          };
-
-          // Raw HDR color → RGBA16Float
-          encodeBufferToHalf4Texture(rawColorBuffer_, metalFXInputTexture_);
-          // Normals → RGBA16Float
-          encodeBufferToHalf4Texture(normalBuffer_, metalFXNormalTexture_);
-          // Diffuse albedo → RGBA16Float
-          encodeBufferToHalf4Texture(diffuseAlbedoBuffer_, metalFXDiffuseAlbedoTexture_);
-          // Specular albedo → RGBA16Float
-          encodeBufferToHalf4Texture(specularAlbedoBuffer_, metalFXSpecularAlbedoTexture_);
-
-          // Depth → R32Float
-          if (depthToTexturePipelineState_ != nil) {
-            id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
-            [enc setComputePipelineState:depthToTexturePipelineState_];
-            [enc setBuffer:depthBuffer_ offset:0 atIndex:0];
-            [enc setTexture:metalFXDepthTexture_ atIndex:0];
-            dispatchThreads(enc, depthToTexturePipelineState_);
-            [enc endEncoding];
-          }
-          // Motion vectors → RG16Float
-          if (motionToTexturePipelineState_ != nil) {
-            id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
-            [enc setComputePipelineState:motionToTexturePipelineState_];
-            [enc setBuffer:motionVectorBuffer_ offset:0 atIndex:0];
-            [enc setTexture:metalFXMotionTexture_ atIndex:0];
-            dispatchThreads(enc, motionToTexturePipelineState_);
-            [enc endEncoding];
-          }
-          // Roughness → R16Float
-          if (roughnessToTexturePipelineState_ != nil) {
-            id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
-            [enc setComputePipelineState:roughnessToTexturePipelineState_];
-            [enc setBuffer:roughnessAuxBuffer_ offset:0 atIndex:0];
-            [enc setTexture:metalFXRoughnessTexture_ atIndex:0];
-            dispatchThreads(enc, roughnessToTexturePipelineState_);
-            [enc endEncoding];
-          }
-
-          CameraUniforms* cam = static_cast<CameraUniforms*>(cameraBuffer_.contents);
-
-          metalFXDenoisedScaler_.colorTexture = metalFXInputTexture_;
-          metalFXDenoisedScaler_.depthTexture = metalFXDepthTexture_;
-          metalFXDenoisedScaler_.motionTexture = metalFXMotionTexture_;
-          metalFXDenoisedScaler_.normalTexture = metalFXNormalTexture_;
-          metalFXDenoisedScaler_.diffuseAlbedoTexture = metalFXDiffuseAlbedoTexture_;
-          metalFXDenoisedScaler_.specularAlbedoTexture = metalFXSpecularAlbedoTexture_;
-          metalFXDenoisedScaler_.roughnessTexture = metalFXRoughnessTexture_;
-          metalFXDenoisedScaler_.outputTexture = metalFXOutputTexture_;
-          metalFXDenoisedScaler_.jitterOffsetX = frame.jitterOffset.x;
-          metalFXDenoisedScaler_.jitterOffsetY = frame.jitterOffset.y;
-          metalFXDenoisedScaler_.shouldResetHistory = !hasPrevViewProj_;
-          metalFXDenoisedScaler_.worldToViewMatrix = cam->viewMatrix;
-          metalFXDenoisedScaler_.viewToClipMatrix = cam->projectionMatrix;
-          [metalFXDenoisedScaler_ encodeToCommandBuffer:commandBuffer];
-
-          // Denoised HDR output → buffer
-          {
-            id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
-            [enc setComputePipelineState:textureToBufferPipelineState_];
-            [enc setTexture:metalFXOutputTexture_ atIndex:0];
-            [enc setBuffer:metalFXOutputBuffer_ offset:0 atIndex:0];
-            ::dispatchThreads(enc, textureToBufferPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
-            [enc endEncoding];
-          }
-
-          // GPU tonemap at upscaled resolution
-          {
-            ToonShaderUniforms mfxToon{};
-            mfxToon.width = metalFXOutputWidth_;
-            mfxToon.height = metalFXOutputHeight_;
-            mfxToon.exposure = config.renderMode == rt::RenderMode::Toon
-                                   ? std::max(0.1f, config.toon.tonemapExposure)
-                                   : std::max(0.1f, config.lighting.standardExposure);
-            mfxToon.gamma = config.renderMode == rt::RenderMode::Toon
-                                ? std::max(0.1f, config.toon.tonemapGamma)
-                                : std::max(0.1f, config.lighting.standardGamma);
-            mfxToon.saturation = config.renderMode == rt::RenderMode::Toon
-                                     ? 1.0f
-                                     : std::max(0.0f, config.lighting.standardSaturation);
-            std::memcpy(metalFXToonBuffer_.contents, &mfxToon, sizeof(ToonShaderUniforms));
-
-            id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
-            [enc setComputePipelineState:tonemapPipelineState_];
-            [enc setBuffer:metalFXOutputBuffer_ offset:0 atIndex:0];
-            [enc setBuffer:metalFXToonBuffer_ offset:0 atIndex:1];
-            [enc setBuffer:metalFXTonemappedBuffer_ offset:0 atIndex:2];
-            ::dispatchThreads(enc, tonemapPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
-            [enc endEncoding];
-          }
-        }
-      } else if (lastEnableMetalFX_) {
-        teardownMetalFXResources();
-      }
-
-      [commandBuffer commit];
-      lastCommandBuffer_ = commandBuffer;
+    // --- Pass 2: post-process (tonemap / contours / MetalFX) -------------------
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuf = [commandQueue_ commandBuffer];
+      encodePostProcessPass(cmdBuf, config, needContours, frame.jitterOffset);
+      [cmdBuf commit];
+      lastCommandBuffer_ = cmdBuf;
     }
 
     latestBuffer_.accumulatedSamples += frame.samplesPerIteration;
@@ -862,6 +680,232 @@ public:
     CameraUniforms* cam = static_cast<CameraUniforms*>(cameraBuffer_.contents);
     prevViewProj_ = simd_mul(cam->projectionMatrix, cam->viewMatrix);
     hasPrevViewProj_ = true;
+  }
+
+  // Encodes the ray-tracing compute dispatch onto cmdBuf (no commit).
+  void encodePathTracePass(id<MTLCommandBuffer> cmdBuf) {
+    id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+    [encoder setComputePipelineState:pathTracePipelineState_];
+    [encoder setBuffer:positionBuffer_         offset:0 atIndex:0];
+    [encoder setBuffer:normalVertexBuffer_     offset:0 atIndex:1];
+    [encoder setBuffer:texcoordBuffer_         offset:0 atIndex:2];
+    [encoder setBuffer:triangleBuffer_         offset:0 atIndex:3];
+    [encoder setBuffer:materialBuffer_         offset:0 atIndex:4];
+    [encoder setBuffer:textureMetadataBuffer_  offset:0 atIndex:5];
+    [encoder setBuffer:texturePixelBuffer_     offset:0 atIndex:6];
+    [encoder setBuffer:lightBuffer_            offset:0 atIndex:7];
+    [encoder setBuffer:cameraBuffer_           offset:0 atIndex:8];
+    [encoder setBuffer:frameBuffer_            offset:0 atIndex:9];
+    [encoder setBuffer:lightingBuffer_         offset:0 atIndex:10];
+    [encoder setBuffer:accumulationBuffer_     offset:0 atIndex:11];
+    [encoder setBuffer:rawColorBuffer_         offset:0 atIndex:12];
+    [encoder setBuffer:depthBuffer_            offset:0 atIndex:13];
+    [encoder setBuffer:linearDepthBuffer_      offset:0 atIndex:14];
+    [encoder setBuffer:normalBuffer_           offset:0 atIndex:15];
+    [encoder setBuffer:objectIdBuffer_         offset:0 atIndex:16];
+    [encoder setAccelerationStructure:meshCurveAcceleration_ atBufferIndex:17];
+    [encoder useResource:meshCurveAcceleration_ usage:MTLResourceUsageRead];
+    [encoder setBuffer:diffuseAlbedoBuffer_    offset:0 atIndex:18];
+    [encoder setBuffer:specularAlbedoBuffer_   offset:0 atIndex:19];
+    [encoder setBuffer:roughnessAuxBuffer_     offset:0 atIndex:20];
+    [encoder setBuffer:motionVectorBuffer_     offset:0 atIndex:21];
+    [encoder setBuffer:vertexColorBuffer_      offset:0 atIndex:22];
+    [encoder setBuffer:curvePrimitiveBuffer_   offset:0 atIndex:23];
+    if (intersectionFunctionTable_ != nil) {
+      [encoder setIntersectionFunctionTable:intersectionFunctionTable_ atBufferIndex:24];
+    }
+    [encoder setBuffer:pointPrimitiveBuffer_   offset:0 atIndex:25];
+    [encoder setAccelerationStructure:pointAcceleration_ atBufferIndex:26];
+    if (triangleBLAS_ != nil && triangleBLAS_ != meshCurveAcceleration_) {
+      [encoder useResource:triangleBLAS_ usage:MTLResourceUsageRead];
+    }
+    if (curveBLAS_ != nil)              [encoder useResource:curveBLAS_              usage:MTLResourceUsageRead];
+    if (curvePrimitiveBuffer_ != nil)   [encoder useResource:curvePrimitiveBuffer_   usage:MTLResourceUsageRead];
+    if (pointAcceleration_ != nil)      [encoder useResource:pointAcceleration_      usage:MTLResourceUsageRead];
+    if (pointBLAS_ != nil)              [encoder useResource:pointBLAS_              usage:MTLResourceUsageRead];
+    if (pointPrimitiveBuffer_ != nil)   [encoder useResource:pointPrimitiveBuffer_   usage:MTLResourceUsageRead];
+    dispatchThreads(encoder, pathTracePipelineState_);
+    [encoder endEncoding];
+  }
+
+  // Encodes tonemap, optional contour passes, and optional MetalFX onto cmdBuf.
+  // cmdBuf must not yet be committed; the caller commits it after this returns.
+  void encodePostProcessPass(id<MTLCommandBuffer> cmdBuf, const rt::RenderConfig& config,
+                             bool needContours, simd_float2 jitter) {
+    id<MTLComputeCommandEncoder> tonemapEncoder = [cmdBuf computeCommandEncoder];
+    [tonemapEncoder setComputePipelineState:tonemapPipelineState_];
+    [tonemapEncoder setBuffer:rawColorBuffer_   offset:0 atIndex:0];
+    [tonemapEncoder setBuffer:toonBuffer_       offset:0 atIndex:1];
+    [tonemapEncoder setBuffer:tonemappedBuffer_ offset:0 atIndex:2];
+    dispatchThreads(tonemapEncoder, tonemapPipelineState_);
+    [tonemapEncoder endEncoding];
+
+    if (needContours) {
+      id<MTLComputeCommandEncoder> depthMinMaxEncoder = [cmdBuf computeCommandEncoder];
+      [depthMinMaxEncoder setComputePipelineState:depthMinMaxPipelineState_];
+      [depthMinMaxEncoder setBuffer:linearDepthBuffer_ offset:0 atIndex:0];
+      [depthMinMaxEncoder setBuffer:depthMinMaxBuffer_ offset:0 atIndex:1];
+      [depthMinMaxEncoder setBuffer:toonBuffer_        offset:0 atIndex:2];
+      dispatchThreads(depthMinMaxEncoder, depthMinMaxPipelineState_);
+      [depthMinMaxEncoder endEncoding];
+
+      id<MTLComputeCommandEncoder> detailEncoder = [cmdBuf computeCommandEncoder];
+      [detailEncoder setComputePipelineState:detailContourPipelineState_];
+      [detailEncoder setBuffer:linearDepthBuffer_   offset:0 atIndex:0];
+      [detailEncoder setBuffer:normalBuffer_        offset:0 atIndex:1];
+      [detailEncoder setBuffer:objectIdBuffer_      offset:0 atIndex:2];
+      [detailEncoder setBuffer:toonBuffer_          offset:0 atIndex:3];
+      [detailEncoder setBuffer:depthMinMaxBuffer_   offset:0 atIndex:4];
+      [detailEncoder setBuffer:detailContourBuffer_ offset:0 atIndex:5];
+      dispatchThreads(detailEncoder, detailContourPipelineState_);
+      [detailEncoder endEncoding];
+
+      id<MTLComputeCommandEncoder> objectEncoder = [cmdBuf computeCommandEncoder];
+      [objectEncoder setComputePipelineState:objectContourPipelineState_];
+      [objectEncoder setBuffer:objectIdBuffer_      offset:0 atIndex:0];
+      [objectEncoder setBuffer:toonBuffer_          offset:0 atIndex:1];
+      [objectEncoder setBuffer:objectContourBuffer_ offset:0 atIndex:2];
+      dispatchThreads(objectEncoder, objectContourPipelineState_);
+      [objectEncoder endEncoding];
+    }
+
+    if (needContours) {
+      id<MTLBuffer> detailInput = detailContourBuffer_;
+      id<MTLBuffer> objectInput = objectContourBuffer_;
+      if (config.toon.useFxaa) {
+        id<MTLComputeCommandEncoder> detailFxaaEncoder = [cmdBuf computeCommandEncoder];
+        [detailFxaaEncoder setComputePipelineState:fxaaPipelineState_];
+        [detailFxaaEncoder setBuffer:detailContourBuffer_     offset:0 atIndex:0];
+        [detailFxaaEncoder setBuffer:toonBuffer_              offset:0 atIndex:1];
+        [detailFxaaEncoder setBuffer:detailContourFxaaBuffer_ offset:0 atIndex:2];
+        dispatchThreads(detailFxaaEncoder, fxaaPipelineState_);
+        [detailFxaaEncoder endEncoding];
+
+        id<MTLComputeCommandEncoder> objectFxaaEncoder = [cmdBuf computeCommandEncoder];
+        [objectFxaaEncoder setComputePipelineState:fxaaPipelineState_];
+        [objectFxaaEncoder setBuffer:objectContourBuffer_     offset:0 atIndex:0];
+        [objectFxaaEncoder setBuffer:toonBuffer_              offset:0 atIndex:1];
+        [objectFxaaEncoder setBuffer:objectContourFxaaBuffer_ offset:0 atIndex:2];
+        dispatchThreads(objectFxaaEncoder, fxaaPipelineState_);
+        [objectFxaaEncoder endEncoding];
+
+        detailInput = detailContourFxaaBuffer_;
+        objectInput = objectContourFxaaBuffer_;
+      }
+
+      id<MTLComputeCommandEncoder> compositeEncoder = [cmdBuf computeCommandEncoder];
+      [compositeEncoder setComputePipelineState:compositePipelineState_];
+      [compositeEncoder setBuffer:tonemappedBuffer_ offset:0 atIndex:0];
+      [compositeEncoder setBuffer:detailInput       offset:0 atIndex:1];
+      [compositeEncoder setBuffer:objectInput       offset:0 atIndex:2];
+      [compositeEncoder setBuffer:toonBuffer_       offset:0 atIndex:3];
+      [compositeEncoder setBuffer:outputBuffer_     offset:0 atIndex:4];
+      dispatchThreads(compositeEncoder, compositePipelineState_);
+      [compositeEncoder endEncoding];
+    } else {
+      id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+      [blit copyFromBuffer:tonemappedBuffer_ sourceOffset:0
+                  toBuffer:outputBuffer_ destinationOffset:0
+                      size:tonemappedBuffer_.length];
+      [blit endEncoding];
+    }
+
+    if (config.enableMetalFX && config.metalFXOutputWidth > 0 && config.metalFXOutputHeight > 0 &&
+        bufferToTexturePipelineState_ != nil && textureToBufferPipelineState_ != nil) {
+      ensureMetalFXResources(config.metalFXOutputWidth, config.metalFXOutputHeight);
+
+      if (metalFXDenoisedScaler_ != nil) {
+        auto encodeBufferToHalf4Texture = [&](id<MTLBuffer> buf, id<MTLTexture> tex) {
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          [enc setComputePipelineState:bufferToTexturePipelineState_];
+          [enc setBuffer:buf offset:0 atIndex:0];
+          [enc setTexture:tex atIndex:0];
+          dispatchThreads(enc, bufferToTexturePipelineState_);
+          [enc endEncoding];
+        };
+
+        encodeBufferToHalf4Texture(rawColorBuffer_,         metalFXInputTexture_);
+        encodeBufferToHalf4Texture(normalBuffer_,           metalFXNormalTexture_);
+        encodeBufferToHalf4Texture(diffuseAlbedoBuffer_,    metalFXDiffuseAlbedoTexture_);
+        encodeBufferToHalf4Texture(specularAlbedoBuffer_,   metalFXSpecularAlbedoTexture_);
+
+        if (depthToTexturePipelineState_ != nil) {
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          [enc setComputePipelineState:depthToTexturePipelineState_];
+          [enc setBuffer:depthBuffer_ offset:0 atIndex:0];
+          [enc setTexture:metalFXDepthTexture_ atIndex:0];
+          dispatchThreads(enc, depthToTexturePipelineState_);
+          [enc endEncoding];
+        }
+        if (motionToTexturePipelineState_ != nil) {
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          [enc setComputePipelineState:motionToTexturePipelineState_];
+          [enc setBuffer:motionVectorBuffer_ offset:0 atIndex:0];
+          [enc setTexture:metalFXMotionTexture_ atIndex:0];
+          dispatchThreads(enc, motionToTexturePipelineState_);
+          [enc endEncoding];
+        }
+        if (roughnessToTexturePipelineState_ != nil) {
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          [enc setComputePipelineState:roughnessToTexturePipelineState_];
+          [enc setBuffer:roughnessAuxBuffer_ offset:0 atIndex:0];
+          [enc setTexture:metalFXRoughnessTexture_ atIndex:0];
+          dispatchThreads(enc, roughnessToTexturePipelineState_);
+          [enc endEncoding];
+        }
+
+        CameraUniforms* cam = static_cast<CameraUniforms*>(cameraBuffer_.contents);
+        metalFXDenoisedScaler_.colorTexture          = metalFXInputTexture_;
+        metalFXDenoisedScaler_.depthTexture          = metalFXDepthTexture_;
+        metalFXDenoisedScaler_.motionTexture         = metalFXMotionTexture_;
+        metalFXDenoisedScaler_.normalTexture         = metalFXNormalTexture_;
+        metalFXDenoisedScaler_.diffuseAlbedoTexture  = metalFXDiffuseAlbedoTexture_;
+        metalFXDenoisedScaler_.specularAlbedoTexture = metalFXSpecularAlbedoTexture_;
+        metalFXDenoisedScaler_.roughnessTexture      = metalFXRoughnessTexture_;
+        metalFXDenoisedScaler_.outputTexture         = metalFXOutputTexture_;
+        metalFXDenoisedScaler_.jitterOffsetX         = jitter.x;
+        metalFXDenoisedScaler_.jitterOffsetY         = jitter.y;
+        metalFXDenoisedScaler_.shouldResetHistory    = !hasPrevViewProj_;
+        metalFXDenoisedScaler_.worldToViewMatrix     = cam->viewMatrix;
+        metalFXDenoisedScaler_.viewToClipMatrix      = cam->projectionMatrix;
+        [metalFXDenoisedScaler_ encodeToCommandBuffer:cmdBuf];
+
+        {
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          [enc setComputePipelineState:textureToBufferPipelineState_];
+          [enc setTexture:metalFXOutputTexture_ atIndex:0];
+          [enc setBuffer:metalFXOutputBuffer_ offset:0 atIndex:0];
+          ::dispatchThreads(enc, textureToBufferPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
+          [enc endEncoding];
+        }
+
+        {
+          ToonShaderUniforms mfxToon{};
+          mfxToon.width = metalFXOutputWidth_;
+          mfxToon.height = metalFXOutputHeight_;
+          mfxToon.exposure = config.renderMode == rt::RenderMode::Toon
+                                 ? std::max(0.1f, config.toon.tonemapExposure)
+                                 : std::max(0.1f, config.lighting.standardExposure);
+          mfxToon.gamma = config.renderMode == rt::RenderMode::Toon
+                              ? std::max(0.1f, config.toon.tonemapGamma)
+                              : std::max(0.1f, config.lighting.standardGamma);
+          mfxToon.saturation = config.renderMode == rt::RenderMode::Toon
+                                   ? 1.0f
+                                   : std::max(0.0f, config.lighting.standardSaturation);
+          std::memcpy(metalFXToonBuffer_.contents, &mfxToon, sizeof(ToonShaderUniforms));
+
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          [enc setComputePipelineState:tonemapPipelineState_];
+          [enc setBuffer:metalFXOutputBuffer_   offset:0 atIndex:0];
+          [enc setBuffer:metalFXToonBuffer_     offset:0 atIndex:1];
+          [enc setBuffer:metalFXTonemappedBuffer_ offset:0 atIndex:2];
+          ::dispatchThreads(enc, tonemapPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
+          [enc endEncoding];
+        }
+      }
+    } else if (lastEnableMetalFX_) {
+      teardownMetalFXResources();
+    }
   }
 
   rt::RenderBuffer downloadRenderBuffer() const override {
@@ -1022,75 +1066,80 @@ private:
     metalFXOutputHeight_ = 0;
   }
 
+  // ---------------------------------------------------------------------------
+  // buildSceneBuffers — orchestrates all gather/upload phases.
+  // To add a new primitive type (e.g. arrows), add a gather*GpuData() method
+  // and call it here before uploadSceneBuffers().
+  // ---------------------------------------------------------------------------
   void buildSceneBuffers() {
-    std::vector<simd_float4> positions;
-    std::vector<simd_float4> normals;
-    std::vector<simd_float4> vertexColors;
-    std::vector<simd_float2> texcoords;
-    std::vector<PackedTriangleIndices> accelIndices;
-    std::vector<TriangleShaderData> shaderTriangles;
-    std::vector<MaterialShaderData> materials;
-    std::vector<TextureShaderData> textures;
-    std::vector<simd_float4> texturePixels;
-    std::unordered_map<std::string, uint32_t> textureLookup;
-    std::unordered_map<std::string, uint32_t> objectIdLookup;
-    std::vector<PunctualLightShaderData> lights;
+    SceneGpuAccumulator acc;
+    acc.positions.reserve(4096);
+    acc.normals.reserve(4096);
+    acc.vertexColors.reserve(4096);
+    acc.texcoords.reserve(4096);
+    acc.accelIndices.reserve(4096);
+    acc.shaderTriangles.reserve(4096);
+    acc.materials.reserve(scene_.meshes.size() + scene_.curveNetworks.size());
 
-    // Returns the index into `textures[]` for the given RTTexture, uploading it once.
-    auto registerTexture = [&](const rt::RTTexture& tex) -> uint32_t {
-      auto existing = textureLookup.find(tex.cacheKey);
-      if (existing != textureLookup.end()) return existing->second;
-      const uint32_t idx    = static_cast<uint32_t>(textures.size());
-      const uint32_t offset = static_cast<uint32_t>(texturePixels.size());
-      TextureShaderData td;
-      td.data = simd_make_uint4(offset, tex.width, tex.height, 0u);
-      textures.push_back(td);
-      textureLookup.emplace(tex.cacheKey, idx);
-      for (const glm::vec4& pixel : tex.pixels) {
-        texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
+    gatherMeshGpuData(acc);
+    gatherCurveGpuData(acc);    // also clears + fills pointPrimitives_ for sphere nodes
+    gatherPointBboxData(acc);   // appends point cloud spheres to pointPrimitives_
+
+
+    // Insert a degenerate far-away triangle so the triangle BLAS is never empty,
+    // which Metal requires even when all geometry is in the curve/point BLASes.
+    if (acc.positions.empty()) {
+      for (int j = 0; j < 3; ++j) {
+        acc.positions.push_back(simd_make_float4(1e6f, 1e6f, 1e6f, 1.0f));
+        acc.normals.push_back(simd_make_float4(0.0f, 1.0f, 0.0f, 0.0f));
+        acc.vertexColors.push_back(simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f));
+        acc.texcoords.push_back(simd_make_float2(0.0f, 0.0f));
       }
-      return idx;
-    };
+      acc.accelIndices.push_back({0, 1, 2});
+      MaterialShaderData dummyMat{};
+      acc.materials.push_back(dummyMat);
+      TriangleShaderData dummyTri{};
+      dummyTri.indicesMaterial = simd_make_uint4(0, 1, 2, static_cast<uint32_t>(acc.materials.size() - 1));
+      acc.shaderTriangles.push_back(dummyTri);
+    }
 
-    positions.reserve(4096);
-    normals.reserve(4096);
-    vertexColors.reserve(4096);
-    texcoords.reserve(4096);
-    accelIndices.reserve(4096);
-    shaderTriangles.reserve(4096);
-    materials.reserve(scene_.meshes.size() + scene_.curveNetworks.size());
+    gatherLightData(acc);
+    uploadSceneBuffers(acc);
+    buildAccelerationStructure(static_cast<uint32_t>(acc.accelIndices.size()));
+  }
 
-    uint32_t nextObjectId = 1u;
+  // Converts scene_.meshes into GPU geometry + material arrays.
+  void gatherMeshGpuData(SceneGpuAccumulator& acc) {
     for (const rt::RTMesh& mesh : scene_.meshes) {
       if (mesh.vertices.empty() || mesh.indices.empty()) continue;
 
-      const uint32_t baseVertex = static_cast<uint32_t>(positions.size());
-      const uint32_t materialIndex = static_cast<uint32_t>(materials.size());
+      const uint32_t baseVertex = static_cast<uint32_t>(acc.positions.size());
+      const uint32_t materialIndex = static_cast<uint32_t>(acc.materials.size());
       const std::string objectKey = contourObjectKey(mesh.name);
-      auto objectIt = objectIdLookup.find(objectKey);
+      auto objectIt = acc.objectIdLookup.find(objectKey);
       uint32_t meshObjectId = 0u;
-      if (objectIt != objectIdLookup.end()) {
+      if (objectIt != acc.objectIdLookup.end()) {
         meshObjectId = objectIt->second;
       } else {
-        meshObjectId = nextObjectId++;
-        objectIdLookup.emplace(objectKey, meshObjectId);
+        meshObjectId = acc.nextObjectId++;
+        acc.objectIdLookup.emplace(objectKey, meshObjectId);
       }
+
       const bool hasVertexNormals = mesh.normals.size() == mesh.vertices.size();
       MaterialShaderData material;
-      material.baseColorFactor = simd_make_float4(mesh.baseColorFactor.r, mesh.baseColorFactor.g, mesh.baseColorFactor.b,
-                                                  mesh.baseColorFactor.a);
+      material.baseColorFactor =
+          simd_make_float4(mesh.baseColorFactor.r, mesh.baseColorFactor.g, mesh.baseColorFactor.b, mesh.baseColorFactor.a);
       material.baseColorTextureData = simd_make_uint4(0u, 0u, 0u, 0u);
       material.metallicRoughnessNormal =
           simd_make_float4(mesh.metallicFactor, mesh.roughnessFactor, mesh.normalTextureScale, 0.0f);
       material.metallicRoughnessTextureData = simd_make_uint4(0u, 0u, 0u, 0u);
-      material.emissiveFactor = simd_make_float4(mesh.emissiveFactor.r, mesh.emissiveFactor.g, mesh.emissiveFactor.b, 1.0f);
+      material.emissiveFactor =
+          simd_make_float4(mesh.emissiveFactor.r, mesh.emissiveFactor.g, mesh.emissiveFactor.b, 1.0f);
       material.emissiveTextureData = simd_make_uint4(0u, 0u, 0u, 0u);
       material.normalTextureData = simd_make_uint4(0u, 0u, 0u, 0u);
       float opacityPacked = mesh.opacity;
       float transmissionPacked = mesh.transmissionFactor;
-      if (opacityPacked < 1e-5f && transmissionPacked < 1e-5f) {
-        opacityPacked = 1.0f;
-      }
+      if (opacityPacked < 1e-5f && transmissionPacked < 1e-5f) opacityPacked = 1.0f;
       material.transmissionIor =
           simd_make_float4(transmissionPacked, mesh.indexOfRefraction, mesh.unlit ? 1.0f : 0.0f, opacityPacked);
       const float edgeBaryThreshold = mesh.wireframe ? (mesh.edgeWidth / 100.0f) : 0.0f;
@@ -1098,112 +1147,106 @@ private:
           simd_make_float4(mesh.edgeColor.r, mesh.edgeColor.g, mesh.edgeColor.b, edgeBaryThreshold);
 
       if (mesh.hasBaseColorTexture && !mesh.baseColorTexture.pixels.empty()) {
-        material.baseColorTextureData = simd_make_uint4(registerTexture(mesh.baseColorTexture), 1u, 0u, 0u);
+        material.baseColorTextureData = simd_make_uint4(registerTextureInAcc(acc, mesh.baseColorTexture), 1u, 0u, 0u);
       }
-
       if (mesh.hasEmissiveTexture && !mesh.emissiveTexture.pixels.empty()) {
-        material.emissiveTextureData = simd_make_uint4(registerTexture(mesh.emissiveTexture), 1u, 0u, 0u);
+        material.emissiveTextureData = simd_make_uint4(registerTextureInAcc(acc, mesh.emissiveTexture), 1u, 0u, 0u);
       }
-
       if (mesh.hasMetallicRoughnessTexture && !mesh.metallicRoughnessTexture.pixels.empty()) {
-        material.metallicRoughnessTextureData = simd_make_uint4(registerTexture(mesh.metallicRoughnessTexture), 1u, 0u, 0u);
+        material.metallicRoughnessTextureData =
+            simd_make_uint4(registerTextureInAcc(acc, mesh.metallicRoughnessTexture), 1u, 0u, 0u);
       }
-
       if (mesh.hasNormalTexture && !mesh.normalTexture.pixels.empty()) {
-        material.normalTextureData = simd_make_uint4(registerTexture(mesh.normalTexture), 1u, 0u, 0u);
+        material.normalTextureData = simd_make_uint4(registerTextureInAcc(acc, mesh.normalTexture), 1u, 0u, 0u);
       }
-      materials.push_back(material);
+      acc.materials.push_back(material);
 
       std::vector<glm::vec3> worldVertices(mesh.vertices.size());
       std::vector<glm::vec3> worldNormals(mesh.vertices.size(), glm::vec3(0.0f));
       glm::mat3 normalTransform = glm::transpose(glm::inverse(glm::mat3(mesh.transform)));
-
       for (size_t i = 0; i < mesh.vertices.size(); ++i) {
         glm::vec4 worldPos = mesh.transform * glm::vec4(mesh.vertices[i], 1.0f);
         worldVertices[i] = glm::vec3(worldPos);
-        if (hasVertexNormals) {
-          worldNormals[i] = glm::normalize(normalTransform * mesh.normals[i]);
-        }
+        if (hasVertexNormals) worldNormals[i] = glm::normalize(normalTransform * mesh.normals[i]);
       }
 
       const bool hasVertexColors = mesh.vertexColors.size() == mesh.vertices.size();
       for (size_t i = 0; i < worldVertices.size(); ++i) {
-        positions.push_back(makeFloat4(worldVertices[i], 1.0f));
-        normals.push_back(makeFloat4(worldNormals[i], 0.0f));
+        acc.positions.push_back(makeFloat4(worldVertices[i], 1.0f));
+        acc.normals.push_back(makeFloat4(worldNormals[i], 0.0f));
         if (hasVertexColors) {
-          vertexColors.push_back(simd_make_float4(mesh.vertexColors[i].r, mesh.vertexColors[i].g, mesh.vertexColors[i].b, 1.0f));
+          acc.vertexColors.push_back(
+              simd_make_float4(mesh.vertexColors[i].r, mesh.vertexColors[i].g, mesh.vertexColors[i].b, 1.0f));
         } else {
-          vertexColors.push_back(simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f));
+          acc.vertexColors.push_back(simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f));
         }
         glm::vec2 uv = i < mesh.texcoords.size() ? mesh.texcoords[i] : glm::vec2(0.0f);
-        texcoords.push_back(simd_make_float2(uv.x, uv.y));
+        acc.texcoords.push_back(simd_make_float2(uv.x, uv.y));
       }
 
       for (const glm::uvec3& tri : mesh.indices) {
-        accelIndices.push_back({baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z});
+        acc.accelIndices.push_back({baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z});
         TriangleShaderData triangle{};
-        triangle.indicesMaterial = simd_make_uint4(baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z, materialIndex);
+        triangle.indicesMaterial =
+            simd_make_uint4(baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z, materialIndex);
         triangle.objectFlags = simd_make_uint4(meshObjectId, hasVertexNormals ? 1u : 0u, mesh.wireframe ? 1u : 0u, 0u);
-        shaderTriangles.push_back(triangle);
+        acc.shaderTriangles.push_back(triangle);
       }
     }
+  }
 
-    std::vector<CurvePrimitiveShaderData> curvePrimitives;
+  // Converts scene_.curveNetworks into:
+  //   • acc.curvePrimitives / curveControlPoints_ / curveRadii_  (cylinder segments)
+  //   • pointPrimitives_ / pointBboxData_                        (sphere joints/endpoints)
+  void gatherCurveGpuData(SceneGpuAccumulator& acc) {
     curveControlPoints_.clear();
     curveRadii_.clear();
-
-    // Sphere-type curve node primitives are routed into the bounding-box point BLAS
-    // (same pipeline as point clouds).  Clear them here so both sources append cleanly.
+    // Sphere-type nodes share the same bounding-box BLAS as point clouds;
+    // clear both here so gather*PointBboxData can safely append afterwards.
     pointPrimitives_.clear();
     pointBboxData_.clear();
 
     for (const rt::RTCurveNetwork& curveNet : scene_.curveNetworks) {
       const std::string objectKey = curveNet.name;
-      auto objectIt = objectIdLookup.find(objectKey);
+      auto objectIt = acc.objectIdLookup.find(objectKey);
       uint32_t curveObjectId = 0u;
-      if (objectIt != objectIdLookup.end()) {
+      if (objectIt != acc.objectIdLookup.end()) {
         curveObjectId = objectIt->second;
       } else {
-        curveObjectId = nextObjectId++;
-        objectIdLookup.emplace(objectKey, curveObjectId);
+        curveObjectId = acc.nextObjectId++;
+        acc.objectIdLookup.emplace(objectKey, curveObjectId);
       }
 
-      uint32_t curveMaterialIndex = static_cast<uint32_t>(materials.size());
+      uint32_t curveMaterialIndex = static_cast<uint32_t>(acc.materials.size());
       MaterialShaderData curveMaterial{};
-      curveMaterial.baseColorFactor = simd_make_float4(curveNet.baseColor.r, curveNet.baseColor.g,
-                                                       curveNet.baseColor.b, curveNet.baseColor.a);
+      curveMaterial.baseColorFactor =
+          simd_make_float4(curveNet.baseColor.r, curveNet.baseColor.g, curveNet.baseColor.b, curveNet.baseColor.a);
       curveMaterial.metallicRoughnessNormal = simd_make_float4(curveNet.metallic, curveNet.roughness, 1.0f, 0.0f);
       curveMaterial.transmissionIor = simd_make_float4(0.0f, 1.5f, curveNet.unlit ? 1.0f : 0.0f, 1.0f);
-      materials.push_back(curveMaterial);
+      acc.materials.push_back(curveMaterial);
 
-
-      for (size_t pi = 0; pi < curveNet.primitives.size(); ++pi) {
-        const rt::RTCurvePrimitive& prim = curveNet.primitives[pi];
-        // Native Metal curve geometry only supports segments (cylinders), not spheres
+      for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
         if (prim.type != rt::RTCurvePrimitiveType::Cylinder) continue;
 
         CurvePrimitiveShaderData shaderPrim;
         shaderPrim.p0_radius = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
         shaderPrim.p1_type = simd_make_float4(prim.p1.x, prim.p1.y, prim.p1.z, 1.0f);
         shaderPrim.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
-        curvePrimitives.push_back(shaderPrim);
+        acc.curvePrimitives.push_back(shaderPrim);
 
-        // Control points for the native Metal curve BLAS
         curveControlPoints_.push_back(simd_make_float3(prim.p0.x, prim.p0.y, prim.p0.z));
         curveControlPoints_.push_back(simd_make_float3(prim.p1.x, prim.p1.y, prim.p1.z));
         curveRadii_.push_back(prim.radius);
         curveRadii_.push_back(prim.radius);
-
       }
 
-      // Sphere-type primitives (curve network node joints/endpoints) are rendered
-      // through the point bounding-box BLAS using the same material as their network.
+      // Sphere-type primitives (node joints/endpoints) go through the point BLAS.
       for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
         if (prim.type != rt::RTCurvePrimitiveType::Sphere) continue;
         PointPrimitiveShaderData gpuPt;
-        gpuPt.center_radius    = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
-        gpuPt.baseColor        = simd_make_float4(curveNet.baseColor.r, curveNet.baseColor.g,
-                                                   curveNet.baseColor.b, 1.0f);
+        gpuPt.center_radius = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
+        gpuPt.baseColor =
+            simd_make_float4(curveNet.baseColor.r, curveNet.baseColor.g, curveNet.baseColor.b, 1.0f);
         gpuPt.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
         pointPrimitives_.push_back(gpuPt);
 
@@ -1213,121 +1256,112 @@ private:
         pointBboxData_.push_back(bb);
       }
     }
+  }
 
-    // Point cloud spheres — appended to the same bounding-box BLAS as curve nodes.
+  // Converts scene_.pointClouds into pointPrimitives_ / pointBboxData_.
+  // Must be called after gatherCurveGpuData() so sphere node entries already exist.
+  void gatherPointBboxData(SceneGpuAccumulator& acc) {
     for (const rt::RTPointCloud& pc : scene_.pointClouds) {
       const std::string objectKey = pc.name;
-      auto objectIt = objectIdLookup.find(objectKey);
+      auto objectIt = acc.objectIdLookup.find(objectKey);
       uint32_t pointObjectId = 0u;
-      if (objectIt != objectIdLookup.end()) {
+      if (objectIt != acc.objectIdLookup.end()) {
         pointObjectId = objectIt->second;
       } else {
-        pointObjectId = nextObjectId++;
-        objectIdLookup.emplace(objectKey, pointObjectId);
+        pointObjectId = acc.nextObjectId++;
+        acc.objectIdLookup.emplace(objectKey, pointObjectId);
       }
 
-      uint32_t pointMaterialIndex = static_cast<uint32_t>(materials.size());
+      uint32_t pointMaterialIndex = static_cast<uint32_t>(acc.materials.size());
       MaterialShaderData ptMat{};
       ptMat.baseColorFactor = simd_make_float4(pc.baseColor.r, pc.baseColor.g, pc.baseColor.b, pc.baseColor.a);
       ptMat.metallicRoughnessNormal = simd_make_float4(pc.metallic, pc.roughness, 1.0f, 0.0f);
       ptMat.transmissionIor = simd_make_float4(0.0f, 1.5f, pc.unlit ? 1.0f : 0.0f, 1.0f);
-      materials.push_back(ptMat);
+      acc.materials.push_back(ptMat);
 
       for (size_t ci = 0; ci < pc.centers.size(); ++ci) {
         const glm::vec3& center = pc.centers[ci];
-        // Use per-point color from scalar quantity if available, otherwise the cloud's base color.
-        glm::vec3 ptColor = pc.colors.empty()
-                                ? glm::vec3(pc.baseColor)
-                                : pc.colors[std::min(ci, pc.colors.size() - 1)];
+        glm::vec3 ptColor = pc.colors.empty() ? glm::vec3(pc.baseColor)
+                                              : pc.colors[std::min(ci, pc.colors.size() - 1)];
         PointPrimitiveShaderData gpuPt;
-        gpuPt.center_radius    = simd_make_float4(center.x, center.y, center.z, pc.radius);
-        gpuPt.baseColor        = simd_make_float4(ptColor.r, ptColor.g, ptColor.b, 1.0f);
+        gpuPt.center_radius = simd_make_float4(center.x, center.y, center.z, pc.radius);
+        gpuPt.baseColor = simd_make_float4(ptColor.r, ptColor.g, ptColor.b, 1.0f);
         gpuPt.materialObjectId = simd_make_uint4(pointMaterialIndex, pointObjectId, 0u, 0u);
         pointPrimitives_.push_back(gpuPt);
 
-        // Axis-aligned bounding box tightly enclosing the sphere.
         MTLAxisAlignedBoundingBox bb;
         bb.min = {center.x - pc.radius, center.y - pc.radius, center.z - pc.radius};
         bb.max = {center.x + pc.radius, center.y + pc.radius, center.z + pc.radius};
         pointBboxData_.push_back(bb);
       }
     }
+  }
 
-    if (positions.empty() && curvePrimitives.empty() && pointPrimitives_.empty()) {
-      throw std::runtime_error("The scene did not contain any renderable geometry.");
-    }
-    if (positions.empty()) {
-      for (int j = 0; j < 3; ++j) {
-        positions.push_back(simd_make_float4(1e6f, 1e6f, 1e6f, 1.0f));
-        normals.push_back(simd_make_float4(0.0f, 1.0f, 0.0f, 0.0f));
-        vertexColors.push_back(simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f));
-        texcoords.push_back(simd_make_float2(0.0f, 0.0f));
-      }
-      accelIndices.push_back({0, 1, 2});
-      MaterialShaderData dummyMat{};
-      materials.push_back(dummyMat);
-      TriangleShaderData dummyTri{};
-      dummyTri.indicesMaterial = simd_make_uint4(0, 1, 2, static_cast<uint32_t>(materials.size() - 1));
-      shaderTriangles.push_back(dummyTri);
-    }
-
+  // Converts scene_.lights into acc.lights.
+  void gatherLightData(SceneGpuAccumulator& acc) {
     for (const rt::RTPunctualLight& light : scene_.lights) {
       PunctualLightShaderData shaderLight;
-      shaderLight.positionRange = simd_make_float4(light.position.x, light.position.y, light.position.z, light.range);
-      shaderLight.directionType =
-          simd_make_float4(light.direction.x, light.direction.y, light.direction.z,
-                           static_cast<float>(static_cast<uint32_t>(light.type)));
-      shaderLight.colorIntensity = simd_make_float4(light.color.x, light.color.y, light.color.z, light.intensity);
+      shaderLight.positionRange =
+          simd_make_float4(light.position.x, light.position.y, light.position.z, light.range);
+      shaderLight.directionType = simd_make_float4(light.direction.x, light.direction.y, light.direction.z,
+                                                   static_cast<float>(static_cast<uint32_t>(light.type)));
+      shaderLight.colorIntensity =
+          simd_make_float4(light.color.x, light.color.y, light.color.z, light.intensity);
       shaderLight.spotAngles = simd_make_float4(light.innerConeAngle, light.outerConeAngle, 0.0f, 0.0f);
-      lights.push_back(shaderLight);
+      acc.lights.push_back(shaderLight);
     }
+  }
 
-    positionBuffer_ = [device_ newBufferWithBytes:positions.data()
-                                           length:positions.size() * sizeof(simd_float4)
+  // Uploads all CPU-side accumulator data to GPU buffers and binds the IFT.
+  void uploadSceneBuffers(SceneGpuAccumulator& acc) {
+    positionBuffer_ = [device_ newBufferWithBytes:acc.positions.data()
+                                           length:acc.positions.size() * sizeof(simd_float4)
                                           options:MTLResourceStorageModeShared];
-    normalVertexBuffer_ = [device_ newBufferWithBytes:normals.data()
-                                               length:normals.size() * sizeof(simd_float4)
+    normalVertexBuffer_ = [device_ newBufferWithBytes:acc.normals.data()
+                                               length:acc.normals.size() * sizeof(simd_float4)
                                               options:MTLResourceStorageModeShared];
-    vertexColorBuffer_ = [device_ newBufferWithBytes:vertexColors.data()
-                                              length:vertexColors.size() * sizeof(simd_float4)
+    vertexColorBuffer_ = [device_ newBufferWithBytes:acc.vertexColors.data()
+                                              length:acc.vertexColors.size() * sizeof(simd_float4)
                                              options:MTLResourceStorageModeShared];
-    texcoordBuffer_ = [device_ newBufferWithBytes:texcoords.data()
-                                           length:texcoords.size() * sizeof(simd_float2)
+    texcoordBuffer_ = [device_ newBufferWithBytes:acc.texcoords.data()
+                                           length:acc.texcoords.size() * sizeof(simd_float2)
                                           options:MTLResourceStorageModeShared];
-    accelIndexBuffer_ = [device_ newBufferWithBytes:accelIndices.data()
-                                             length:accelIndices.size() * sizeof(PackedTriangleIndices)
+    accelIndexBuffer_ = [device_ newBufferWithBytes:acc.accelIndices.data()
+                                             length:acc.accelIndices.size() * sizeof(PackedTriangleIndices)
                                             options:MTLResourceStorageModeShared];
-    triangleBuffer_ = [device_ newBufferWithBytes:shaderTriangles.data()
-                                           length:shaderTriangles.size() * sizeof(TriangleShaderData)
+    triangleBuffer_ = [device_ newBufferWithBytes:acc.shaderTriangles.data()
+                                           length:acc.shaderTriangles.size() * sizeof(TriangleShaderData)
                                           options:MTLResourceStorageModeShared];
-    materialBuffer_ = [device_ newBufferWithBytes:materials.data()
-                                           length:materials.size() * sizeof(MaterialShaderData)
+    materialBuffer_ = [device_ newBufferWithBytes:acc.materials.data()
+                                           length:acc.materials.size() * sizeof(MaterialShaderData)
                                           options:MTLResourceStorageModeShared];
-    if (textures.empty()) {
+
+    if (acc.textures.empty()) {
       TextureShaderData defaultTexture;
       defaultTexture.data = simd_make_uint4(0u, 0u, 0u, 0u);
-      textures.push_back(defaultTexture);
+      acc.textures.push_back(defaultTexture);
     }
-    if (texturePixels.empty()) {
-      texturePixels.push_back(simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f));
+    if (acc.texturePixels.empty()) {
+      acc.texturePixels.push_back(simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f));
     }
-    textureMetadataBuffer_ = [device_ newBufferWithBytes:textures.data()
-                                                  length:textures.size() * sizeof(TextureShaderData)
+    textureMetadataBuffer_ = [device_ newBufferWithBytes:acc.textures.data()
+                                                  length:acc.textures.size() * sizeof(TextureShaderData)
                                                  options:MTLResourceStorageModeShared];
-    texturePixelBuffer_ = [device_ newBufferWithBytes:texturePixels.data()
-                                               length:texturePixels.size() * sizeof(simd_float4)
+    texturePixelBuffer_ = [device_ newBufferWithBytes:acc.texturePixels.data()
+                                               length:acc.texturePixels.size() * sizeof(simd_float4)
                                               options:MTLResourceStorageModeShared];
-    if (lights.empty()) {
+
+    if (acc.lights.empty()) {
       PunctualLightShaderData defaultLight{};
-      lights.push_back(defaultLight);
+      acc.lights.push_back(defaultLight);
     }
-    lightBuffer_ = [device_ newBufferWithBytes:lights.data()
-                                        length:lights.size() * sizeof(PunctualLightShaderData)
+    lightBuffer_ = [device_ newBufferWithBytes:acc.lights.data()
+                                        length:acc.lights.size() * sizeof(PunctualLightShaderData)
                                        options:MTLResourceStorageModeShared];
 
-    if (!curvePrimitives.empty()) {
-      curvePrimitiveBuffer_ = [device_ newBufferWithBytes:curvePrimitives.data()
-                                                   length:curvePrimitives.size() * sizeof(CurvePrimitiveShaderData)
+    if (!acc.curvePrimitives.empty()) {
+      curvePrimitiveBuffer_ = [device_ newBufferWithBytes:acc.curvePrimitives.data()
+                                                   length:acc.curvePrimitives.size() * sizeof(CurvePrimitiveShaderData)
                                                   options:MTLResourceStorageModeShared];
       curveControlPointBuffer_ = [device_ newBufferWithBytes:curveControlPoints_.data()
                                                       length:curveControlPoints_.size() * sizeof(simd_float3)
@@ -1335,7 +1369,7 @@ private:
       curveRadiusBuffer_ = [device_ newBufferWithBytes:curveRadii_.data()
                                                 length:curveRadii_.size() * sizeof(float)
                                                options:MTLResourceStorageModeShared];
-      curveSegmentCount_ = static_cast<uint32_t>(curvePrimitives.size());
+      curveSegmentCount_ = static_cast<uint32_t>(acc.curvePrimitives.size());
     } else {
       CurvePrimitiveShaderData dummy{};
       curvePrimitiveBuffer_ = [device_ newBufferWithBytes:&dummy
@@ -1361,13 +1395,11 @@ private:
       pointBboxBuffer_ = nil;
     }
 
-    // Bind the point primitive buffer in the intersection function table so sphereIntersection
-    // can access it at buffer(25) when invoked by the hardware traversal.
+    // Bind the point primitive buffer in the intersection function table so
+    // sphereIntersection can access it at buffer(25) during hardware traversal.
     if (intersectionFunctionTable_ != nil && pointPrimitiveBuffer_ != nil) {
       [intersectionFunctionTable_ setBuffer:pointPrimitiveBuffer_ offset:0 atIndex:25];
     }
-
-    buildAccelerationStructure(static_cast<uint32_t>(accelIndices.size()));
   }
 
   bool sceneContainsTransmission() const {
@@ -1760,31 +1792,7 @@ public:
     id<MTLBuffer> outputBuffer =
         [device_ newBufferWithLength:pixelCount * sizeof(simd_float4) options:MTLResourceStorageModeShared];
 
-    ToonShaderUniforms toon;
-    toon.width = input.width;
-    toon.height = input.height;
-    toon.contourMethod = 2u;
-    toon.useFxaa = input.toon.useFxaa ? 1u : 0u;
-    toon.detailContourStrength =
-        input.toon.enabled && input.toon.enableDetailContour ? std::max(0.0f, input.toon.detailContourStrength) : 0.0f;
-    toon.depthThreshold = std::max(0.0f, input.toon.depthThreshold);
-    toon.normalThreshold = std::max(0.0f, input.toon.normalThreshold);
-    toon.edgeThickness = std::max(1.0f, input.toon.edgeThickness);
-    toon.exposure = input.renderMode == rt::RenderMode::Toon ? std::max(0.1f, input.toon.tonemapExposure)
-                                                                 : std::max(0.1f, input.lighting.standardExposure);
-    toon.gamma = input.renderMode == rt::RenderMode::Toon ? std::max(0.1f, input.toon.tonemapGamma)
-                                                              : std::max(0.1f, input.lighting.standardGamma);
-    toon.saturation =
-        input.renderMode == rt::RenderMode::Toon ? 1.0f : std::max(0.0f, input.lighting.standardSaturation);
-    toon.objectContourStrength =
-        input.toon.enabled && input.toon.enableObjectContour ? std::max(0.0f, input.toon.objectContourStrength) : 0.0f;
-    toon.objectThreshold = std::max(0.0f, input.toon.objectThreshold);
-    toon.enableDetailContour = input.toon.enabled && input.toon.enableDetailContour ? 1u : 0u;
-    toon.enableObjectContour = input.toon.enabled && input.toon.enableObjectContour ? 1u : 0u;
-    toon.enableNormalEdge = input.toon.enableNormalEdge ? 1u : 0u;
-    toon.enableDepthEdge = input.toon.enableDepthEdge ? 1u : 0u;
-    toon.backgroundColor = makeFloat4(input.lighting.backgroundColor, 1.0f);
-    toon.edgeColor = makeFloat4(input.toon.edgeColor, 1.0f);
+    ToonShaderUniforms toon = makeToonShaderUniforms(input, input.width, input.height);
     std::memcpy(toonBuffer_.contents, &toon, sizeof(ToonShaderUniforms));
 
     uint32_t init[2];

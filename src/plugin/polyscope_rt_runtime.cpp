@@ -149,13 +149,6 @@ void PolyscopeRtRuntime::tick() {
     }
 
     const PolyscopeSceneSnapshot& snapshot = cachedSnapshot_;
-    if (snapshot.scene.meshes.empty()) {
-      setError("No enabled triangle meshes are registered in Polyscope.");
-      removeRenderImage();
-      wasEnabledLastFrame_ = false;
-      return;
-    }
-
     const rt::RTScene& renderScene = snapshot.scene;
 
     rt::RTCamera camera = captureCamera();
@@ -243,9 +236,8 @@ void PolyscopeRtRuntime::tick() {
     hadPreviousCamera_ = true;
     polyscope::requestRedraw();
   } catch (const std::exception& e) {
+    // Show the error but never auto-disable RT mode — only the user can turn it off.
     setError(e.what());
-    rayTracingEnabled_ = false;
-    removeRenderImage();
     wasEnabledLastFrame_ = false;
   }
 }

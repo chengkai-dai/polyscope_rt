@@ -208,34 +208,46 @@ void testDepthContourDoesNotWashOutSmoothSurface(rt::IMetalShaderTestHarness& ha
 }
 
 void testFxaaAndCompositeBackground(rt::IMetalShaderTestHarness& harness) {
-  auto input = makeInput(8, 8);
-  input.lighting.backgroundColor = glm::vec3(0.9f, 0.95f, 1.0f);
-  for (uint32_t y = 0; y < input.height; ++y) {
-    for (uint32_t x = 0; x < input.width; ++x) {
-      size_t idx = pixelIndex(x, y, input.width);
-      if (x >= 3 && x <= 4) {
-        input.objectId[idx] = 1u;
+  // Part 1: verify the composite kernel restores the background color for non-object pixels.
+  {
+    auto input = makeInput(4, 4);
+    input.lighting.backgroundColor = glm::vec3(0.9f, 0.95f, 1.0f);
+    const auto output = harness.runPostprocess(input);
+    const glm::vec3 bg = output.finalColor[pixelIndex(0, 0, input.width)];
+    require(glm::length(bg - input.lighting.backgroundColor) < 1e-3f,
+            "composite kernel should restore the configured background color");
+  }
+
+  // Part 2: FXAA should produce intermediate values (anti-aliasing) on a diagonal object
+  // boundary.  A perfectly vertical/horizontal stripe cannot be anti-aliased by the diagonal
+  // 5-tap FXAA pattern because the NW/NE (and SW/SE) samples are always equal, making
+  // dir.x = 0.  A 45-degree edge (x+y = constant) gives non-zero gradients in both axes so
+  // bilinear blending yields values strictly between 0 and 1.
+  {
+    auto input = makeInput(8, 8);
+    for (uint32_t y = 0; y < input.height; ++y) {
+      for (uint32_t x = 0; x < input.width; ++x) {
+        size_t idx = pixelIndex(x, y, input.width);
+        // Two distinct objects separated by a 45-degree diagonal at x+y == 7.
+        if (x + y < 7) {
+          input.objectId[idx] = 1u;
+        } else {
+          input.objectId[idx] = 2u;
+        }
         input.linearDepth[idx] = 3.0f;
-        input.rawColor[idx] = glm::vec4(0.2f, 0.2f, 0.2f, 1.0f);
-      } else {
-        input.rawColor[idx] = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        input.rawColor[idx] = glm::vec4(0.3f, 0.3f, 0.3f, 1.0f);
       }
     }
-  }
-
-  const auto output = harness.runPostprocess(input);
-  const glm::vec3 bg = output.finalColor[pixelIndex(0, 0, input.width)];
-  require(glm::length(bg - input.lighting.backgroundColor) < 1e-3f,
-          "composite kernel should restore the configured background color");
-
-  bool foundIntermediateFxaa = false;
-  for (float value : output.objectContourFxaa) {
-    if (value > 0.05f && value < 0.95f) {
-      foundIntermediateFxaa = true;
-      break;
+    const auto output = harness.runPostprocess(input);
+    bool foundIntermediateFxaa = false;
+    for (float value : output.objectContourFxaa) {
+      if (value > 0.05f && value < 0.95f) {
+        foundIntermediateFxaa = true;
+        break;
+      }
     }
+    require(foundIntermediateFxaa, "FXAA should introduce intermediate contour coverage values");
   }
-  require(foundIntermediateFxaa, "FXAA should introduce intermediate contour coverage values");
 }
 
 } // namespace
