@@ -6,12 +6,9 @@
 #include "glm/gtc/matrix_transform.hpp"
 
 #include "rendering/ray_tracing_backend.h"
+#include "test_helpers.h"
 
 namespace {
-
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
 
 bool isSkippableBackendError(const std::string& message) {
   return message.find("Metal is unavailable") != std::string::npos ||
@@ -159,8 +156,8 @@ int main() {
     opaqueSphere.roughnessFactor = 0.02f;
     opaqueSphere.metallicFactor = 0.0f;
     opaqueScene.meshes.push_back(std::move(opaqueSphere));
-    opaqueScene.hash = 44;
-    backend->setScene(opaqueScene);
+      opaqueScene.hash = 44;
+      backend->setScene(opaqueScene);
     backend->resetAccumulation();
     backend->renderIteration(glassConfig);
     rt::RenderBuffer opaqueBuffer = backend->downloadRenderBuffer();
@@ -280,6 +277,146 @@ int main() {
         triColorSum += c.x + c.y + c.z;
       }
       require(triColorSum > 0.0, "expected non-black output from triangle-only regression");
+    }
+
+    // ---- Point-cloud-only scene ----
+    // Verifies that the bounding-box BLAS and sphereIntersection IFT are wired up
+    // correctly and produce visible output.
+    {
+      rt::RTScene pointScene;
+      rt::RTPointCloud cloud;
+      cloud.name = "red_cloud";
+      cloud.centers = {{0.0f, 0.0f, 0.0f}, {0.4f, 0.1f, 0.0f}, {-0.4f, -0.1f, 0.0f}};
+      cloud.radius = 0.35f;
+      cloud.baseColor = {1.0f, 0.0f, 0.0f, 1.0f};
+      pointScene.pointClouds.push_back(cloud);
+      pointScene.hash = 200;
+
+      backend->setScene(pointScene);
+      backend->updateCamera(camera);
+      backend->resetAccumulation();
+
+      rt::RenderConfig pointConfig;
+      pointConfig.samplesPerIteration = 1;
+      pointConfig.maxBounces = 1;
+      pointConfig.accumulate = false;
+      pointConfig.lighting.backgroundColor = {0.0f, 0.0f, 0.0f};
+      pointConfig.lighting.environmentIntensity = 0.0f;
+      pointConfig.lighting.mainLightIntensity = 1.0f;
+      pointConfig.lighting.ambientFloor = 0.15f;
+
+      backend->renderIteration(pointConfig);
+      rt::RenderBuffer pointBuffer = backend->downloadRenderBuffer();
+      require(pointBuffer.width == 64 && pointBuffer.height == 64, "point cloud buffer size mismatch");
+
+      double redSum = 0.0, blueSum = 0.0;
+      for (const auto& c : pointBuffer.color) {
+        require(std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z),
+                "non-finite color in point-cloud-only scene");
+        redSum  += c.x;
+        blueSum += c.z;
+      }
+      require(redSum > 0.0, "point cloud must produce non-black output");
+      require(redSum > blueSum + 0.1,
+              "red point cloud should dominate in the red channel");
+    }
+
+    // ---- Per-point color (colormap path) ----
+    // Verifies that RTPointCloud::colors (per-point overrides) flow from the CPU
+    // buffer all the way to the rendered pixels.
+    {
+      rt::RTScene coloredScene;
+      rt::RTPointCloud cloud;
+      cloud.name = "blue_cloud";
+      cloud.centers = {{0.0f, 0.0f, 0.0f}};
+      cloud.radius = 0.55f;
+      cloud.baseColor = {1.0f, 0.0f, 0.0f, 1.0f};        // base = red
+      cloud.colors   = {{0.0f, 0.0f, 1.0f}};              // override = blue
+      coloredScene.pointClouds.push_back(cloud);
+      coloredScene.hash = 201;
+
+      backend->setScene(coloredScene);
+      backend->updateCamera(camera);
+      backend->resetAccumulation();
+
+      rt::RenderConfig coloredConfig;
+      coloredConfig.samplesPerIteration = 1;
+      coloredConfig.maxBounces = 1;
+      coloredConfig.accumulate = false;
+      coloredConfig.lighting.backgroundColor = {0.0f, 0.0f, 0.0f};
+      coloredConfig.lighting.environmentIntensity = 0.0f;
+      coloredConfig.lighting.mainLightIntensity = 1.0f;
+      coloredConfig.lighting.ambientFloor = 0.15f;
+
+      backend->renderIteration(coloredConfig);
+      rt::RenderBuffer coloredBuffer = backend->downloadRenderBuffer();
+
+      double redSum = 0.0, blueSum = 0.0;
+      for (const auto& c : coloredBuffer.color) {
+        require(std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z),
+                "non-finite color in per-point-color scene");
+        redSum  += c.x;
+        blueSum += c.z;
+      }
+      require(blueSum > 0.0, "per-point blue color must produce visible output");
+      require(blueSum > redSum + 0.05,
+              "per-point color override (blue) should dominate over baseColor (red)");
+    }
+
+    // ---- Dual-IAS regression: curves and point clouds coexist ----
+    // This is the regression test for the bug where adding a point cloud caused
+    // Metal's built-in curve intersection to stop working.  Both the red point
+    // cloud (left half) and the green curve sphere (right half) must be visible.
+    {
+      rt::RTScene mixedScene;
+
+      rt::RTPointCloud cloud;
+      cloud.name = "mixed_points";
+      cloud.centers = {{-0.6f, 0.0f, 0.0f}};
+      cloud.radius = 0.35f;
+      cloud.baseColor = {1.0f, 0.0f, 0.0f, 1.0f};
+      mixedScene.pointClouds.push_back(cloud);
+
+      rt::RTCurveNetwork curveNet;
+      curveNet.name = "mixed_curve";
+      curveNet.baseColor = {0.0f, 1.0f, 0.0f, 1.0f};
+      rt::RTCurvePrimitive curveSphere;
+      curveSphere.type   = rt::RTCurvePrimitiveType::Sphere;
+      curveSphere.p0     = {0.6f, 0.0f, 0.0f};
+      curveSphere.radius = 0.35f;
+      curveNet.primitives.push_back(curveSphere);
+      mixedScene.curveNetworks.push_back(curveNet);
+
+      mixedScene.hash = 202;
+
+      backend->setScene(mixedScene);
+      backend->updateCamera(camera);
+      backend->resetAccumulation();
+
+      rt::RenderConfig mixedConfig;
+      mixedConfig.samplesPerIteration = 1;
+      mixedConfig.maxBounces = 1;
+      mixedConfig.accumulate = false;
+      mixedConfig.lighting.backgroundColor = {0.0f, 0.0f, 0.0f};
+      mixedConfig.lighting.environmentIntensity = 0.0f;
+      mixedConfig.lighting.mainLightIntensity = 1.0f;
+      mixedConfig.lighting.ambientFloor = 0.15f;
+
+      backend->renderIteration(mixedConfig);
+      rt::RenderBuffer mixedBuffer = backend->downloadRenderBuffer();
+
+      double redSum = 0.0, greenSum = 0.0;
+      for (const auto& c : mixedBuffer.color) {
+        require(std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z),
+                "non-finite color in mixed curve+point scene");
+        redSum   += c.x;
+        greenSum += c.y;
+      }
+      require(redSum > 0.0,
+              "point cloud (red, left) must be visible in mixed curve+point scene");
+      require(greenSum > 0.0,
+              "curve network (green, right) must remain visible when a point cloud is "
+              "also present — dual-IAS regression");
     }
 
     std::cout << "metal_backend_smoke_test passed" << std::endl;

@@ -11,6 +11,7 @@
 #include "polyscope/render/color_maps.h"
 #include "polyscope/render/engine.h"
 #include "polyscope/rt/curve_network.h"  
+#include "polyscope/rt/point_cloud.h"   
 #include "polyscope/rt/polyscope.h"      
 #include "polyscope/rt/surface_mesh.h"  
 
@@ -153,6 +154,24 @@ int main(int argc, char** argv) {
   auto* psCurve = ps::registerCurveNetwork("geodesic isocontours", isoNodes, isoEdges);
   psCurve->setColor({1.0f, 1.0f, 1.0f});
   psCurve->setRadius(0.0002f, /*isRelative=*/false);
+
+  // Sample every kStep-th vertex to demonstrate native Metal point rendering.
+  constexpr int kStep = 20;
+  std::vector<glm::vec3> sampledPositions;
+  std::vector<float>     sampledDist;
+  for (gcs::Vertex v : mesh->vertices()) {
+    if (static_cast<int>(v.getIndex()) % kStep != 0) continue;
+    auto p = geometry->inputVertexPositions[v];
+    sampledPositions.push_back({float(p.x), float(p.y), float(p.z)});
+    sampledDist.push_back(distValues[v.getIndex()]);
+  }
+
+  auto* psPoints = ps::registerPointCloud("surface samples", sampledPositions);
+  psPoints->addScalarQuantity("geodesic distance", sampledDist)
+          ->setColorMap("geodesic_hot_r")
+          ->setMapRange({0.0f, static_cast<float>(maxDist)})
+          ->setEnabled(true);
+  psPoints->setPointRadius(0.0015f, /*isRelative=*/false);
 
   ps::show();
   return 0;

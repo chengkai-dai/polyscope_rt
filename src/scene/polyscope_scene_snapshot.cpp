@@ -10,6 +10,7 @@
 #include "polyscope/curve_network.h"
 #include "polyscope/polyscope.h"
 #include "polyscope/point_cloud.h"
+#include "polyscope/point_cloud_scalar_quantity.h"
 #include "polyscope/render/color_maps.h"
 #include "polyscope/render/engine.h"
 #include "polyscope/simple_triangle_mesh.h"
@@ -27,8 +28,6 @@ namespace {
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
 constexpr float kMinProceduralRadius = 1e-4f;
-constexpr uint32_t kPointSphereLatSegments = 4u;
-constexpr uint32_t kPointSphereLonSegments = 6u;
 
 glm::mat4 makeTranslationTransform(const glm::vec3& offset) {
   glm::mat4 transform(1.0f);
@@ -101,7 +100,8 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
   return out;
 }
 
-void applyMaterialProfile(rt::RTMesh& mesh, std::string_view materialName) {
+template <typename T>
+void applyMaterialPreset(T& target, std::string_view materialName) {
   using polyscope::rt::applyPhysicalParamsFromPreset;
   using polyscope::rt::Ceramic;
   using polyscope::rt::Clay;
@@ -109,53 +109,60 @@ void applyMaterialProfile(rt::RTMesh& mesh, std::string_view materialName) {
   using polyscope::rt::PerfectDiffuse;
   using polyscope::rt::Rubber;
 
-  if (materialName == "clay") { applyPhysicalParamsFromPreset(mesh, Clay()); return; }
-  if (materialName == "flat") { applyPhysicalParamsFromPreset(mesh, PerfectDiffuse()); return; }
-  if (materialName == "candy") { auto p = Plastic(); p.roughness = 0.08f; applyPhysicalParamsFromPreset(mesh, p); return; }
-  if (materialName == "wax") { auto p = Plastic(); p.roughness = 0.35f; applyPhysicalParamsFromPreset(mesh, p); return; }
-  if (materialName == "mud") { applyPhysicalParamsFromPreset(mesh, Rubber()); return; }
-  if (materialName == "ceramic") { applyPhysicalParamsFromPreset(mesh, Ceramic()); return; }
-  if (materialName == "jade") { auto p = Plastic(); p.roughness = 0.12f; applyPhysicalParamsFromPreset(mesh, p); return; }
-  if (materialName == "normal") { auto p = Plastic(); p.roughness = 0.6f; applyPhysicalParamsFromPreset(mesh, p); return; }
-  applyPhysicalParamsFromPreset(mesh, PerfectDiffuse());
+  if (materialName == "clay") { applyPhysicalParamsFromPreset(target, Clay()); return; }
+  if (materialName == "flat") { applyPhysicalParamsFromPreset(target, PerfectDiffuse()); return; }
+  if (materialName == "candy") { auto p = Plastic(); p.roughness = 0.08f; applyPhysicalParamsFromPreset(target, p); return; }
+  if (materialName == "wax") { auto p = Plastic(); p.roughness = 0.35f; applyPhysicalParamsFromPreset(target, p); return; }
+  if (materialName == "mud") { applyPhysicalParamsFromPreset(target, Rubber()); return; }
+  if (materialName == "ceramic") { applyPhysicalParamsFromPreset(target, Ceramic()); return; }
+  if (materialName == "jade") { auto p = Plastic(); p.roughness = 0.12f; applyPhysicalParamsFromPreset(target, p); return; }
+  if (materialName == "normal") { auto p = Plastic(); p.roughness = 0.6f; applyPhysicalParamsFromPreset(target, p); return; }
+  applyPhysicalParamsFromPreset(target, PerfectDiffuse());
 }
 
-void applyCurveMaterialProfile(rt::RTCurveNetwork& curve, std::string_view materialName) {
-  using polyscope::rt::applyPhysicalParamsFromPreset;
-  using polyscope::rt::Ceramic;
-  using polyscope::rt::Clay;
-  using polyscope::rt::Plastic;
-  using polyscope::rt::PerfectDiffuse;
-  using polyscope::rt::Rubber;
+rt::RTPointCloud makeRTPointCloud(polyscope::PointCloud& cloud) {
+  rt::RTPointCloud out;
+  out.name   = cloud.getName();
+  out.radius = std::max(kMinProceduralRadius, static_cast<float>(cloud.getPointRadius()));
+  out.baseColor = glm::vec4(cloud.getPointColor(), 1.0f);
 
-  if (materialName == "clay") { applyPhysicalParamsFromPreset(curve, Clay()); return; }
-  if (materialName == "flat") { applyPhysicalParamsFromPreset(curve, PerfectDiffuse()); return; }
-  if (materialName == "candy") { auto p = Plastic(); p.roughness = 0.08f; applyPhysicalParamsFromPreset(curve, p); return; }
-  if (materialName == "wax") { auto p = Plastic(); p.roughness = 0.35f; applyPhysicalParamsFromPreset(curve, p); return; }
-  if (materialName == "mud") { applyPhysicalParamsFromPreset(curve, Rubber()); return; }
-  if (materialName == "ceramic") { applyPhysicalParamsFromPreset(curve, Ceramic()); return; }
-  if (materialName == "jade") { auto p = Plastic(); p.roughness = 0.12f; applyPhysicalParamsFromPreset(curve, p); return; }
-  if (materialName == "normal") { auto p = Plastic(); p.roughness = 0.6f; applyPhysicalParamsFromPreset(curve, p); return; }
-  applyPhysicalParamsFromPreset(curve, PerfectDiffuse());
-}
-
-rt::RTMesh makeMeshFromPointCloud(polyscope::PointCloud& cloud) {
-  rt::RTMesh out;
-  out.name = cloud.getName();
-  out.transform = cloud.getTransform();
-  out.baseColorFactor = glm::vec4(cloud.getPointColor(), 1.0f);
-  applyMaterialProfile(out, cloud.getMaterial());
-
-  float radius = std::max(kMinProceduralRadius, static_cast<float>(cloud.getPointRadius()));
-  rt_geometry::TriangleMeshData combined;
-  rt_geometry::TriangleMeshData sphereTemplate =
-      rt_geometry::makeUvSphere(radius, kPointSphereLatSegments, kPointSphereLonSegments);
-  for (const glm::vec3& point : cloud.points.data) {
-    rt_geometry::appendMesh(combined, sphereTemplate, makeTranslationTransform(point));
+  glm::mat4 transform = cloud.getTransform();
+  out.centers.reserve(cloud.points.data.size());
+  for (const glm::vec3& p : cloud.points.data) {
+    out.centers.push_back(glm::vec3(transform * glm::vec4(p, 1.0f)));
   }
 
-  out.vertices = std::move(combined.vertices);
-  out.indices = std::move(combined.faces);
+  // Reflect Polyscope material preset in roughness/metallic.
+  rt::RTMesh tmp;
+  tmp.metallicFactor  = 0.0f;
+  tmp.roughnessFactor = 0.8f;
+  applyMaterialPreset(tmp, cloud.getMaterial());
+  out.metallic  = tmp.metallicFactor;
+  out.roughness = tmp.roughnessFactor;
+  out.unlit     = tmp.unlit;
+
+  // If an enabled scalar quantity exists, compute per-point colors from its colormap.
+  for (auto& [qName, qPtr] : cloud.quantities) {
+    if (!qPtr->isEnabled()) continue;
+    auto* scalarQ = dynamic_cast<polyscope::PointCloudScalarQuantity*>(qPtr.get());
+    if (!scalarQ) continue;
+
+    const std::string& cmapName = scalarQ->getColorMap();
+    const polyscope::render::ValueColorMap& cmap =
+        polyscope::render::engine->getColorMap(cmapName);
+    auto [lo, hi] = scalarQ->getMapRange();
+    const std::vector<float>& vals = scalarQ->values.data;
+
+    out.colors.reserve(out.centers.size());
+    double range = (hi != lo) ? (hi - lo) : 1.0;
+    for (size_t i = 0; i < out.centers.size(); ++i) {
+      float v = (i < vals.size()) ? vals[i] : 0.0f;
+      double t = (v - lo) / range;
+      out.colors.push_back(cmap.getValue(t));
+    }
+    break; // Use the first enabled scalar quantity.
+  }
+
   return out;
 }
 
@@ -163,7 +170,7 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
   rt::RTCurveNetwork out;
   out.name = network.getName();
   out.baseColor = glm::vec4(network.getColor(), 1.0f);
-  applyCurveMaterialProfile(out, network.getMaterial());
+  applyMaterialPreset(out, network.getMaterial());
 
   float radius = std::max(kMinProceduralRadius, network.getRadius());
   glm::mat4 transform = network.getTransform();
@@ -208,7 +215,7 @@ rt::RTMesh makeMeshFromVolumeMesh(polyscope::VolumeMesh& mesh) {
   out.transform = mesh.getTransform();
   out.baseColorFactor = glm::vec4(mesh.getColor(), 1.0f);
   out.vertices = mesh.vertexPositions.data;
-  applyMaterialProfile(out, mesh.getMaterial());
+  applyMaterialPreset(out, mesh.getMaterial());
 
   const auto& triIndices = mesh.triangleVertexInds.data;
   const auto& triFaceIndices = mesh.triangleFaceInds.data;
@@ -226,7 +233,7 @@ rt::RTMesh makeMeshFromVolumeMesh(polyscope::VolumeMesh& mesh) {
 }
 
 void addMeshAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTMesh&& mesh, polyscope::Structure& structure) {
-  snapshot.supportedMeshCount++;
+  snapshot.supportedStructureCount++;
   if (snapshot.hostStructure == nullptr) {
     snapshot.hostStructure = &structure;
     snapshot.hostTypeName = structure.typeName();
@@ -253,7 +260,7 @@ void addMeshAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTMesh&& mesh, polysco
 }
 
 void addCurveNetworkAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTCurveNetwork&& curveNet, polyscope::Structure& structure) {
-  snapshot.supportedMeshCount++;
+  snapshot.supportedStructureCount++;
   if (snapshot.hostStructure == nullptr) {
     snapshot.hostStructure = &structure;
     snapshot.hostTypeName = structure.typeName();
@@ -273,6 +280,26 @@ void addCurveNetworkAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTCurveNetwork
   }
 
   snapshot.scene.curveNetworks.push_back(std::move(curveNet));
+}
+
+void addPointCloudAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTPointCloud&& pc, polyscope::Structure& structure) {
+  snapshot.supportedStructureCount++;
+  if (snapshot.hostStructure == nullptr) {
+    snapshot.hostStructure = &structure;
+    snapshot.hostTypeName  = structure.typeName();
+    snapshot.hostName      = structure.getName();
+  }
+
+  hashString(snapshot.scene.hash, structure.typeName());
+  hashString(snapshot.scene.hash, structure.getName());
+  hashBytes(snapshot.scene.hash, &pc.baseColor[0], sizeof(float) * 4);
+  hashBytes(snapshot.scene.hash, &pc.radius, sizeof(float));
+  hashBytes(snapshot.scene.hash, &pc.metallic, sizeof(float));
+  hashBytes(snapshot.scene.hash, &pc.roughness, sizeof(float));
+  hashVector(snapshot.scene.hash, pc.centers);
+  hashVector(snapshot.scene.hash, pc.colors);
+
+  snapshot.scene.pointClouds.push_back(std::move(pc));
 }
 
 void addLightsAndHash(PolyscopeSceneSnapshot& snapshot, const std::vector<rt::RTPunctualLight>& apiLights) {
@@ -325,7 +352,7 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
 
       if (auto* simpleMesh = dynamic_cast<polyscope::SimpleTriangleMesh*>(structure)) {
         rt::RTMesh mesh = makeMeshFromSimpleTriangleMesh(*simpleMesh);
-        applyMaterialProfile(mesh, simpleMesh->getMaterial());
+        applyMaterialPreset(mesh, simpleMesh->getMaterial());
         applyMaterialOverride(mesh, materialOverrides);
         if (mesh.vertices.empty() || mesh.indices.empty()) continue;
         addMeshAndHash(snapshot, std::move(mesh), *structure);
@@ -335,7 +362,7 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
       if (auto* surfaceMesh = dynamic_cast<polyscope::SurfaceMesh*>(structure)) {
         if (surfaceMesh->triangleVertexInds.data.empty()) continue;
         rt::RTMesh mesh = makeMeshFromSurfaceMesh(*surfaceMesh);
-        applyMaterialProfile(mesh, surfaceMesh->getMaterial());
+        applyMaterialPreset(mesh, surfaceMesh->getMaterial());
         applyMaterialOverride(mesh, materialOverrides);
         if (mesh.vertices.empty() || mesh.indices.empty()) continue;
         if (surfaceMesh->getEdgeWidth() > 0.0) {
@@ -348,10 +375,9 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
       }
 
       if (auto* pointCloud = dynamic_cast<polyscope::PointCloud*>(structure)) {
-        rt::RTMesh mesh = makeMeshFromPointCloud(*pointCloud);
-        applyMaterialOverride(mesh, materialOverrides);
-        if (mesh.vertices.empty() || mesh.indices.empty()) continue;
-        addMeshAndHash(snapshot, std::move(mesh), *structure);
+        if (pointCloud->points.data.empty()) continue;
+        rt::RTPointCloud pc = makeRTPointCloud(*pointCloud);
+        addPointCloudAndHash(snapshot, std::move(pc), *pointCloud);
         continue;
       }
 
@@ -374,7 +400,7 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
 
   // Include curve networks registered directly via polyscope::rt::registerCurveNetwork().
   for (const rt::RTCurveNetwork& directNet : getDirectRtCurveNetworks()) {
-    snapshot.supportedMeshCount++;
+    snapshot.supportedStructureCount++;
     hashString(snapshot.scene.hash, directNet.name);
     hashBytes(snapshot.scene.hash, &directNet.baseColor[0], sizeof(float) * 4);
     hashBytes(snapshot.scene.hash, &directNet.metallic, sizeof(float));

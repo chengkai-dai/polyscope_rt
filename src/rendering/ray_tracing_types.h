@@ -87,9 +87,22 @@ struct RTCurveNetwork {
   std::vector<RTCurvePrimitive> primitives;
 };
 
+struct RTPointCloud {
+  std::string name;
+  std::vector<glm::vec3> centers;
+  // Per-point colors (same length as centers if populated, or empty to use baseColor uniformly).
+  std::vector<glm::vec3> colors;
+  float radius = 0.01f;
+  glm::vec4 baseColor{0.8f, 0.8f, 0.8f, 1.0f};
+  float metallic = 0.0f;
+  float roughness = 0.8f;
+  bool unlit = false;
+};
+
 struct RTScene {
   std::vector<RTMesh> meshes;
   std::vector<RTCurveNetwork> curveNetworks;
+  std::vector<RTPointCloud> pointClouds;
   std::vector<RTPunctualLight> lights;
   uint64_t hash = 0;
 };

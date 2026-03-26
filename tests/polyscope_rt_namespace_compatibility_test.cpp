@@ -10,12 +10,9 @@
 #include "polyscope/rt/simple_triangle_mesh.h"
 
 #include "scene/polyscope_scene_snapshot.h"
+#include "test_helpers.h"
 
 namespace {
-
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
 
 } // namespace
 
@@ -44,8 +41,9 @@ int main() {
     require(!polyscope::rt::state::structures.empty(), "structure registry should be reachable via rt namespace");
 
     PolyscopeSceneSnapshot snapshot = capturePolyscopeSceneSnapshot();
-    require(snapshot.supportedMeshCount == 2, "expected both rt namespace structures in the snapshot");
-    require(snapshot.scene.meshes.size() == 2, "expected two RT meshes from rt namespace usage");
+    require(snapshot.supportedStructureCount == 2, "expected both rt namespace structures in the snapshot");
+    require(snapshot.scene.meshes.size() == 1, "expected one RT mesh (triangle mesh only; point cloud → pointClouds)");
+    require(snapshot.scene.pointClouds.size() == 1, "expected one RTPointCloud from the point cloud structure");
 
     polyscope::rt::shutdown();
     std::cout << "polyscope_rt_namespace_compatibility_test passed" << std::endl;

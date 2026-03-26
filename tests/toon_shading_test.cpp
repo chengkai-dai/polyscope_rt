@@ -4,12 +4,9 @@
 #include <stdexcept>
 
 #include "rendering/toon_shading.h"
+#include "test_helpers.h"
 
 namespace {
-
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
 
 } // namespace
 

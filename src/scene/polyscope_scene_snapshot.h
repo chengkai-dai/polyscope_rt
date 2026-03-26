@@ -13,7 +13,7 @@ struct PolyscopeSceneSnapshot {
   polyscope::Structure* hostStructure = nullptr;
   std::string hostTypeName;
   std::string hostName;
-  size_t supportedMeshCount = 0;
+  size_t supportedStructureCount = 0;
 };
 
 PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot();

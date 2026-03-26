@@ -171,7 +171,7 @@ Run the surface mesh example:
 ### Structure support
 
 - [x] ~~Wireframe rendering — direct edge rendering without triangle fill~~
-- [ ] Native point rendering — per-point radius and color quantity support
+- [x] ~~Native point rendering — per-point radius and color quantity support~~
 - [ ] Vector field rendering — arrow/tube primitives from Polyscope face/vertex vector quantities
 
 ### Rendering

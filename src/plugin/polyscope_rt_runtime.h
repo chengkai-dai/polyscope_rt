@@ -54,7 +54,6 @@ private:
   rt::RenderConfig buildRenderConfig(uint32_t samplesPerIteration) const;
 
   bool rayTracingEnabled_ = false;
-  bool progressiveAccumulation_ = true;
   int previewSamplesPerFrame_ = 1;
   int maxBounces_ = 6;
   bool autoSyncScene_ = true;
@@ -90,6 +89,7 @@ private:
   PolyscopeSceneSnapshot offlineSnapshot_;
   rt::RTCamera offlineCamera_;
   std::string offlineOutputPath_;
+  std::string pendingOutputPath_;  // set by exportPNG(); consumed by beginOfflineRender()
   std::chrono::steady_clock::time_point offlineStartTime_{};
 
   polyscope::ColorImageQuantity* renderImage_ = nullptr;

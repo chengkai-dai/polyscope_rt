@@ -101,6 +101,14 @@ struct CurvePrimitiveGPU {
   uint4 materialObjectId;
 };
 
+// One bounding-box sphere primitive.  center_radius.w = radius.
+// materialObjectId.x = material index, .y = object id.
+struct PointPrimitiveGPU {
+  float4 center_radius;
+  float4 baseColor;         // xyz = per-point color, w = unused
+  uint4  materialObjectId;
+};
+
 
 uint wangHash(uint x) {
   x = (x ^ 61u) ^ (x >> 16u);
@@ -284,7 +292,7 @@ float computeClipDepth(float3 worldPos, constant CameraData& camera) {
 
 float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 normal,
                                intersector<curve_data, triangle_data, instancing> isector,
-                               instance_acceleration_structure scene,
+                               instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 toLight = normalize(-lightDir);
   float nDotL = max(dot(normal, toLight), 0.0f);
@@ -296,23 +304,24 @@ float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hit
   shadowRay.min_distance = 5e-3f;
   shadowRay.max_distance = 1e6f;
   isector.accept_any_intersection(true);
-  auto shadowHit = isector.intersect(shadowRay, scene, 0xFFu);
+  auto mcShadow = isector.intersect(shadowRay, scene, 0xFFu);
+  auto ptShadow = isector.intersect(shadowRay, pointScene, 0xFFu, ftable);
   isector.accept_any_intersection(false);
-  if (shadowHit.type != intersection_type::none) return 0.0f;
+  if (mcShadow.type != intersection_type::none || ptShadow.type != intersection_type::none) return 0.0f;
   return nDotL * lightIntensity;
 }
 
 float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
                        device const TriangleData* triangles, device const MaterialData* materials,
                        thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
-                       instance_acceleration_structure scene,
+                       instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                        intersection_function_table<curve_data, triangle_data, instancing> ftable);
 
 bool sampleAreaLight(float3 hitPos, float3 normal, constant LightingData& lighting,
                      device const TriangleData* triangles, device const MaterialData* materials,
                      thread uint& rng, thread float3& toLight,
                      thread float3& radiance, intersector<curve_data, triangle_data, instancing> isector,
-                     instance_acceleration_structure scene,
+                     instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                      intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   if (lighting.areaLightCenterEnabled.w < 0.5f) return false;
 
@@ -330,7 +339,7 @@ bool sampleAreaLight(float3 hitPos, float3 normal, constant LightingData& lighti
   if (nDotL <= 0.0f || lightCos <= 0.0f) return false;
 
   float visibility = shadowVisibility(hitPos, toLight, max(distance - 2e-2f, 1e-3f),
-                                      triangles, materials, rng, isector, scene, ftable);
+                                      triangles, materials, rng, isector, scene, pointScene, ftable);
   if (visibility <= 0.0f) return false;
 
   float area = 4.0f * length(cross(lighting.areaLightU.xyz, lighting.areaLightV.xyz));
@@ -484,7 +493,7 @@ float3 applyNormalMap(float3 geomNormal, float3 shadingNormal, float3 p0, float3
 float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
                        device const TriangleData* triangles, device const MaterialData* materials,
                        thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
-                       instance_acceleration_structure scene,
+                       instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                        intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   ray shadowRay;
   shadowRay.origin = hitPos;
@@ -493,12 +502,18 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
   shadowRay.max_distance = maxDistance;
 
   for (uint i = 0u; i < 8u; ++i) {
-    auto shadowHit = isector.intersect(shadowRay, scene, 0xFFu);
-    if (shadowHit.type == intersection_type::none) return 1.0f;
+    auto mcHit = isector.intersect(shadowRay, scene, 0xFFu);
+    auto ptHit = isector.intersect(shadowRay, pointScene, 0xFFu, ftable);
+    if (mcHit.type == intersection_type::none && ptHit.type == intersection_type::none) return 1.0f;
 
-    if (shadowHit.type == intersection_type::curve) return 0.0f;
+    // Sphere (point cloud) hit → always opaque
+    bool ptCloser = ptHit.type != intersection_type::none &&
+                    (mcHit.type == intersection_type::none || ptHit.distance < mcHit.distance);
+    if (ptCloser) return 0.0f;
 
-    uint objectId = triangles[shadowHit.primitive_id].objectFlags.x;
+    if (mcHit.type == intersection_type::curve) return 0.0f;
+
+    uint objectId = triangles[mcHit.primitive_id].objectFlags.x;
     float opacity = clamp(materials[objectId].transmissionIor.w, 0.0f, 1.0f);
     float transmission = clamp(materials[objectId].transmissionIor.x, 0.0f, 1.0f);
 
@@ -513,7 +528,7 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
       if (rand01(rng) < opacity) return 0.0f;
     }
 
-    float traveled = shadowHit.distance + 2e-3f;
+    float traveled = mcHit.distance + 2e-3f;
     shadowRay.origin = shadowRay.origin + toLight * traveled;
     shadowRay.min_distance = 1e-3f;
     shadowRay.max_distance = maxDistance - traveled;
@@ -523,7 +538,7 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
 }
 
 float evaluatePunctualLight(device const PunctualLightData* lights, uint lightIndex, float3 hitPos, float3 normal,
-                            intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene,
+                            intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                             intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   PunctualLightData light = lights[lightIndex];
   uint lightType = uint(light.directionType.w);
@@ -566,9 +581,10 @@ float evaluatePunctualLight(device const PunctualLightData* lights, uint lightIn
   shadowRay.min_distance = 5e-3f;
   shadowRay.max_distance = maxDistance;
   isector.accept_any_intersection(true);
-  auto shadowHit = isector.intersect(shadowRay, scene, 0xFFu);
+  auto mcShadow = isector.intersect(shadowRay, scene, 0xFFu);
+  auto ptShadow = isector.intersect(shadowRay, pointScene, 0xFFu, ftable);
   isector.accept_any_intersection(false);
-  if (shadowHit.type != intersection_type::none) return 0.0f;
+  if (mcShadow.type != intersection_type::none || ptShadow.type != intersection_type::none) return 0.0f;
 
   float luminance = dot(lightColor, float3(0.2126f, 0.7152f, 0.0722f));
   return luminance * attenuation * nDotL;
@@ -666,8 +682,9 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const MaterialData* materials, device const TextureData* textures,
                          device const float4* texturePixels, device const PunctualLightData* sceneLights,
                          device const CurvePrimitiveGPU* curvePrimitives,
+                         device const PointPrimitiveGPU* pointPrimitives,
                          constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
-                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene,
+                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable);
 
 float3 sampleMissRadiance(float3 dir, constant LightingData& lighting) {
@@ -717,30 +734,112 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   return out;
 }
 
+// Return type for custom bounding-box intersection functions.
+struct BoundingBoxIntersectionResult {
+  bool  accept   [[accept_intersection]];
+  float distance [[distance]];
+};
+
+// Custom bounding-box intersection function for analytic sphere ray-tracing.
+// [[visible]] is required so the function is accessible by name from the host
+// and can be inserted into an MTLIntersectionFunctionTable.
+[[intersection(bounding_box, instancing)]]
+BoundingBoxIntersectionResult sphereIntersection(float3 rayOrigin         [[origin]],
+                                                  float3 rayDirection      [[direction]],
+                                                  float  rayMinDistance    [[min_distance]],
+                                                  float  rayMaxDistance    [[max_distance]],
+                                                  uint   primitiveIndex    [[primitive_id]],
+                                                  device const PointPrimitiveGPU* points [[buffer(25)]]) {
+  BoundingBoxIntersectionResult result;
+  result.accept = false;
+
+  PointPrimitiveGPU pt = points[primitiveIndex];
+  float3 center = pt.center_radius.xyz;
+  float  radius = pt.center_radius.w;
+
+  float3 oc = rayOrigin - center;
+  float  b  = dot(oc, rayDirection);
+  float  c  = dot(oc, oc) - radius * radius;
+  float  disc = b * b - c;
+  if (disc < 0.0f) return result;
+
+  float sqrtDisc = sqrt(disc);
+  float t = -b - sqrtDisc;
+  if (t < rayMinDistance || t > rayMaxDistance) {
+    t = -b + sqrtDisc;
+    if (t < rayMinDistance || t > rayMaxDistance) return result;
+  }
+
+  result.accept   = true;
+  result.distance = t;
+  return result;
+}
+
+SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIndex,
+                              device const PointPrimitiveGPU* points,
+                              device const MaterialData* materials) {
+  SurfaceHitInfo out;
+  PointPrimitiveGPU pt = points[primitiveIndex];
+  float3 center  = pt.center_radius.xyz;
+  float3 hitPos  = currentRay.origin + currentRay.direction * hitDistance;
+  float3 normal  = normalize(hitPos - center);
+  if (dot(normal, -currentRay.direction) < 0.0f) normal = -normal;
+
+  uint matIdx = pt.materialObjectId.x;
+  uint objId  = pt.materialObjectId.y;
+  MaterialData material = materials[matIdx];
+
+  out.hit        = 1u;
+  out.objectId   = objId;
+  out.distance   = hitDistance;
+  out.hitPos     = hitPos;
+  out.geomNormal = normal;
+  out.normal     = normal;
+  // Per-point color overrides the shared material base color when populated.
+  out.baseColor  = clamp(pt.baseColor.xyz, 0.0f, 1.0f);
+  out.emissive   = material.emissiveFactor.xyz;
+  out.metallic   = material.metallicRoughnessNormal.x;
+  out.roughness  = clamp(material.metallicRoughnessNormal.y, 0.045f, 1.0f);
+  out.transmission = 0.0f;
+  out.ior        = 1.5f;
+  out.opacity    = 1.0f;
+  out.unlit      = (material.transmissionIor.z > 0.5f);
+  out.isInfinitePlane = false;
+  return out;
+}
+
 SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, device const float4* normals,
                                 device const float2* texcoords, device const float4* vertexColors,
                                 device const TriangleData* triangles,
                                 device const MaterialData* materials, device const TextureData* textures,
                                 device const float4* texturePixels,
                                 device const CurvePrimitiveGPU* curvePrimitives,
+                                device const PointPrimitiveGPU* pointPrimitives,
                                 intersector<curve_data, triangle_data, instancing> isector,
-                                instance_acceleration_structure scene,
+                                instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                 intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   SurfaceHitInfo out;
-  auto hit = isector.intersect(currentRay, scene, 0xFFu);
-  if (hit.type == intersection_type::none) return out;
+  auto mcHit = isector.intersect(currentRay, scene, 0xFFu);
+  auto ptHit = isector.intersect(currentRay, pointScene, 0xFFu, ftable);
+  if (mcHit.type == intersection_type::none && ptHit.type == intersection_type::none) return out;
 
-  if (hit.type == intersection_type::curve) {
-    return shadeCurveHit(currentRay, hit.distance, hit.curve_parameter, hit.primitive_id, curvePrimitives, materials);
+  bool ptCloser = ptHit.type != intersection_type::none &&
+                  (mcHit.type == intersection_type::none || ptHit.distance < mcHit.distance);
+  if (ptCloser) {
+    return shadePointHit(currentRay, ptHit.distance, ptHit.primitive_id, pointPrimitives, materials);
   }
-  uint triangleIndex = hit.primitive_id;
+
+  if (mcHit.type == intersection_type::curve) {
+    return shadeCurveHit(currentRay, mcHit.distance, mcHit.curve_parameter, mcHit.primitive_id, curvePrimitives, materials);
+  }
+  uint triangleIndex = mcHit.primitive_id;
   TriangleData tri = triangles[triangleIndex];
   float3 p0 = positions[tri.indicesMaterial.x].xyz;
   float3 p1 = positions[tri.indicesMaterial.y].xyz;
   float3 p2 = positions[tri.indicesMaterial.z].xyz;
-  float3 hitPos = currentRay.origin + currentRay.direction * hit.distance;
+  float3 hitPos = currentRay.origin + currentRay.direction * mcHit.distance;
 
-  float2 bary = hit.triangle_barycentric_coord;
+  float2 bary = mcHit.triangle_barycentric_coord;
   float w0 = 1.0f - bary.x - bary.y;
   float w1 = bary.x;
   float w2 = bary.y;
@@ -792,7 +891,7 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
 
   out.hit = 1u;
   out.objectId = tri.objectFlags.x;
-  out.distance = hit.distance;
+  out.distance = mcHit.distance;
   out.hitPos = hitPos;
   out.geomNormal = geomNormal;
   out.normal = normal;
@@ -828,7 +927,7 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
 float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device const PunctualLightData* sceneLights,
                                  device const TriangleData* triangles, device const MaterialData* materials,
                                  constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
-                                 intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene,
+                                 intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                  intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 N = surf.normal;
   float3 V = viewDir;
@@ -847,7 +946,7 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
     float3 L = normalize(-lighting.mainLightDirection.xyz);
-    float visibility = shadowVisibility(surf.hitPos, L, 1e6f, triangles, materials, rng, isector, scene, ftable);
+    float visibility = shadowVisibility(surf.hitPos, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
     float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
     float NdotL = max(dot(N, L), 0.0f);
     if (NdotL > 0.0f && visibility > 0.0f) {
@@ -873,7 +972,7 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
       float3 radiance;
       float maxDistance = 1e6f;
       if (!samplePunctualLight(sceneLights, lightIndex, surf.hitPos, L, radiance, maxDistance)) continue;
-      float visibility = shadowVisibility(surf.hitPos, L, maxDistance, triangles, materials, rng, isector, scene, ftable);
+      float visibility = shadowVisibility(surf.hitPos, L, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
       float NdotL = max(dot(N, L), 0.0f);
       if (NdotL <= 0.0f || visibility <= 0.0f || all(radiance <= 0.0f)) continue;
       if (isInfinitePlane) {
@@ -895,7 +994,7 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
   if (frame.enableAreaLight != 0u) {
     float3 L;
     float3 radiance;
-    if (sampleAreaLight(surf.hitPos, N, lighting, triangles, materials, rng, L, radiance, isector, scene, ftable)) {
+    if (sampleAreaLight(surf.hitPos, N, lighting, triangles, materials, rng, L, radiance, isector, scene, pointScene, ftable)) {
       float NdotL = max(dot(N, L), 0.0f);
       if (isInfinitePlane) {
         directLighting += (diffuseAlbedo / 3.14159265f) * radiance * NdotL;
@@ -918,7 +1017,7 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
 float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, device const PunctualLightData* sceneLights,
                                         device const TriangleData* triangles, device const MaterialData* materials,
                                         constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
-                                        intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene,
+                                        intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                         intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 N = surf.normal;
   float3 V = viewDir;
@@ -932,7 +1031,7 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
   if (mainIntensity > 1e-5f) {
     float3 L = normalize(-lighting.mainLightDirection.xyz);
     float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
-    float visibility = shadowVisibility(surf.hitPos, L, 1e6f, triangles, materials, rng, isector, scene, ftable);
+    float visibility = shadowVisibility(surf.hitPos, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
     float NdotL = max(dot(N, L), 0.0f);
     if (NdotL > 0.0f && visibility > 0.0f) {
       float3 H = normalize(V + L);
@@ -951,7 +1050,7 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
       float3 radiance;
       float maxDistance = 1e6f;
       if (!samplePunctualLight(sceneLights, lightIndex, surf.hitPos, L, radiance, maxDistance)) continue;
-      float visibility = shadowVisibility(surf.hitPos, L, maxDistance, triangles, materials, rng, isector, scene, ftable);
+      float visibility = shadowVisibility(surf.hitPos, L, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
       float NdotL = max(dot(N, L), 0.0f);
       if (NdotL <= 0.0f || visibility <= 0.0f || all(radiance <= 0.0f)) continue;
       float3 H = normalize(V + L);
@@ -967,7 +1066,7 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
   if (frame.enableAreaLight != 0u) {
     float3 L;
     float3 radiance;
-    if (sampleAreaLight(surf.hitPos, N, lighting, triangles, materials, rng, L, radiance, isector, scene, ftable)) {
+    if (sampleAreaLight(surf.hitPos, N, lighting, triangles, materials, rng, L, radiance, isector, scene, pointScene, ftable)) {
       float NdotL = max(dot(N, L), 0.0f);
       if (NdotL > 0.0f && any(radiance > 0.0f)) {
         float3 H = normalize(V + L);
@@ -990,8 +1089,9 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
                          device const MaterialData* materials, device const TextureData* textures,
                          device const float4* texturePixels, device const PunctualLightData* sceneLights,
                          device const CurvePrimitiveGPU* curvePrimitives,
+                         device const PointPrimitiveGPU* pointPrimitives,
                          constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
-                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene,
+                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
@@ -1004,7 +1104,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       surf = firstHit;
     } else {
       surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                              curvePrimitives, isector, scene, ftable);
+                              curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable);
       SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
       if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
         surf = planeSurf;
@@ -1051,7 +1151,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
         SurfaceHitInfo glassSurf = surf;
         glassSurf.roughness = max(glassSurf.roughness, 0.08f);
         radiance += throughput * shadeStandardTransmissionSurface(glassSurf, currentViewDir, sceneLights, triangles, materials,
-                                                                  frame, lighting, rng, isector, scene, ftable);
+                                                                  frame, lighting, rng, isector, scene, pointScene, ftable);
       }
       float3 N = surf.normal;
       bool frontFace = dot(currentRay.direction, N) < 0.0f;
@@ -1079,8 +1179,8 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       reflectedRay.max_distance = 1e6f;
       radiance += throughput *
                   traceSpecularPath(reflectedRay, max(frame.maxBounces - bounce - 1u, 1u), positions, normals, texcoords, vertexColors,
-                                    triangles, materials, textures, texturePixels, sceneLights, curvePrimitives,
-                                    frame, lighting, rng, isector, scene, ftable) *
+                                    triangles, materials, textures, texturePixels, sceneLights, curvePrimitives, pointPrimitives,
+                                    frame, lighting, rng, isector, scene, pointScene, ftable) *
                   fresnel;
 
       float3 tint = mix(float3(1.0f), surf.baseColor, 0.08f);
@@ -1100,7 +1200,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
     }
 
     if (surf.isInfinitePlane) {
-      float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, ftable);
+      float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
       radiance += throughput * (directLighting + surf.emissive);
       throughput *= surf.baseColor * (1.0f - surf.metallic);
       currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
@@ -1119,7 +1219,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
     }
 
     // Opaque surface — NEE direct lighting + emissive (no ambient, indirect comes from bounces)
-    float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, ftable);
+    float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
     float3 F0 = mix(float3(surf.dielectricF0), surf.baseColor, surf.metallic);
     float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, surf.metallic);
     float NdotV = max(dot(surf.normal, currentViewDir), 0.0f);
@@ -1170,8 +1270,9 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const MaterialData* materials, device const TextureData* textures,
                          device const float4* texturePixels, device const PunctualLightData* sceneLights,
                          device const CurvePrimitiveGPU* curvePrimitives,
+                         device const PointPrimitiveGPU* pointPrimitives,
                          constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
-                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene,
+                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
@@ -1180,7 +1281,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
 
   for (uint bounce = 0u; bounce < max(remainingBounces, 1u); ++bounce) {
     SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                           curvePrimitives, isector, scene, ftable);
+                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable);
     SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
     if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
       surf = planeSurf;
@@ -1255,7 +1356,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     }
 
     if (surf.isInfinitePlane) {
-      float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, ftable);
+      float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
       radiance += throughput * (directLighting + surf.emissive);
       throughput *= surf.baseColor * (1.0f - surf.metallic);
       currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
@@ -1274,7 +1375,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     }
 
     // Full bounce for opaque surfaces (same quality as traceStandardPath)
-    float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, ftable);
+    float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
     float3 F0 = mix(float3(surf.dielectricF0), surf.baseColor, surf.metallic);
     float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, surf.metallic);
     float NdotV = max(dot(surf.normal, currentViewDir), 0.0f);
@@ -1328,6 +1429,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                                 device float4* normalBuffer [[buffer(15)]],
                                 device uint* objectIdBuffer [[buffer(16)]],
                                 instance_acceleration_structure scene [[buffer(17)]],
+                                instance_acceleration_structure pointScene [[buffer(26)]],
                                 device float4* diffuseAlbedoBuffer [[buffer(18)]],
                                 device float4* specularAlbedoBuffer [[buffer(19)]],
                                 device float* roughnessBuffer [[buffer(20)]],
@@ -1335,12 +1437,13 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                                 device const float4* vertexColors [[buffer(22)]],
                                 device const CurvePrimitiveGPU* curvePrimitives [[buffer(23)]],
                                 intersection_function_table<curve_data, triangle_data, instancing> ftable [[buffer(24)]],
+                                device const PointPrimitiveGPU* pointPrimitives [[buffer(25)]],
                                 uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= frame.width || gid.y >= frame.height) return;
 
   uint pixelIndex = gid.y * frame.width + gid.x;
   intersector<curve_data, triangle_data, instancing> isector;
-  isector.assume_geometry_type(geometry_type::curve | geometry_type::triangle);
+  isector.assume_geometry_type(geometry_type::bounding_box | geometry_type::curve | geometry_type::triangle);
 
   float3 colorSum = float3(0.0f);
   float alphaSum = 0.0f;
@@ -1378,7 +1481,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     float sampleAlpha = 1.0f;
 
     SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                           curvePrimitives, isector, scene, ftable);
+                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable);
     SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
     if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
       surf = planeSurf;
@@ -1387,8 +1490,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       if (frame.renderMode == 0u) {
         sampleColor =
             traceStandardPath(currentRay, normalize(camera.position.xyz - surf.hitPos), surf, positions, normals, texcoords, vertexColors,
-                              triangles, materials, textures, texturePixels, sceneLights, curvePrimitives,
-                              frame, lighting, rng, isector, scene, ftable);
+                              triangles, materials, textures, texturePixels, sceneLights, curvePrimitives, pointPrimitives,
+                              frame, lighting, rng, isector, scene, pointScene, ftable);
         float lum = dot(sampleColor, float3(0.212671f, 0.715160f, 0.072169f));
         if (lum > 5.0f) {
           sampleColor *= 5.0f / lum;
@@ -1400,17 +1503,17 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
           float direct = 0.0f;
           if (lighting.mainLightColorIntensity.w > 1e-5f) {
             direct += evaluateDirectionalLight(lighting.mainLightDirection.xyz, lighting.mainLightColorIntensity.w, surf.hitPos,
-                                              surf.normal, isector, scene, ftable);
+                                              surf.normal, isector, scene, pointScene, ftable);
           }
           if (frame.lightCount > 0u) {
             for (uint lightIndex = 0u; lightIndex < frame.lightCount; ++lightIndex) {
-              direct += evaluatePunctualLight(sceneLights, lightIndex, surf.hitPos, surf.normal, isector, scene, ftable);
+              direct += evaluatePunctualLight(sceneLights, lightIndex, surf.hitPos, surf.normal, isector, scene, pointScene, ftable);
             }
           }
           if (frame.enableAreaLight != 0u) {
             float3 areaL;
             float3 areaRadiance;
-            if (sampleAreaLight(surf.hitPos, surf.normal, lighting, triangles, materials, rng, areaL, areaRadiance, isector, scene, ftable)) {
+            if (sampleAreaLight(surf.hitPos, surf.normal, lighting, triangles, materials, rng, areaL, areaRadiance, isector, scene, pointScene, ftable)) {
               direct += dot(areaRadiance, float3(0.2126f, 0.7152f, 0.0722f)) * max(dot(surf.normal, areaL), 0.0f);
             }
           }

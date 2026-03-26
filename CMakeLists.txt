@@ -116,11 +116,9 @@ add_custom_command(
   COMMENT "Compiling Metal shaders"
 )
 add_custom_target(metal_shaders DEPENDS ${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.metallib)
-if(NOT DEFINED ENV{CI})
-  execute_process(COMMAND xcrun -sdk macosx --find metal RESULT_VARIABLE METAL_FOUND OUTPUT_QUIET ERROR_QUIET)
-  if(METAL_FOUND EQUAL 0)
-    add_dependencies(polyscope_rt_plugin metal_shaders)
-  endif()
+execute_process(COMMAND xcrun -sdk macosx --find metal RESULT_VARIABLE METAL_FOUND OUTPUT_QUIET ERROR_QUIET)
+if(METAL_FOUND EQUAL 0)
+  add_dependencies(polyscope_rt_plugin metal_shaders)
 endif()
 target_compile_definitions(polyscope_rt_plugin PRIVATE
   POLYSCOPE_RT_BUILD_METALLIB_PATH="${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.metallib"
@@ -255,4 +253,5 @@ if(BUILD_TESTING)
   polyscope_rt_add_private_test(polyscope_rt_namespace_compatibility_test tests/polyscope_rt_namespace_compatibility_test.cpp)
   polyscope_rt_add_private_test(metal_backend_smoke_test tests/metal_backend_smoke_test.cpp)
   polyscope_rt_add_private_test(metal_shader_unit_test tests/metal_shader_unit_test.cpp)
+  polyscope_rt_add_private_test(point_cloud_rendering_test tests/point_cloud_rendering_test.cpp)
 endif()

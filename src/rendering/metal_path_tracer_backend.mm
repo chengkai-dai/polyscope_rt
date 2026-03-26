@@ -194,6 +194,12 @@ struct CurvePrimitiveShaderData {
   simd_uint4 materialObjectId;
 };
 
+struct PointPrimitiveShaderData {
+  simd_float4 center_radius;    // xyz = center, w = radius
+  simd_float4 baseColor;        // xyz = per-point color, w = unused (1.0)
+  simd_uint4  materialObjectId; // x = material index, y = object id
+};
+
 simd_float4 makeFloat4(const glm::vec3& v, float w = 0.0f) { return simd_make_float4(v.x, v.y, v.z, w); }
 
 std::string buildNSErrorMessage(NSError* error) {
@@ -257,6 +263,15 @@ simd_float4x4 makeFloat4x4(const glm::mat4& m) {
   return result;
 }
 
+void dispatchThreads(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipelineState,
+                     uint32_t width, uint32_t height) {
+  const NSUInteger threadWidth  = pipelineState.threadExecutionWidth;
+  const NSUInteger threadHeight = std::max<NSUInteger>(1, pipelineState.maxTotalThreadsPerThreadgroup / threadWidth);
+  MTLSize threadsPerGroup = MTLSizeMake(threadWidth, threadHeight, 1);
+  MTLSize threadsPerGrid  = MTLSizeMake(width, height, 1);
+  [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
+}
+
 class MetalPathTracerBackend final : public rt::IRayTracingBackend {
 public:
   explicit MetalPathTracerBackend(const std::string& shaderLibraryPath) {
@@ -285,8 +300,12 @@ public:
       }
 
       id<MTLFunction> pathTraceKernel = [library_ newFunctionWithName:@"pathTraceKernel"];
+      id<MTLFunction> sphereIntersectFn = [library_ newFunctionWithName:@"sphereIntersection"];
 
       MTLLinkedFunctions* linkedFunctions = [[MTLLinkedFunctions alloc] init];
+      if (sphereIntersectFn != nil) {
+        linkedFunctions.functions = @[ sphereIntersectFn ];
+      }
 
       MTLComputePipelineDescriptor* pipelineDesc = [[MTLComputePipelineDescriptor alloc] init];
       pipelineDesc.computeFunction = pathTraceKernel;
@@ -303,8 +322,15 @@ public:
 
       {
         MTLIntersectionFunctionTableDescriptor* ftDesc = [[MTLIntersectionFunctionTableDescriptor alloc] init];
-        ftDesc.functionCount = 0;
+        ftDesc.functionCount = 1; // slot 0 = sphereIntersection
         intersectionFunctionTable_ = [pathTracePipelineState_ newIntersectionFunctionTableWithDescriptor:ftDesc];
+        if (sphereIntersectFn != nil) {
+          id<MTLFunctionHandle> handle = [pathTracePipelineState_ functionHandleWithFunction:sphereIntersectFn];
+          if (handle != nil) {
+            [intersectionFunctionTable_ setFunction:handle atIndex:0];
+          }
+          // Buffer binding deferred to buildSceneBuffers once pointPrimitiveBuffer_ is available.
+        }
       }
       id<MTLFunction> tonemapKernel = [library_ newFunctionWithName:@"tonemapKernel"];
       tonemapPipelineState_ = [device_ newComputePipelineStateWithFunction:tonemapKernel error:&error];
@@ -485,12 +511,12 @@ public:
     if (width_ == 0 || height_ == 0) {
       throw std::runtime_error("The render target size is invalid.");
     }
-    if (scene_.meshes.empty() && scene_.curveNetworks.empty()) {
+    if (scene_.meshes.empty() && scene_.curveNetworks.empty() && scene_.pointClouds.empty()) {
       throw std::runtime_error("No geometry was provided to the Metal ray tracer.");
     }
     if (pathTracePipelineState_ == nil || tonemapPipelineState_ == nil || objectContourPipelineState_ == nil ||
         detailContourPipelineState_ == nil || depthMinMaxPipelineState_ == nil || fxaaPipelineState_ == nil ||
-        compositePipelineState_ == nil || accelerationStructure_ == nil) {
+        compositePipelineState_ == nil || meshCurveAcceleration_ == nil || pointAcceleration_ == nil) {
       throw std::runtime_error("The Metal ray tracing pipeline is not initialized.");
     }
 
@@ -558,8 +584,8 @@ public:
       [encoder setBuffer:linearDepthBuffer_ offset:0 atIndex:14];
       [encoder setBuffer:normalBuffer_ offset:0 atIndex:15];
       [encoder setBuffer:objectIdBuffer_ offset:0 atIndex:16];
-      [encoder setAccelerationStructure:accelerationStructure_ atBufferIndex:17];
-      [encoder useResource:accelerationStructure_ usage:MTLResourceUsageRead];
+      [encoder setAccelerationStructure:meshCurveAcceleration_ atBufferIndex:17];
+      [encoder useResource:meshCurveAcceleration_ usage:MTLResourceUsageRead];
       [encoder setBuffer:diffuseAlbedoBuffer_ offset:0 atIndex:18];
       [encoder setBuffer:specularAlbedoBuffer_ offset:0 atIndex:19];
       [encoder setBuffer:roughnessAuxBuffer_ offset:0 atIndex:20];
@@ -569,7 +595,9 @@ public:
       if (intersectionFunctionTable_ != nil) {
         [encoder setIntersectionFunctionTable:intersectionFunctionTable_ atBufferIndex:24];
       }
-      if (triangleBLAS_ != nil && triangleBLAS_ != accelerationStructure_) {
+      [encoder setBuffer:pointPrimitiveBuffer_ offset:0 atIndex:25];
+      [encoder setAccelerationStructure:pointAcceleration_ atBufferIndex:26];
+      if (triangleBLAS_ != nil && triangleBLAS_ != meshCurveAcceleration_) {
         [encoder useResource:triangleBLAS_ usage:MTLResourceUsageRead];
       }
       if (curveBLAS_ != nil) {
@@ -577,6 +605,15 @@ public:
       }
       if (curvePrimitiveBuffer_ != nil) {
         [encoder useResource:curvePrimitiveBuffer_ usage:MTLResourceUsageRead];
+      }
+      if (pointAcceleration_ != nil) {
+        [encoder useResource:pointAcceleration_ usage:MTLResourceUsageRead];
+      }
+      if (pointBLAS_ != nil) {
+        [encoder useResource:pointBLAS_ usage:MTLResourceUsageRead];
+      }
+      if (pointPrimitiveBuffer_ != nil) {
+        [encoder useResource:pointPrimitiveBuffer_ usage:MTLResourceUsageRead];
       }
 
       dispatchThreads(encoder, pathTracePipelineState_);
@@ -780,7 +817,7 @@ public:
             [enc setComputePipelineState:textureToBufferPipelineState_];
             [enc setTexture:metalFXOutputTexture_ atIndex:0];
             [enc setBuffer:metalFXOutputBuffer_ offset:0 atIndex:0];
-            dispatchThreads(enc, textureToBufferPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
+            ::dispatchThreads(enc, textureToBufferPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
             [enc endEncoding];
           }
 
@@ -805,7 +842,7 @@ public:
             [enc setBuffer:metalFXOutputBuffer_ offset:0 atIndex:0];
             [enc setBuffer:metalFXToonBuffer_ offset:0 atIndex:1];
             [enc setBuffer:metalFXTonemappedBuffer_ offset:0 atIndex:2];
-            dispatchThreads(enc, tonemapPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
+            ::dispatchThreads(enc, tonemapPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
             [enc endEncoding];
           }
         }
@@ -909,17 +946,8 @@ public:
   }
 
 private:
-  static void dispatchThreads(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipelineState,
-                              uint32_t width, uint32_t height) {
-    const NSUInteger threadWidth = pipelineState.threadExecutionWidth;
-    const NSUInteger threadHeight = std::max<NSUInteger>(1, pipelineState.maxTotalThreadsPerThreadgroup / threadWidth);
-    MTLSize threadsPerGroup = MTLSizeMake(threadWidth, threadHeight, 1);
-    MTLSize threadsPerGrid = MTLSizeMake(width, height, 1);
-    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
-  }
-
   void dispatchThreads(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipelineState) const {
-    dispatchThreads(encoder, pipelineState, width_, height_);
+    ::dispatchThreads(encoder, pipelineState, width_, height_);
   }
 
   id<MTLTexture> createPrivateTexture(MTLPixelFormat format, uint32_t w, uint32_t h) {
@@ -1008,6 +1036,22 @@ private:
     std::unordered_map<std::string, uint32_t> objectIdLookup;
     std::vector<PunctualLightShaderData> lights;
 
+    // Returns the index into `textures[]` for the given RTTexture, uploading it once.
+    auto registerTexture = [&](const rt::RTTexture& tex) -> uint32_t {
+      auto existing = textureLookup.find(tex.cacheKey);
+      if (existing != textureLookup.end()) return existing->second;
+      const uint32_t idx    = static_cast<uint32_t>(textures.size());
+      const uint32_t offset = static_cast<uint32_t>(texturePixels.size());
+      TextureShaderData td;
+      td.data = simd_make_uint4(offset, tex.width, tex.height, 0u);
+      textures.push_back(td);
+      textureLookup.emplace(tex.cacheKey, idx);
+      for (const glm::vec4& pixel : tex.pixels) {
+        texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
+      }
+      return idx;
+    };
+
     positions.reserve(4096);
     normals.reserve(4096);
     vertexColors.reserve(4096);
@@ -1054,85 +1098,19 @@ private:
           simd_make_float4(mesh.edgeColor.r, mesh.edgeColor.g, mesh.edgeColor.b, edgeBaryThreshold);
 
       if (mesh.hasBaseColorTexture && !mesh.baseColorTexture.pixels.empty()) {
-        auto existing = textureLookup.find(mesh.baseColorTexture.cacheKey);
-        uint32_t textureIndex = 0;
-        if (existing != textureLookup.end()) {
-          textureIndex = existing->second;
-        } else {
-          textureIndex = static_cast<uint32_t>(textures.size());
-          const uint32_t textureOffset = static_cast<uint32_t>(texturePixels.size());
-          TextureShaderData texture;
-          texture.data =
-              simd_make_uint4(textureOffset, mesh.baseColorTexture.width, mesh.baseColorTexture.height, 0u);
-          textures.push_back(texture);
-          textureLookup.emplace(mesh.baseColorTexture.cacheKey, textureIndex);
-
-          for (const glm::vec4& pixel : mesh.baseColorTexture.pixels) {
-            texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
-          }
-        }
-        material.baseColorTextureData = simd_make_uint4(textureIndex, 1u, 0u, 0u);
+        material.baseColorTextureData = simd_make_uint4(registerTexture(mesh.baseColorTexture), 1u, 0u, 0u);
       }
 
       if (mesh.hasEmissiveTexture && !mesh.emissiveTexture.pixels.empty()) {
-        auto existing = textureLookup.find(mesh.emissiveTexture.cacheKey);
-        uint32_t textureIndex = 0;
-        if (existing != textureLookup.end()) {
-          textureIndex = existing->second;
-        } else {
-          textureIndex = static_cast<uint32_t>(textures.size());
-          const uint32_t textureOffset = static_cast<uint32_t>(texturePixels.size());
-          TextureShaderData texture;
-          texture.data = simd_make_uint4(textureOffset, mesh.emissiveTexture.width, mesh.emissiveTexture.height, 0u);
-          textures.push_back(texture);
-          textureLookup.emplace(mesh.emissiveTexture.cacheKey, textureIndex);
-
-          for (const glm::vec4& pixel : mesh.emissiveTexture.pixels) {
-            texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
-          }
-        }
-        material.emissiveTextureData = simd_make_uint4(textureIndex, 1u, 0u, 0u);
+        material.emissiveTextureData = simd_make_uint4(registerTexture(mesh.emissiveTexture), 1u, 0u, 0u);
       }
 
       if (mesh.hasMetallicRoughnessTexture && !mesh.metallicRoughnessTexture.pixels.empty()) {
-        auto existing = textureLookup.find(mesh.metallicRoughnessTexture.cacheKey);
-        uint32_t textureIndex = 0;
-        if (existing != textureLookup.end()) {
-          textureIndex = existing->second;
-        } else {
-          textureIndex = static_cast<uint32_t>(textures.size());
-          const uint32_t textureOffset = static_cast<uint32_t>(texturePixels.size());
-          TextureShaderData texture;
-          texture.data = simd_make_uint4(textureOffset, mesh.metallicRoughnessTexture.width,
-                                         mesh.metallicRoughnessTexture.height, 0u);
-          textures.push_back(texture);
-          textureLookup.emplace(mesh.metallicRoughnessTexture.cacheKey, textureIndex);
-
-          for (const glm::vec4& pixel : mesh.metallicRoughnessTexture.pixels) {
-            texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
-          }
-        }
-        material.metallicRoughnessTextureData = simd_make_uint4(textureIndex, 1u, 0u, 0u);
+        material.metallicRoughnessTextureData = simd_make_uint4(registerTexture(mesh.metallicRoughnessTexture), 1u, 0u, 0u);
       }
 
       if (mesh.hasNormalTexture && !mesh.normalTexture.pixels.empty()) {
-        auto existing = textureLookup.find(mesh.normalTexture.cacheKey);
-        uint32_t textureIndex = 0;
-        if (existing != textureLookup.end()) {
-          textureIndex = existing->second;
-        } else {
-          textureIndex = static_cast<uint32_t>(textures.size());
-          const uint32_t textureOffset = static_cast<uint32_t>(texturePixels.size());
-          TextureShaderData texture;
-          texture.data = simd_make_uint4(textureOffset, mesh.normalTexture.width, mesh.normalTexture.height, 0u);
-          textures.push_back(texture);
-          textureLookup.emplace(mesh.normalTexture.cacheKey, textureIndex);
-
-          for (const glm::vec4& pixel : mesh.normalTexture.pixels) {
-            texturePixels.push_back(simd_make_float4(pixel.r, pixel.g, pixel.b, pixel.a));
-          }
-        }
-        material.normalTextureData = simd_make_uint4(textureIndex, 1u, 0u, 0u);
+        material.normalTextureData = simd_make_uint4(registerTexture(mesh.normalTexture), 1u, 0u, 0u);
       }
       materials.push_back(material);
 
@@ -1174,6 +1152,11 @@ private:
     curveControlPoints_.clear();
     curveRadii_.clear();
 
+    // Sphere-type curve node primitives are routed into the bounding-box point BLAS
+    // (same pipeline as point clouds).  Clear them here so both sources append cleanly.
+    pointPrimitives_.clear();
+    pointBboxData_.clear();
+
     for (const rt::RTCurveNetwork& curveNet : scene_.curveNetworks) {
       const std::string objectKey = curveNet.name;
       auto objectIt = objectIdLookup.find(objectKey);
@@ -1193,7 +1176,6 @@ private:
       curveMaterial.transmissionIor = simd_make_float4(0.0f, 1.5f, curveNet.unlit ? 1.0f : 0.0f, 1.0f);
       materials.push_back(curveMaterial);
 
-      float bbPadding = 1.0f;  // DIAGNOSTIC: MASSIVE inflate to test IAS
 
       for (size_t pi = 0; pi < curveNet.primitives.size(); ++pi) {
         const rt::RTCurvePrimitive& prim = curveNet.primitives[pi];
@@ -1213,9 +1195,65 @@ private:
         curveRadii_.push_back(prim.radius);
 
       }
+
+      // Sphere-type primitives (curve network node joints/endpoints) are rendered
+      // through the point bounding-box BLAS using the same material as their network.
+      for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
+        if (prim.type != rt::RTCurvePrimitiveType::Sphere) continue;
+        PointPrimitiveShaderData gpuPt;
+        gpuPt.center_radius    = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
+        gpuPt.baseColor        = simd_make_float4(curveNet.baseColor.r, curveNet.baseColor.g,
+                                                   curveNet.baseColor.b, 1.0f);
+        gpuPt.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
+        pointPrimitives_.push_back(gpuPt);
+
+        MTLAxisAlignedBoundingBox bb;
+        bb.min = {prim.p0.x - prim.radius, prim.p0.y - prim.radius, prim.p0.z - prim.radius};
+        bb.max = {prim.p0.x + prim.radius, prim.p0.y + prim.radius, prim.p0.z + prim.radius};
+        pointBboxData_.push_back(bb);
+      }
     }
 
-    if (positions.empty() && curvePrimitives.empty()) {
+    // Point cloud spheres — appended to the same bounding-box BLAS as curve nodes.
+    for (const rt::RTPointCloud& pc : scene_.pointClouds) {
+      const std::string objectKey = pc.name;
+      auto objectIt = objectIdLookup.find(objectKey);
+      uint32_t pointObjectId = 0u;
+      if (objectIt != objectIdLookup.end()) {
+        pointObjectId = objectIt->second;
+      } else {
+        pointObjectId = nextObjectId++;
+        objectIdLookup.emplace(objectKey, pointObjectId);
+      }
+
+      uint32_t pointMaterialIndex = static_cast<uint32_t>(materials.size());
+      MaterialShaderData ptMat{};
+      ptMat.baseColorFactor = simd_make_float4(pc.baseColor.r, pc.baseColor.g, pc.baseColor.b, pc.baseColor.a);
+      ptMat.metallicRoughnessNormal = simd_make_float4(pc.metallic, pc.roughness, 1.0f, 0.0f);
+      ptMat.transmissionIor = simd_make_float4(0.0f, 1.5f, pc.unlit ? 1.0f : 0.0f, 1.0f);
+      materials.push_back(ptMat);
+
+      for (size_t ci = 0; ci < pc.centers.size(); ++ci) {
+        const glm::vec3& center = pc.centers[ci];
+        // Use per-point color from scalar quantity if available, otherwise the cloud's base color.
+        glm::vec3 ptColor = pc.colors.empty()
+                                ? glm::vec3(pc.baseColor)
+                                : pc.colors[std::min(ci, pc.colors.size() - 1)];
+        PointPrimitiveShaderData gpuPt;
+        gpuPt.center_radius    = simd_make_float4(center.x, center.y, center.z, pc.radius);
+        gpuPt.baseColor        = simd_make_float4(ptColor.r, ptColor.g, ptColor.b, 1.0f);
+        gpuPt.materialObjectId = simd_make_uint4(pointMaterialIndex, pointObjectId, 0u, 0u);
+        pointPrimitives_.push_back(gpuPt);
+
+        // Axis-aligned bounding box tightly enclosing the sphere.
+        MTLAxisAlignedBoundingBox bb;
+        bb.min = {center.x - pc.radius, center.y - pc.radius, center.z - pc.radius};
+        bb.max = {center.x + pc.radius, center.y + pc.radius, center.z + pc.radius};
+        pointBboxData_.push_back(bb);
+      }
+    }
+
+    if (positions.empty() && curvePrimitives.empty() && pointPrimitives_.empty()) {
       throw std::runtime_error("The scene did not contain any renderable geometry.");
     }
     if (positions.empty()) {
@@ -1306,6 +1344,27 @@ private:
       curveControlPointBuffer_ = nil;
       curveRadiusBuffer_ = nil;
       curveSegmentCount_ = 0;
+    }
+
+    if (!pointPrimitives_.empty()) {
+      pointPrimitiveBuffer_ = [device_ newBufferWithBytes:pointPrimitives_.data()
+                                                   length:pointPrimitives_.size() * sizeof(PointPrimitiveShaderData)
+                                                  options:MTLResourceStorageModeShared];
+      pointBboxBuffer_ = [device_ newBufferWithBytes:pointBboxData_.data()
+                                              length:pointBboxData_.size() * sizeof(MTLAxisAlignedBoundingBox)
+                                             options:MTLResourceStorageModeShared];
+    } else {
+      PointPrimitiveShaderData dummy{};
+      pointPrimitiveBuffer_ = [device_ newBufferWithBytes:&dummy
+                                                   length:sizeof(PointPrimitiveShaderData)
+                                                  options:MTLResourceStorageModeShared];
+      pointBboxBuffer_ = nil;
+    }
+
+    // Bind the point primitive buffer in the intersection function table so sphereIntersection
+    // can access it at buffer(25) when invoked by the hardware traversal.
+    if (intersectionFunctionTable_ != nil && pointPrimitiveBuffer_ != nil) {
+      [intersectionFunctionTable_ setBuffer:pointPrimitiveBuffer_ offset:0 atIndex:25];
     }
 
     buildAccelerationStructure(static_cast<uint32_t>(accelIndices.size()));
@@ -1402,54 +1461,123 @@ private:
         curveBLAS_ = nil;
       }
 
-      NSUInteger instanceCount = hasCurves ? 2 : 1;
-      std::vector<MTLAccelerationStructureInstanceDescriptor> instances(instanceCount);
-      std::memset(instances.data(), 0, instances.size() * sizeof(MTLAccelerationStructureInstanceDescriptor));
+      bool hasPoints = !pointPrimitives_.empty() && pointBboxBuffer_ != nil;
 
-      for (NSUInteger i = 0; i < instanceCount; ++i) {
-        instances[i].transformationMatrix.columns[0] = {1.0f, 0.0f, 0.0f};
-        instances[i].transformationMatrix.columns[1] = {0.0f, 1.0f, 0.0f};
-        instances[i].transformationMatrix.columns[2] = {0.0f, 0.0f, 1.0f};
-        instances[i].transformationMatrix.columns[3] = {0.0f, 0.0f, 0.0f};
-        instances[i].mask = 0xFF;
-        instances[i].options = MTLAccelerationStructureInstanceOptionNone;
-        instances[i].intersectionFunctionTableOffset = 0;
+      // --- Always build a valid point BLAS and point IAS --------------------------
+      // When there are no real point primitives, use a single far-away dummy sphere
+      // that can never be hit, so the shader always has a valid pointScene to bind.
+      auto buildPointIas = [&]() -> id<MTLAccelerationStructure> {
+        id<MTLBuffer> bboxBuf = nil;
+        NSUInteger bboxCount = 0;
+
+        if (hasPoints) {
+          bboxBuf   = pointBboxBuffer_;
+          bboxCount = static_cast<NSUInteger>(pointPrimitives_.size());
+        } else {
+          // Far-away dummy bbox — no ray from the scene can reach it, so sphereIntersection
+          // is never invoked and the all-zeros pointPrimitiveBuffer_ is never dereferenced.
+          MTLAxisAlignedBoundingBox dummyBox = { {9.99e9f, 9.99e9f, 9.99e9f},
+                                                 {1.001e10f, 1.001e10f, 1.001e10f} };
+          bboxBuf   = [device_ newBufferWithBytes:&dummyBox
+                                           length:sizeof(dummyBox)
+                                          options:MTLResourceStorageModeShared];
+          bboxCount = 1;
+        }
+
+        auto* bboxGeom = [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
+        bboxGeom.boundingBoxBuffer = bboxBuf;
+        bboxGeom.boundingBoxCount  = bboxCount;
+        bboxGeom.boundingBoxStride = sizeof(MTLAxisAlignedBoundingBox);
+        bboxGeom.intersectionFunctionTableOffset = 0;  // slot 0 → sphereIntersection
+
+        auto* ptDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        ptDesc.geometryDescriptors = @[ bboxGeom ];
+        ptDesc.usage = MTLAccelerationStructureUsagePreferFastBuild;
+        pointBLAS_ = buildAndCompactBLAS(ptDesc);
+
+        // Build point IAS with a single instance.
+        MTLAccelerationStructureInstanceDescriptor ptInst{};
+        ptInst.transformationMatrix.columns[0] = {1.f, 0.f, 0.f};
+        ptInst.transformationMatrix.columns[1] = {0.f, 1.f, 0.f};
+        ptInst.transformationMatrix.columns[2] = {0.f, 0.f, 1.f};
+        ptInst.transformationMatrix.columns[3] = {0.f, 0.f, 0.f};
+        ptInst.mask = 0xFF;
+        ptInst.options = MTLAccelerationStructureInstanceOptionNone;
+        ptInst.intersectionFunctionTableOffset = 0;
+        ptInst.accelerationStructureIndex = 0;
+
+        id<MTLBuffer> ptInstBuf = [device_ newBufferWithBytes:&ptInst
+                                                        length:sizeof(ptInst)
+                                                       options:MTLResourceStorageModeShared];
+        auto* ptIasDesc = [[MTLInstanceAccelerationStructureDescriptor alloc] init];
+        ptIasDesc.instancedAccelerationStructures = @[ pointBLAS_ ];
+        ptIasDesc.instanceCount = 1;
+        ptIasDesc.instanceDescriptorBuffer = ptInstBuf;
+        ptIasDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+        ptIasDesc.usage = MTLAccelerationStructureUsagePreferFastBuild;
+
+        MTLAccelerationStructureSizes ptSizes = [device_ accelerationStructureSizesWithDescriptor:ptIasDesc];
+        id<MTLAccelerationStructure> ptIas = [device_ newAccelerationStructureWithSize:ptSizes.accelerationStructureSize];
+        id<MTLBuffer> ptScratch = [device_ newBufferWithLength:ptSizes.buildScratchBufferSize
+                                                       options:MTLResourceStorageModePrivate];
+        id<MTLCommandBuffer> ptCmd = [commandQueue_ commandBuffer];
+        id<MTLAccelerationStructureCommandEncoder> ptEnc = [ptCmd accelerationStructureCommandEncoder];
+        [ptEnc buildAccelerationStructure:ptIas descriptor:ptIasDesc
+                             scratchBuffer:ptScratch scratchBufferOffset:0];
+        [ptEnc endEncoding];
+        [ptCmd commit];
+        [ptCmd waitUntilCompleted];
+        return ptIas;
+      };
+      pointAcceleration_ = buildPointIas();
+
+      // --- Build mesh+curve IAS (no bounding-box geometry, no IFT) ---------------
+      NSUInteger mcInstanceCount = 1 + (hasCurves ? 1 : 0);
+      std::vector<MTLAccelerationStructureInstanceDescriptor> mcInstances(mcInstanceCount);
+      std::memset(mcInstances.data(), 0, mcInstances.size() * sizeof(MTLAccelerationStructureInstanceDescriptor));
+
+      for (NSUInteger i = 0; i < mcInstanceCount; ++i) {
+        mcInstances[i].transformationMatrix.columns[0] = {1.0f, 0.0f, 0.0f};
+        mcInstances[i].transformationMatrix.columns[1] = {0.0f, 1.0f, 0.0f};
+        mcInstances[i].transformationMatrix.columns[2] = {0.0f, 0.0f, 1.0f};
+        mcInstances[i].transformationMatrix.columns[3] = {0.0f, 0.0f, 0.0f};
+        mcInstances[i].mask = 0xFF;
+        mcInstances[i].options = MTLAccelerationStructureInstanceOptionNone;
+        mcInstances[i].intersectionFunctionTableOffset = 0;
       }
-      instances[0].accelerationStructureIndex = 0;
+      NSUInteger nextMcInstance = 0;
+      mcInstances[nextMcInstance++].accelerationStructureIndex = 0;  // triangles at slot 0
+
+      NSMutableArray* mcBlasArray = [NSMutableArray arrayWithObject:triangleBLAS_];
       if (hasCurves) {
-        instances[1].accelerationStructureIndex = 1;
+        mcInstances[nextMcInstance++].accelerationStructureIndex = static_cast<uint32_t>(mcBlasArray.count);
+        [mcBlasArray addObject:curveBLAS_];
       }
 
-      id<MTLBuffer> instanceBuffer = [device_ newBufferWithBytes:instances.data()
-                                                          length:instances.size() * sizeof(MTLAccelerationStructureInstanceDescriptor)
+      id<MTLBuffer> mcInstanceBuf = [device_ newBufferWithBytes:mcInstances.data()
+                                                          length:mcInstances.size() * sizeof(MTLAccelerationStructureInstanceDescriptor)
                                                          options:MTLResourceStorageModeShared];
 
-      NSMutableArray* blasArray = [NSMutableArray arrayWithObject:triangleBLAS_];
-      if (hasCurves) {
-        [blasArray addObject:curveBLAS_];
-      }
+      auto* mcIasDesc = [[MTLInstanceAccelerationStructureDescriptor alloc] init];
+      mcIasDesc.instancedAccelerationStructures = mcBlasArray;
+      mcIasDesc.instanceCount = mcInstanceCount;
+      mcIasDesc.instanceDescriptorBuffer = mcInstanceBuf;
+      mcIasDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+      mcIasDesc.usage = MTLAccelerationStructureUsagePreferFastBuild;
 
-      auto* instanceDesc = [[MTLInstanceAccelerationStructureDescriptor alloc] init];
-      instanceDesc.instancedAccelerationStructures = blasArray;
-      instanceDesc.instanceCount = instanceCount;
-      instanceDesc.instanceDescriptorBuffer = instanceBuffer;
-      instanceDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
-      instanceDesc.usage = MTLAccelerationStructureUsagePreferFastBuild;
-
-      MTLAccelerationStructureSizes iasSizes = [device_ accelerationStructureSizesWithDescriptor:instanceDesc];
-      accelerationStructure_ = [device_ newAccelerationStructureWithSize:iasSizes.accelerationStructureSize];
-      id<MTLBuffer> iasScratch = [device_ newBufferWithLength:iasSizes.buildScratchBufferSize
-                                                      options:MTLResourceStorageModePrivate];
-
-      id<MTLCommandBuffer> iasCmdBuf = [commandQueue_ commandBuffer];
-      id<MTLAccelerationStructureCommandEncoder> iasEnc = [iasCmdBuf accelerationStructureCommandEncoder];
-      [iasEnc buildAccelerationStructure:accelerationStructure_
-                              descriptor:instanceDesc
-                            scratchBuffer:iasScratch
-                      scratchBufferOffset:0];
-      [iasEnc endEncoding];
-      [iasCmdBuf commit];
-      [iasCmdBuf waitUntilCompleted];
+      MTLAccelerationStructureSizes mcSizes = [device_ accelerationStructureSizesWithDescriptor:mcIasDesc];
+      meshCurveAcceleration_ = [device_ newAccelerationStructureWithSize:mcSizes.accelerationStructureSize];
+      id<MTLBuffer> mcScratch = [device_ newBufferWithLength:mcSizes.buildScratchBufferSize
+                                                     options:MTLResourceStorageModePrivate];
+      id<MTLCommandBuffer> mcCmdBuf = [commandQueue_ commandBuffer];
+      id<MTLAccelerationStructureCommandEncoder> mcEnc = [mcCmdBuf accelerationStructureCommandEncoder];
+      [mcEnc buildAccelerationStructure:meshCurveAcceleration_
+                             descriptor:mcIasDesc
+                           scratchBuffer:mcScratch
+                     scratchBufferOffset:0];
+      [mcEnc endEncoding];
+      [mcCmdBuf commit];
+      [mcCmdBuf waitUntilCompleted];
     }
   }
 
@@ -1474,7 +1602,8 @@ private:
   id<MTLBuffer> textureMetadataBuffer_ = nil;
   id<MTLBuffer> texturePixelBuffer_ = nil;
   id<MTLBuffer> lightBuffer_ = nil;
-  id<MTLAccelerationStructure> accelerationStructure_ = nil;
+  id<MTLAccelerationStructure> meshCurveAcceleration_ = nil;
+  id<MTLAccelerationStructure> pointAcceleration_ = nil;
   id<MTLAccelerationStructure> triangleBLAS_ = nil;
   id<MTLAccelerationStructure> curveBLAS_ = nil;
   id<MTLBuffer> curvePrimitiveBuffer_ = nil;
@@ -1483,6 +1612,13 @@ private:
   uint32_t curveSegmentCount_ = 0;
   std::vector<simd_float3> curveControlPoints_;
   std::vector<float> curveRadii_;
+
+  id<MTLAccelerationStructure> pointBLAS_ = nil;
+  id<MTLBuffer> pointPrimitiveBuffer_ = nil;
+  id<MTLBuffer> pointBboxBuffer_ = nil;
+  std::vector<PointPrimitiveShaderData> pointPrimitives_;
+  std::vector<MTLAxisAlignedBoundingBox> pointBboxData_;
+
   id<MTLIntersectionFunctionTable> intersectionFunctionTable_ = nil;
 
   id<MTLBuffer> cameraBuffer_ = nil;
@@ -1772,15 +1908,6 @@ private:
                                buildNSErrorMessage(error));
     }
     return pipeline;
-  }
-
-  static void dispatchThreads(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipelineState,
-                              uint32_t width, uint32_t height) {
-    const NSUInteger threadWidth = pipelineState.threadExecutionWidth;
-    const NSUInteger threadHeight = std::max<NSUInteger>(1, pipelineState.maxTotalThreadsPerThreadgroup / threadWidth);
-    MTLSize threadsPerGroup = MTLSizeMake(threadWidth, threadHeight, 1);
-    MTLSize threadsPerGrid = MTLSizeMake(width, height, 1);
-    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
   }
 
   id<MTLDevice> device_ = nil;

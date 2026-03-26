@@ -338,7 +338,8 @@ void PolyscopeRtRuntime::beginOfflineRender(const PolyscopeSceneSnapshot& snapsh
   offlineSnapshot_ = snapshot;
   offlineCamera_ = camera;
   offlineRenderActive_ = true;
-  offlineOutputPath_ = makeOfflineRenderFilename();
+  offlineOutputPath_ = pendingOutputPath_.empty() ? makeOfflineRenderFilename() : pendingOutputPath_;
+  pendingOutputPath_.clear();
   offlineStartTime_ = std::chrono::steady_clock::now();
 
   backend_->setScene(offlineSnapshot_.scene);
@@ -446,7 +447,7 @@ rt::RenderConfig PolyscopeRtRuntime::buildRenderConfig(uint32_t samplesPerIterat
   config.renderMode = appearance_.mode;
   config.samplesPerIteration = samplesPerIteration;
   config.maxBounces = static_cast<uint32_t>(std::max(1, maxBounces_));
-  config.accumulate = progressiveAccumulation_;
+  config.accumulate = true;
   config.enableMetalFX = appearance_.enableMetalFX;
   config.lighting = appearance_.lighting;
   config.toon = appearance_.toon;
@@ -546,6 +547,6 @@ void PolyscopeRtRuntime::resetAccumulation() {
 
 void PolyscopeRtRuntime::exportPNG(const std::string& path, int targetSPP) {
   offlineTargetSamples_ = targetSPP;
-  offlineOutputPath_ = path;
+  pendingOutputPath_ = path;
   offlineRenderRequested_ = true;
 }

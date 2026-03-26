@@ -7,12 +7,9 @@
 #include "glm/glm.hpp"
 
 #include "rendering/ray_tracing_backend.h"
+#include "test_helpers.h"
 
 namespace {
-
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
 
 bool isSkippableBackendError(const std::string& message) {
   return message.find("Metal is unavailable") != std::string::npos ||

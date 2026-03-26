@@ -12,12 +12,10 @@
 #include "polyscope/volume_mesh.h"
 
 #include "scene/polyscope_scene_snapshot.h"
+#include "rendering/ray_tracing_types.h"
+#include "test_helpers.h"
 
 namespace {
-
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
 
 } // namespace
 
@@ -38,7 +36,7 @@ int main() {
     mesh->setTransform(glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f)));
 
     PolyscopeSceneSnapshot snapshot = capturePolyscopeSceneSnapshot();
-    require(snapshot.supportedMeshCount == 1, "expected exactly one supported mesh");
+    require(snapshot.supportedStructureCount == 1, "expected exactly one supported mesh");
     require(snapshot.scene.meshes.size() == 1, "expected exactly one extracted RT mesh");
     require(snapshot.hostStructure != nullptr, "expected a host structure");
     require(snapshot.hostName == "snapshot_mesh", "unexpected host structure name");
@@ -55,7 +53,7 @@ int main() {
     mesh->setEnabled(false);
     PolyscopeSceneSnapshot disabledSnapshot = capturePolyscopeSceneSnapshot();
     require(disabledSnapshot.scene.meshes.empty(), "disabled meshes should not be exported");
-    require(disabledSnapshot.supportedMeshCount == 0, "disabled meshes should not count as supported");
+    require(disabledSnapshot.supportedStructureCount == 0, "disabled meshes should not count as supported");
 
     polyscope::removeEverything();
     auto* pointCloud = polyscope::registerPointCloud("snapshot_points",
@@ -78,23 +76,23 @@ int main() {
     volumeMesh->setColor(glm::vec3(0.2f, 0.5f, 0.9f));
 
     PolyscopeSceneSnapshot mixedSnapshot = capturePolyscopeSceneSnapshot();
-    require(mixedSnapshot.supportedMeshCount == 3, "expected point, curve, and volume structures to be exported");
-    require(mixedSnapshot.scene.meshes.size() == 2, "expected two generated RT meshes (point cloud + volume)");
+    require(mixedSnapshot.supportedStructureCount == 3, "expected point, curve, and volume structures to be exported");
+    require(mixedSnapshot.scene.meshes.size() == 1, "expected one RT mesh (volume only; point cloud goes to pointClouds)");
     require(mixedSnapshot.scene.curveNetworks.size() == 1, "expected one curve network");
+    require(mixedSnapshot.scene.pointClouds.size() == 1, "expected one RTPointCloud");
 
-    bool foundPointCloud = false;
+    const auto& rtpc = mixedSnapshot.scene.pointClouds.front();
+    require(rtpc.name == "snapshot_points", "RTPointCloud name mismatch");
+    require(rtpc.centers.size() == 2, "RTPointCloud should have 2 centers");
+    requireNear(rtpc.radius, 0.15f, 1e-4f, "RTPointCloud radius mismatch");
+
     bool foundVolumeMesh = false;
     for (const auto& rtMesh2 : mixedSnapshot.scene.meshes) {
-      if (rtMesh2.name == "snapshot_points") {
-        foundPointCloud = true;
-        require(!rtMesh2.vertices.empty() && !rtMesh2.indices.empty(), "point cloud should generate triangles");
-      }
       if (rtMesh2.name == "snapshot_volume") {
         foundVolumeMesh = true;
         require(!rtMesh2.indices.empty(), "volume mesh should export its boundary triangles");
       }
     }
-    require(foundPointCloud, "point cloud export missing");
     require(foundVolumeMesh, "volume mesh export missing");
 
     const auto& curveNet = mixedSnapshot.scene.curveNetworks.front();
