@@ -47,9 +47,9 @@ void PolyscopeRtRuntime::buildUI() {
   float paneW  = polyscope::internal::rightWindowsWidth;
   float x      = polyscope::view::windowWidth - paneW - margin;
   ImGui::SetNextWindowPos(ImVec2(x, margin), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(paneW, 0.f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(paneW, 0.f), ImGuiCond_Always);
 
-  if (!ImGui::Begin("Polyscope RT")) {
+  if (!ImGui::Begin("Polyscope RT", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
     return;
   }
