@@ -10,11 +10,6 @@
 
 namespace {
 
-bool isSkippableBackendError(const std::string& message) {
-  return message.find("Metal is unavailable") != std::string::npos ||
-         message.find("does not report ray tracing support") != std::string::npos;
-}
-
 rt::RTMesh makeSphere(float radius, uint32_t latSegments, uint32_t lonSegments) {
   rt::RTMesh mesh;
   mesh.name = "glass_sphere";
@@ -53,7 +48,7 @@ rt::RTMesh makeSphere(float radius, uint32_t latSegments, uint32_t lonSegments) 
 
 int main() {
   try {
-    auto backend = rt::createMetalPathTracerBackend();
+    auto backend = rt::createBackend(rt::BackendType::Metal);
 
     rt::RTMesh mesh;
     mesh.name = "tri";
@@ -419,15 +414,15 @@ int main() {
               "also present — dual-IAS regression");
     }
 
-    std::cout << "metal_backend_smoke_test passed" << std::endl;
+    std::cout << "backend_smoke_test passed" << std::endl;
     return 0;
   } catch (const std::exception& e) {
     const std::string message = e.what();
     if (isSkippableBackendError(message)) {
-      std::cout << "metal_backend_smoke_test skipped: " << message << std::endl;
+      std::cout << "backend_smoke_test skipped: " << message << std::endl;
       return 0;
     }
-    std::cerr << "metal_backend_smoke_test failed: " << message << std::endl;
+    std::cerr << "backend_smoke_test failed: " << message << std::endl;
     return 1;
   }
 }

@@ -2,293 +2,8 @@
 #include <metal_raytracing>
 using namespace metal;
 using namespace metal::raytracing;
-
-constant float kBackgroundDepth = 0.999999f;
-struct CameraData {
-  float4 position;
-  float4 lookDir;
-  float4 upDir;
-  float4 rightDir;
-  float4 clipData;
-  float4x4 viewMatrix;
-  float4x4 projectionMatrix;
-};
-
-struct FrameUniforms {
-  uint renderMode;
-  uint width;
-  uint height;
-  uint samplesPerIteration;
-  uint frameIndex;
-  uint maxBounces;
-  uint lightCount;
-  uint enableSceneLights;  // reserved, unused
-  uint enableAreaLight;
-  uint toonBandCount;
-  float ambientFloor;
-  uint rngFrameIndex;
-  float4 planeColorEnabled;
-  float4 planeParams;
-  float2 jitterOffset;
-  float2 _pad1;
-  float4x4 prevViewProj;
-};
-
-struct LightingData {
-  float4 backgroundColor;
-  float4 mainLightDirection;
-  float4 mainLightColorIntensity;
-  float4 environmentTintIntensity;
-  float4 areaLightCenterEnabled;
-  float4 areaLightU;
-  float4 areaLightV;
-  float4 areaLightEmission;
-};
-
-struct ToonUniforms {
-  uint width;
-  uint height;
-  uint contourMethod;
-  uint useFxaa;
-  float detailContourStrength;
-  float depthThreshold;
-  float normalThreshold;
-  float edgeThickness;
-  float exposure;
-  float gamma;
-  float saturation;
-  float objectContourStrength;
-  float objectThreshold;
-  uint enableDetailContour;
-  uint enableObjectContour;
-  uint enableNormalEdge;
-  uint enableDepthEdge;
-  float4 backgroundColor;
-  float4 edgeColor;
-};
-
-struct TriangleData {
-  uint4 indicesMaterial;
-  uint4 objectFlags;
-};
-
-struct MaterialData {
-  float4 baseColorFactor;
-  uint4 baseColorTextureData;
-  float4 metallicRoughnessNormal;
-  uint4 metallicRoughnessTextureData;
-  float4 emissiveFactor;
-  uint4 emissiveTextureData;
-  uint4 normalTextureData;
-  float4 transmissionIor;
-  float4 wireframeEdgeData;  // xyz = edge color, w = barycentric threshold (0 = disabled)
-};
-
-struct TextureData {
-  uint4 data;
-};
-
-struct PunctualLightData {
-  float4 positionRange;
-  float4 directionType;
-  float4 colorIntensity;
-  float4 spotAngles;
-};
-
-struct CurvePrimitiveGPU {
-  float4 p0_radius;
-  float4 p1_type;
-  uint4 materialObjectId;
-};
-
-// One bounding-box sphere primitive.  center_radius.w = radius.
-// materialObjectId.x = material index, .y = object id.
-struct PointPrimitiveGPU {
-  float4 center_radius;
-  float4 baseColor;         // xyz = per-point color, w = unused
-  uint4  materialObjectId;
-};
-
-
-uint wangHash(uint x) {
-  x = (x ^ 61u) ^ (x >> 16u);
-  x *= 9u;
-  x = x ^ (x >> 4u);
-  x *= 0x27d4eb2du;
-  x = x ^ (x >> 15u);
-  return x;
-}
-
-float rand01(thread uint& state) {
-  state = wangHash(state);
-  return (float(state) + 0.5f) / 4294967296.0f;
-}
-
-constant unsigned int primes[] = {
-    2,   3,  5,  7, 11, 13, 17, 19,
-    23, 29, 31, 37, 41, 43, 47, 53,
-    59, 61, 67, 71, 73, 79, 83, 89
-};
-
-float halton(unsigned int i, unsigned int d) {
-    unsigned int b = primes[d];
-    float f = 1.0f;
-    float invB = 1.0f / b;
-    float r = 0;
-    while (i > 0) {
-        f = f * invB;
-        r = r + f * (i % b);
-        i = i / b;
-    }
-    return r;
-}
-
-uint clampIndex(int value, uint limit) {
-  if (limit == 0u) return 0u;
-  return uint(clamp(value, 0, int(limit - 1u)));
-}
-
-uint pixelIndex(uint x, uint y, uint width) { return y * width + x; }
-
-float4 loadPixel(device const float4* buffer, uint width, uint height, int x, int y) {
-  return buffer[pixelIndex(clampIndex(x, width), clampIndex(y, height), width)];
-}
-
-float loadDepth(device const float* buffer, uint width, uint height, int x, int y) {
-  return buffer[pixelIndex(clampIndex(x, width), clampIndex(y, height), width)];
-}
-
-uint loadObjectId(device const uint* buffer, uint width, uint height, int x, int y) {
-  return buffer[pixelIndex(clampIndex(x, width), clampIndex(y, height), width)];
-}
-
-float4 sampleLinear(device const float4* buffer, uint width, uint height, float2 uv) {
-  float px = clamp(uv.x * float(max(width, 1u)) - 0.5f, 0.0f, float(max(width, 1u) - 1u));
-  float py = clamp(uv.y * float(max(height, 1u)) - 0.5f, 0.0f, float(max(height, 1u) - 1u));
-
-  uint x0 = min(uint(floor(px)), max(width, 1u) - 1u);
-  uint y0 = min(uint(floor(py)), max(height, 1u) - 1u);
-  uint x1 = min(x0 + 1u, max(width, 1u) - 1u);
-  uint y1 = min(y0 + 1u, max(height, 1u) - 1u);
-
-  float tx = px - float(x0);
-  float ty = py - float(y0);
-
-  float4 c00 = buffer[pixelIndex(x0, y0, width)];
-  float4 c10 = buffer[pixelIndex(x1, y0, width)];
-  float4 c01 = buffer[pixelIndex(x0, y1, width)];
-  float4 c11 = buffer[pixelIndex(x1, y1, width)];
-  return mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
-}
-
-float4 sampleBaseColorTexture(device const TextureData* textures, device const float4* texturePixels, uint textureIndex,
-                              float2 uv) {
-  TextureData texture = textures[textureIndex];
-  uint offset = texture.data.x;
-  uint width = texture.data.y;
-  uint height = texture.data.z;
-  if (width == 0u || height == 0u) return float4(1.0f);
-
-  float2 wrapped = uv - floor(uv);
-  float x = wrapped.x * float(max(width - 1u, 1u));
-  float y = wrapped.y * float(max(height - 1u, 1u));
-
-  uint x0 = min(uint(floor(x)), width - 1u);
-  uint y0 = min(uint(floor(y)), height - 1u);
-  uint x1 = min(x0 + 1u, width - 1u);
-  uint y1 = min(y0 + 1u, height - 1u);
-
-  float tx = x - float(x0);
-  float ty = y - float(y0);
-
-  float4 c00 = texturePixels[offset + y0 * width + x0];
-  float4 c10 = texturePixels[offset + y0 * width + x1];
-  float4 c01 = texturePixels[offset + y1 * width + x0];
-  float4 c11 = texturePixels[offset + y1 * width + x1];
-  return mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
-}
-
-float spotAttenuation(float3 lightDir, float3 toLight, float innerConeAngle, float outerConeAngle) {
-  float cosTheta = dot(normalize(-lightDir), normalize(toLight));
-  float innerCos = cos(innerConeAngle);
-  float outerCos = cos(outerConeAngle);
-  if (cosTheta <= outerCos) return 0.0f;
-  if (cosTheta >= innerCos) return 1.0f;
-  return smoothstep(outerCos, innerCos, cosTheta);
-}
-
-float toonShading(float nDotL, uint bandCount) {
-  if (bandCount == 0u) return max(0.0f, nDotL);
-  float value = clamp(nDotL, 0.0f, 1.0f);
-  float inv = 1.0f / float(max(bandCount, 1u));
-  return floor(value * (1.0f + inv * 0.5f) * float(bandCount)) * inv;
-}
-
-float3 gammaCorrection(float3 color, float gamma) { return pow(color, float3(1.0f / max(gamma, 1e-4f))); }
-
-float3 applySaturation(float3 color, float saturation) {
-  float luma = dot(color, float3(0.299f, 0.587f, 0.114f));
-  return mix(float3(luma), color, saturation);
-}
-
-float3 toneMapUncharted2Impl(float3 color) {
-  const float A = 0.15f;
-  const float B = 0.50f;
-  const float C = 0.10f;
-  const float D = 0.20f;
-  const float E = 0.02f;
-  const float F = 0.30f;
-  return ((color * (A * color + C * B) + D * E) / (color * (A * color + B) + D * F)) - E / F;
-}
-
-float3 toneMapUncharted(float3 color, float gamma) {
-  const float W = 11.2f;
-  const float exposureBias = 2.0f;
-  color = toneMapUncharted2Impl(color * exposureBias);
-  float3 whiteScale = 1.0f / toneMapUncharted2Impl(float3(W));
-  return gammaCorrection(color * whiteScale, gamma);
-}
-
-float normalizedInverseDepth(float depth, float zNear, float zFar) {
-  if (depth <= 0.0f || zFar <= zNear) return 0.0f;
-  float invDepth = 1.0f / depth;
-  float invNear = 1.0f / zNear;
-  float invFar = 1.0f / zFar;
-  float denom = invFar - invNear;
-  if (fabs(denom) < 1e-6f) return 0.0f;
-  return fabs((invDepth - invNear) / denom);
-}
-
-float3 sampleContourNormal(device const float4* normals, device const uint* objectIds, uint width, uint height, int x, int y) {
-  if (loadObjectId(objectIds, width, height, x, y) == 0u) return float3(0.0f);
-  return normalize(loadPixel(normals, width, height, x, y).xyz);
-}
-
-float sampleContourDepth(device const float* linearDepth, device const uint* objectIds, uint width, uint height, int x, int y,
-                         float zNear, float zFar) {
-  if (loadObjectId(objectIds, width, height, x, y) == 0u) return 0.0f;
-  float depth = loadDepth(linearDepth, width, height, x, y);
-  return normalizedInverseDepth(depth, zNear, zFar);
-}
-
-[[kernel]] void depthMinMaxKernel(device const float* linearDepth [[buffer(0)]],
-                                  device atomic_uint* minmax [[buffer(1)]],
-                                  constant ToonUniforms& toon [[buffer(2)]],
-                                  uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= toon.width || gid.y >= toon.height) return;
-  float depth = linearDepth[pixelIndex(gid.x, gid.y, toon.width)];
-  if (depth > 0.0f) {
-    uint bits = as_type<uint>(depth);
-    atomic_fetch_min_explicit(&minmax[0], bits, memory_order_relaxed);
-    atomic_fetch_max_explicit(&minmax[1], bits, memory_order_relaxed);
-  }
-}
-
-float computeClipDepth(float3 worldPos, constant CameraData& camera) {
-  float4 clip = camera.projectionMatrix * (camera.viewMatrix * float4(worldPos, 1.0f));
-  float ndc = clip.z / max(clip.w, 1e-6f);
-  return clamp(0.5f * ndc + 0.5f, 0.0f, 1.0f);
-}
+#include "gpu_shared_types.h"
+#include "shader_common.h"
 
 float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 normal,
                                intersector<curve_data, triangle_data, instancing> isector,
@@ -312,13 +27,13 @@ float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hit
 }
 
 float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
-                       device const TriangleData* triangles, device const MaterialData* materials,
+                       device const GPUTriangle* triangles, device const GPUMaterial* materials,
                        thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
                        instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                        intersection_function_table<curve_data, triangle_data, instancing> ftable);
 
-bool sampleAreaLight(float3 hitPos, float3 normal, constant LightingData& lighting,
-                     device const TriangleData* triangles, device const MaterialData* materials,
+bool sampleAreaLight(float3 hitPos, float3 normal, constant GPULighting& lighting,
+                     device const GPUTriangle* triangles, device const GPUMaterial* materials,
                      thread uint& rng, thread float3& toLight,
                      thread float3& radiance, intersector<curve_data, triangle_data, instancing> isector,
                      instance_acceleration_structure scene, instance_acceleration_structure pointScene,
@@ -376,23 +91,21 @@ float geometrySmith(float3 N, float3 V, float3 L, float roughness) {
   return geometrySchlickGGX(NdotV, roughness) * geometrySchlickGGX(NdotL, roughness);
 }
 
-float3 evalSimpleSky(float3 dir, constant LightingData& lighting) {
+float3 evalSimpleSky(float3 dir, constant GPULighting& lighting) {
   float3 sunDir = normalize(-lighting.mainLightDirection.xyz);
   float sunIntensity = lighting.mainLightColorIntensity.w;
   float3 sunColor = lighting.mainLightColorIntensity.xyz;
-  // Always use the live UI background color (LightingData from frame).
   float3 bgColor = lighting.backgroundColor.xyz;
 
   float y = dir.y;
 
-  // Sky gradient is anchored to backgroundColor: horizon matches it, zenith is a relative shift (not a fixed RGB sky).
+  // Sky gradient is anchored to backgroundColor: horizon matches it, zenith is a relative shift.
   float3 horizonColor = bgColor;
   float3 zenithColor = mix(bgColor, bgColor * float3(0.35f, 0.55f, 1.05f), 0.75f);
   float3 groundColor = bgColor * float3(0.08f, 0.08f, 0.09f);
 
   float3 sky;
   if (y > 0.0f) {
-    // Smaller exponent => t rises faster with elevation => shorter horizon-colored band (narrower "strip").
     float t = pow(y, 0.29f);
     sky = mix(horizonColor, zenithColor, t);
   } else {
@@ -414,7 +127,7 @@ float3 evalSimpleSky(float3 dir, constant LightingData& lighting) {
   return sky;
 }
 
-float3 sampleEnvironment(float3 dir, constant LightingData& lighting) {
+float3 sampleEnvironment(float3 dir, constant GPULighting& lighting) {
   float hemi = saturate(dir.y * 0.5f + 0.5f);
   float3 sky = mix(float3(0.04f, 0.04f, 0.05f), lighting.environmentTintIntensity.xyz, hemi);
   return sky * lighting.environmentTintIntensity.w;
@@ -462,7 +175,7 @@ float3 sampleGGXBounce(float3 N, float3 V, float roughness, thread uint& rng) {
 }
 
 float3 applyNormalMap(float3 geomNormal, float3 shadingNormal, float3 p0, float3 p1, float3 p2, float2 uv0, float2 uv1, float2 uv2,
-                      float2 uv, device const TextureData* textures, device const float4* texturePixels, uint4 normalTextureData,
+                      float2 uv, device const GPUTexture* textures, device const float4* texturePixels, uint4 normalTextureData,
                       float normalScale) {
   if (normalTextureData.y == 0u) return shadingNormal;
 
@@ -491,7 +204,7 @@ float3 applyNormalMap(float3 geomNormal, float3 shadingNormal, float3 p0, float3
 }
 
 float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
-                       device const TriangleData* triangles, device const MaterialData* materials,
+                       device const GPUTriangle* triangles, device const GPUMaterial* materials,
                        thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
                        instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                        intersection_function_table<curve_data, triangle_data, instancing> ftable) {
@@ -506,7 +219,6 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
     auto ptHit = isector.intersect(shadowRay, pointScene, 0xFFu, ftable);
     if (mcHit.type == intersection_type::none && ptHit.type == intersection_type::none) return 1.0f;
 
-    // Sphere (point cloud) hit → always opaque
     bool ptCloser = ptHit.type != intersection_type::none &&
                     (mcHit.type == intersection_type::none || ptHit.distance < mcHit.distance);
     if (ptCloser) return 0.0f;
@@ -537,10 +249,10 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
   return 0.0f;
 }
 
-float evaluatePunctualLight(device const PunctualLightData* lights, uint lightIndex, float3 hitPos, float3 normal,
+float evaluatePunctualLight(device const GPUPunctualLight* lights, uint lightIndex, float3 hitPos, float3 normal,
                             intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                             intersection_function_table<curve_data, triangle_data, instancing> ftable) {
-  PunctualLightData light = lights[lightIndex];
+  GPUPunctualLight light = lights[lightIndex];
   uint lightType = uint(light.directionType.w);
   float3 lightColor = light.colorIntensity.xyz * light.colorIntensity.w;
   if (all(lightColor == float3(0.0f))) return 0.0f;
@@ -590,9 +302,9 @@ float evaluatePunctualLight(device const PunctualLightData* lights, uint lightIn
   return luminance * attenuation * nDotL;
 }
 
-bool samplePunctualLight(device const PunctualLightData* lights, uint lightIndex, float3 hitPos, thread float3& toLight,
+bool samplePunctualLight(device const GPUPunctualLight* lights, uint lightIndex, float3 hitPos, thread float3& toLight,
                          thread float3& radiance, thread float& maxDistance) {
-  PunctualLightData light = lights[lightIndex];
+  GPUPunctualLight light = lights[lightIndex];
   uint lightType = uint(light.directionType.w);
   float3 lightColor = light.colorIntensity.xyz * light.colorIntensity.w;
   if (all(lightColor == float3(0.0f))) return false;
@@ -646,14 +358,13 @@ struct SurfaceHitInfo {
   bool isInfinitePlane = false;
 };
 
-SurfaceHitInfo intersectGroundPlane(ray r, constant FrameUniforms& frame) {
+SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame) {
   SurfaceHitInfo out;
   if (frame.planeColorEnabled.w < 0.5f) return out;
 
   float3 normal = float3(0, 1, 0);
   float planeHeight = frame.planeParams.x;
 
-  // Only report intersection if ray origin is above the plane
   if (r.origin.y <= planeHeight) return out;
 
   float denom = dot(r.direction, normal);
@@ -678,24 +389,24 @@ SurfaceHitInfo intersectGroundPlane(ray r, constant FrameUniforms& frame) {
 
 float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const float4* positions, device const float4* normals,
                          device const float2* texcoords, device const float4* vertexColors,
-                         device const TriangleData* triangles,
-                         device const MaterialData* materials, device const TextureData* textures,
-                         device const float4* texturePixels, device const PunctualLightData* sceneLights,
-                         device const CurvePrimitiveGPU* curvePrimitives,
-                         device const PointPrimitiveGPU* pointPrimitives,
-                         constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
+                         device const GPUTriangle* triangles,
+                         device const GPUMaterial* materials, device const GPUTexture* textures,
+                         device const float4* texturePixels, device const GPUPunctualLight* sceneLights,
+                         device const GPUCurvePrimitive* curvePrimitives,
+                         device const GPUPointPrimitive* pointPrimitives,
+                         constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable);
 
-float3 sampleMissRadiance(float3 dir, constant LightingData& lighting) {
+float3 sampleMissRadiance(float3 dir, constant GPULighting& lighting) {
   return evalSimpleSky(dir, lighting);
 }
 
 SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam, uint segmentId,
-                             device const CurvePrimitiveGPU* curvePrimitives,
-                             device const MaterialData* materials) {
+                             device const GPUCurvePrimitive* curvePrimitives,
+                             device const GPUMaterial* materials) {
   SurfaceHitInfo out;
-  CurvePrimitiveGPU prim = curvePrimitives[segmentId];
+  GPUCurvePrimitive prim = curvePrimitives[segmentId];
   float3 hitPos = currentRay.origin + currentRay.direction * hitDistance;
   float3 p0 = prim.p0_radius.xyz;
   float3 p1 = prim.p1_type.xyz;
@@ -714,7 +425,7 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
     normal = -normal;
   }
 
-  MaterialData material = materials[matIdx];
+  GPUMaterial material = materials[matIdx];
 
   out.hit = 1u;
   out.objectId = objId;
@@ -734,52 +445,11 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   return out;
 }
 
-// Return type for custom bounding-box intersection functions.
-struct BoundingBoxIntersectionResult {
-  bool  accept   [[accept_intersection]];
-  float distance [[distance]];
-};
-
-// Custom bounding-box intersection function for analytic sphere ray-tracing.
-// [[visible]] is required so the function is accessible by name from the host
-// and can be inserted into an MTLIntersectionFunctionTable.
-[[intersection(bounding_box, instancing)]]
-BoundingBoxIntersectionResult sphereIntersection(float3 rayOrigin         [[origin]],
-                                                  float3 rayDirection      [[direction]],
-                                                  float  rayMinDistance    [[min_distance]],
-                                                  float  rayMaxDistance    [[max_distance]],
-                                                  uint   primitiveIndex    [[primitive_id]],
-                                                  device const PointPrimitiveGPU* points [[buffer(25)]]) {
-  BoundingBoxIntersectionResult result;
-  result.accept = false;
-
-  PointPrimitiveGPU pt = points[primitiveIndex];
-  float3 center = pt.center_radius.xyz;
-  float  radius = pt.center_radius.w;
-
-  float3 oc = rayOrigin - center;
-  float  b  = dot(oc, rayDirection);
-  float  c  = dot(oc, oc) - radius * radius;
-  float  disc = b * b - c;
-  if (disc < 0.0f) return result;
-
-  float sqrtDisc = sqrt(disc);
-  float t = -b - sqrtDisc;
-  if (t < rayMinDistance || t > rayMaxDistance) {
-    t = -b + sqrtDisc;
-    if (t < rayMinDistance || t > rayMaxDistance) return result;
-  }
-
-  result.accept   = true;
-  result.distance = t;
-  return result;
-}
-
 SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIndex,
-                              device const PointPrimitiveGPU* points,
-                              device const MaterialData* materials) {
+                              device const GPUPointPrimitive* points,
+                              device const GPUMaterial* materials) {
   SurfaceHitInfo out;
-  PointPrimitiveGPU pt = points[primitiveIndex];
+  GPUPointPrimitive pt = points[primitiveIndex];
   float3 center  = pt.center_radius.xyz;
   float3 hitPos  = currentRay.origin + currentRay.direction * hitDistance;
   float3 normal  = normalize(hitPos - center);
@@ -787,7 +457,7 @@ SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIn
 
   uint matIdx = pt.materialObjectId.x;
   uint objId  = pt.materialObjectId.y;
-  MaterialData material = materials[matIdx];
+  GPUMaterial material = materials[matIdx];
 
   out.hit        = 1u;
   out.objectId   = objId;
@@ -795,7 +465,6 @@ SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIn
   out.hitPos     = hitPos;
   out.geomNormal = normal;
   out.normal     = normal;
-  // Per-point color overrides the shared material base color when populated.
   out.baseColor  = clamp(pt.baseColor.xyz, 0.0f, 1.0f);
   out.emissive   = material.emissiveFactor.xyz;
   out.metallic   = material.metallicRoughnessNormal.x;
@@ -810,11 +479,11 @@ SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIn
 
 SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, device const float4* normals,
                                 device const float2* texcoords, device const float4* vertexColors,
-                                device const TriangleData* triangles,
-                                device const MaterialData* materials, device const TextureData* textures,
+                                device const GPUTriangle* triangles,
+                                device const GPUMaterial* materials, device const GPUTexture* textures,
                                 device const float4* texturePixels,
-                                device const CurvePrimitiveGPU* curvePrimitives,
-                                device const PointPrimitiveGPU* pointPrimitives,
+                                device const GPUCurvePrimitive* curvePrimitives,
+                                device const GPUPointPrimitive* pointPrimitives,
                                 intersector<curve_data, triangle_data, instancing> isector,
                                 instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                 intersection_function_table<curve_data, triangle_data, instancing> ftable) {
@@ -833,7 +502,7 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
     return shadeCurveHit(currentRay, mcHit.distance, mcHit.curve_parameter, mcHit.primitive_id, curvePrimitives, materials);
   }
   uint triangleIndex = mcHit.primitive_id;
-  TriangleData tri = triangles[triangleIndex];
+  GPUTriangle tri = triangles[triangleIndex];
   float3 p0 = positions[tri.indicesMaterial.x].xyz;
   float3 p1 = positions[tri.indicesMaterial.y].xyz;
   float3 p2 = positions[tri.indicesMaterial.z].xyz;
@@ -859,7 +528,7 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   float3 vc2 = vertexColors[tri.indicesMaterial.z].xyz;
   float3 interpVertexColor = vc0 * w0 + vc1 * w1 + vc2 * w2;
 
-  MaterialData material = materials[tri.indicesMaterial.w];
+  GPUMaterial material = materials[tri.indicesMaterial.w];
   float4 baseColor = material.baseColorFactor * float4(interpVertexColor, 1.0f);
   float metallic = material.metallicRoughnessNormal.x;
   float roughness = material.metallicRoughnessNormal.y;
@@ -905,7 +574,6 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   out.unlit = (material.transmissionIor.z > 0.5f);
   out.isInfinitePlane = false;
 
-  // Wireframe edge overlay: if enabled, override to edge color when close to any triangle edge.
   if (tri.objectFlags.z != 0u) {
     float edgeThreshold = material.wireframeEdgeData.w;
     float minBary = min(w0, min(w1, w2));
@@ -924,9 +592,9 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   return out;
 }
 
-float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device const PunctualLightData* sceneLights,
-                                 device const TriangleData* triangles, device const MaterialData* materials,
-                                 constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
+float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device const GPUPunctualLight* sceneLights,
+                                 device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                                 constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                                  intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                  intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 N = surf.normal;
@@ -937,12 +605,9 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
   float3 F0 = mix(float3(surf.dielectricF0), albedo, metallic);
   float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, metallic);
   float3 directLighting = float3(0.0f);
-  // Infinite ground plane: use Lambert-only direct light. GGX + area lights on a huge plane produces a long grazing
-  // highlight strip (denominator ~ NdotV, foreshortened light footprint) unrelated to the sky gradient.
   const bool isInfinitePlane = surf.isInfinitePlane;
   float3 diffuseAlbedo = albedo * (1.0f - metallic);
 
-  // Main directional light (always evaluate if intensity > 0)
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
     float3 L = normalize(-lighting.mainLightDirection.xyz);
@@ -965,7 +630,6 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
     }
   }
 
-  // Punctual scene lights (always evaluate if enabled and count > 0)
   if (frame.lightCount > 0u) {
     for (uint lightIndex = 0u; lightIndex < frame.lightCount; ++lightIndex) {
       float3 L;
@@ -990,7 +654,6 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
     }
   }
 
-  // Area light (NEE only; full two-way MIS would also check BRDF bounce hits on the light)
   if (frame.enableAreaLight != 0u) {
     float3 L;
     float3 radiance;
@@ -1014,9 +677,9 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
   return directLighting;
 }
 
-float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, device const PunctualLightData* sceneLights,
-                                        device const TriangleData* triangles, device const MaterialData* materials,
-                                        constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
+float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, device const GPUPunctualLight* sceneLights,
+                                        device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                                        constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                         intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 N = surf.normal;
@@ -1026,7 +689,6 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
   float3 F0 = float3(f0Scalar);
   float3 specularLighting = float3(0.0f);
 
-  // Main directional light
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
     float3 L = normalize(-lighting.mainLightDirection.xyz);
@@ -1043,7 +705,6 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
     }
   }
 
-  // Punctual scene lights
   if (frame.lightCount > 0u) {
     for (uint lightIndex = 0u; lightIndex < frame.lightCount; ++lightIndex) {
       float3 L;
@@ -1062,7 +723,6 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
     }
   }
 
-  // Area light
   if (frame.enableAreaLight != 0u) {
     float3 L;
     float3 radiance;
@@ -1085,12 +745,12 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
 
 float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit, device const float4* positions, device const float4* normals,
                          device const float2* texcoords, device const float4* vertexColors,
-                         device const TriangleData* triangles,
-                         device const MaterialData* materials, device const TextureData* textures,
-                         device const float4* texturePixels, device const PunctualLightData* sceneLights,
-                         device const CurvePrimitiveGPU* curvePrimitives,
-                         device const PointPrimitiveGPU* pointPrimitives,
-                         constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
+                         device const GPUTriangle* triangles,
+                         device const GPUMaterial* materials, device const GPUTexture* textures,
+                         device const float4* texturePixels, device const GPUPunctualLight* sceneLights,
+                         device const GPUCurvePrimitive* curvePrimitives,
+                         device const GPUPointPrimitive* pointPrimitives,
+                         constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 throughput = float3(1.0f);
@@ -1218,7 +878,6 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       continue;
     }
 
-    // Opaque surface — NEE direct lighting + emissive (no ambient, indirect comes from bounces)
     float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
     float3 F0 = mix(float3(surf.dielectricF0), surf.baseColor, surf.metallic);
     float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, surf.metallic);
@@ -1226,11 +885,9 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
     float3 F = fresnelSchlick(NdotV, F0, grazingMax);
     radiance += throughput * (directLighting + surf.emissive);
 
-    // Choose specular vs diffuse bounce via Fresnel
     float specProb = clamp((F.x + F.y + F.z) / 3.0f + surf.metallic * 0.5f, 0.04f, 0.96f);
 
     if (rand01(rng) < specProb) {
-      // Specular bounce: GGX VNDF importance sampling
       float3 bounceDir = sampleGGXBounce(surf.normal, currentViewDir, surf.roughness, rng);
       if (dot(bounceDir, surf.normal) <= 0.0f) {
         bounceDir = reflect(-currentViewDir, surf.normal);
@@ -1238,16 +895,13 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       throughput *= F / specProb;
       currentRay.direction = bounceDir;
     } else {
-      // Diffuse bounce
       float3 kD = (1.0f - F) * (1.0f - surf.metallic);
       throughput *= surf.baseColor * kD / (1.0f - specProb);
       currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
     }
 
-    // Early exit if throughput is negligible
     if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
 
-    // Russian roulette from bounce 2+ (guarantee first 2 indirect bounces)
     if (bounce >= 2u) {
       float rrProb = clamp(max(max(throughput.x, throughput.y), throughput.z) + 0.001f, 0.05f, 0.95f);
       if (rand01(rng) >= rrProb) break;
@@ -1266,12 +920,12 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
 
 float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const float4* positions, device const float4* normals,
                          device const float2* texcoords, device const float4* vertexColors,
-                         device const TriangleData* triangles,
-                         device const MaterialData* materials, device const TextureData* textures,
-                         device const float4* texturePixels, device const PunctualLightData* sceneLights,
-                         device const CurvePrimitiveGPU* curvePrimitives,
-                         device const PointPrimitiveGPU* pointPrimitives,
-                         constant FrameUniforms& frame, constant LightingData& lighting, thread uint& rng,
+                         device const GPUTriangle* triangles,
+                         device const GPUMaterial* materials, device const GPUTexture* textures,
+                         device const float4* texturePixels, device const GPUPunctualLight* sceneLights,
+                         device const GPUCurvePrimitive* curvePrimitives,
+                         device const GPUPointPrimitive* pointPrimitives,
+                         constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   float3 throughput = float3(1.0f);
@@ -1374,7 +1028,6 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       continue;
     }
 
-    // Full bounce for opaque surfaces (same quality as traceStandardPath)
     float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
     float3 F0 = mix(float3(surf.dielectricF0), surf.baseColor, surf.metallic);
     float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, surf.metallic);
@@ -1414,14 +1067,14 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
 [[kernel]] void pathTraceKernel(device const float4* positions [[buffer(0)]],
                                 device const float4* normals [[buffer(1)]],
                                 device const float2* texcoords [[buffer(2)]],
-                                device const TriangleData* triangles [[buffer(3)]],
-                                device const MaterialData* materials [[buffer(4)]],
-                                device const TextureData* textures [[buffer(5)]],
+                                device const GPUTriangle* triangles [[buffer(3)]],
+                                device const GPUMaterial* materials [[buffer(4)]],
+                                device const GPUTexture* textures [[buffer(5)]],
                                 device const float4* texturePixels [[buffer(6)]],
-                                device const PunctualLightData* sceneLights [[buffer(7)]],
-                                constant CameraData& camera [[buffer(8)]],
-                                constant FrameUniforms& frame [[buffer(9)]],
-                                constant LightingData& lighting [[buffer(10)]],
+                                device const GPUPunctualLight* sceneLights [[buffer(7)]],
+                                constant GPUCamera& camera [[buffer(8)]],
+                                constant GPUFrameUniforms& frame [[buffer(9)]],
+                                constant GPULighting& lighting [[buffer(10)]],
                                 device float4* accumulation [[buffer(11)]],
                                 device float4* output [[buffer(12)]],
                                 device float* depthBuffer [[buffer(13)]],
@@ -1435,9 +1088,9 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                                 device float* roughnessBuffer [[buffer(20)]],
                                 device float4* motionVectorBuffer [[buffer(21)]],
                                 device const float4* vertexColors [[buffer(22)]],
-                                device const CurvePrimitiveGPU* curvePrimitives [[buffer(23)]],
+                                device const GPUCurvePrimitive* curvePrimitives [[buffer(23)]],
                                 intersection_function_table<curve_data, triangle_data, instancing> ftable [[buffer(24)]],
-                                device const PointPrimitiveGPU* pointPrimitives [[buffer(25)]],
+                                device const GPUPointPrimitive* pointPrimitives [[buffer(25)]],
                                 uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= frame.width || gid.y >= frame.height) return;
 
@@ -1581,239 +1234,4 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
   }
 
   output[pixelIndex] = accumulation[pixelIndex];
-}
-
-[[kernel]] void tonemapKernel(device const float4* input [[buffer(0)]],
-                              constant ToonUniforms& toon [[buffer(1)]],
-                              device float4* output [[buffer(2)]],
-                              uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= toon.width || gid.y >= toon.height) return;
-  uint index = pixelIndex(gid.x, gid.y, toon.width);
-  float4 color = input[index];
-  float3 mapped = toneMapUncharted(color.xyz * toon.exposure, toon.gamma);
-  mapped = max(mapped, float3(0.0f));
-  mapped = applySaturation(mapped, toon.saturation);
-  output[index] = float4(mapped, color.w);
-}
-
-[[kernel]] void objectContourKernel(device const uint* objectIds [[buffer(0)]],
-                                    constant ToonUniforms& toon [[buffer(1)]],
-                                    device float4* output [[buffer(2)]],
-                                    uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= toon.width || gid.y >= toon.height) return;
-
-  int radius = max(1, int(round(toon.edgeThickness)));
-  int x = int(gid.x);
-  int y = int(gid.y);
-  uint center = loadObjectId(objectIds, toon.width, toon.height, x, y);
-  float contour = 0.0f;
-
-  if (toon.contourMethod == 2u) {
-    contour = (center != loadObjectId(objectIds, toon.width, toon.height, x - radius, y + radius) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x, y + radius) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x + radius, y + radius) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x - radius, y) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x + radius, y) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x - radius, y - radius) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x, y - radius) ||
-               center != loadObjectId(objectIds, toon.width, toon.height, x + radius, y - radius))
-                  ? 1.0f
-                  : 0.0f;
-  } else {
-    int differentCorners = 0;
-    int differentEdges = 0;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x - radius, y + radius)) differentCorners++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x + radius, y + radius)) differentCorners++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x - radius, y - radius)) differentCorners++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x + radius, y - radius)) differentCorners++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x, y + radius)) differentEdges++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x - radius, y)) differentEdges++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x + radius, y)) differentEdges++;
-    if (center != loadObjectId(objectIds, toon.width, toon.height, x, y - radius)) differentEdges++;
-    contour = differentCorners * (1.0f / 6.0f) + differentEdges * (1.0f / 3.0f);
-  }
-
-  contour = clamp(contour * toon.objectThreshold, 0.0f, 1.0f);
-  output[pixelIndex(gid.x, gid.y, toon.width)] = float4(contour, contour, contour, 1.0f);
-}
-
-[[kernel]] void detailContourKernel(device const float* linearDepth [[buffer(0)]],
-                                    device const float4* normals [[buffer(1)]],
-                                    device const uint* objectIds [[buffer(2)]],
-                                    constant ToonUniforms& toon [[buffer(3)]],
-                                    device atomic_uint* minmax [[buffer(4)]],
-                                    device float4* output [[buffer(5)]],
-                                    uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= toon.width || gid.y >= toon.height) return;
-
-  int radius = max(1, int(round(toon.edgeThickness)));
-  int x = int(gid.x);
-  int y = int(gid.y);
-  uint centerObject = loadObjectId(objectIds, toon.width, toon.height, x, y);
-  if (centerObject == 0u) {
-    output[pixelIndex(gid.x, gid.y, toon.width)] = float4(0.0f);
-    return;
-  }
-
-  float zNear = as_type<float>(atomic_load_explicit(&minmax[0], memory_order_relaxed));
-  float zFar = as_type<float>(atomic_load_explicit(&minmax[1], memory_order_relaxed));
-
-  float3 A = sampleContourNormal(normals, objectIds, toon.width, toon.height, x - radius, y + radius);
-  float3 B = sampleContourNormal(normals, objectIds, toon.width, toon.height, x, y + radius);
-  float3 C = sampleContourNormal(normals, objectIds, toon.width, toon.height, x + radius, y + radius);
-  float3 D = sampleContourNormal(normals, objectIds, toon.width, toon.height, x - radius, y);
-  float3 E = sampleContourNormal(normals, objectIds, toon.width, toon.height, x + radius, y);
-  float3 F = sampleContourNormal(normals, objectIds, toon.width, toon.height, x - radius, y - radius);
-  float3 G = sampleContourNormal(normals, objectIds, toon.width, toon.height, x, y - radius);
-  float3 H = sampleContourNormal(normals, objectIds, toon.width, toon.height, x + radius, y - radius);
-
-  const float k0 = 17.0f / 23.75f;
-  const float k1 = 61.0f / 23.75f;
-  float3 gradY = k0 * A + k1 * B + k0 * C - k0 * F - k1 * G - k0 * H;
-  float3 gradX = k0 * C + k1 * E + k0 * H - k0 * A - k1 * D - k0 * F;
-  float normalGradient = length(gradX) + length(gradY);
-  float normalEdge = smoothstep(2.0f, 3.0f, normalGradient * toon.normalThreshold);
-  if (toon.enableNormalEdge == 0u) normalEdge = 0.0f;
-
-  // Depth edge requires a valid scene depth range; skip when zNear == zFar
-  // (e.g. uniform-depth test scenes) — normal edge detection is unaffected.
-  float depthEdge = 0.0f;
-  if (zFar > zNear) {
-    float Az = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y + radius, zNear, zFar);
-    float Bz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y + radius, zNear, zFar);
-    float Cz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y + radius, zNear, zFar);
-    float Dz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y, zNear, zFar);
-    float Ez = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y, zNear, zFar);
-    float Fz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x - radius, y - radius, zNear, zFar);
-    float Gz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y - radius, zNear, zFar);
-    float Hz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x + radius, y - radius, zNear, zFar);
-    float Xz = sampleContourDepth(linearDepth, objectIds, toon.width, toon.height, x, y, zNear, zFar);
-    float g = (fabs(Az + 2.0f * Bz + Cz - Fz - 2.0f * Gz - Hz) +
-               fabs(Cz + 2.0f * Ez + Hz - Az - 2.0f * Dz - Fz)) /
-              8.0f;
-    float l = (8.0f * Xz - Az - Bz - Cz - Dz - Ez - Fz - Gz - Hz) / 3.0f;
-    depthEdge = smoothstep(0.03f, 0.1f, (l + g) * toon.depthThreshold);
-    if (toon.enableDepthEdge == 0u) depthEdge = 0.0f;
-  }
-
-  float edge = clamp(normalEdge + depthEdge, 0.0f, 1.0f);
-  output[pixelIndex(gid.x, gid.y, toon.width)] = float4(edge, edge, edge, 1.0f);
-}
-
-[[kernel]] void fxaaKernel(device const float4* input [[buffer(0)]],
-                           constant ToonUniforms& toon [[buffer(1)]],
-                           device float4* output [[buffer(2)]],
-                           uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= toon.width || gid.y >= toon.height) return;
-
-  float2 resolution = float2(toon.width, toon.height);
-  float2 fragCoord = float2(gid) + 0.5f;
-  float2 inverseVP = 1.0f / resolution;
-  float2 uvNW = (fragCoord + float2(-1.0f, -1.0f)) * inverseVP;
-  float2 uvNE = (fragCoord + float2(1.0f, -1.0f)) * inverseVP;
-  float2 uvSW = (fragCoord + float2(-1.0f, 1.0f)) * inverseVP;
-  float2 uvSE = (fragCoord + float2(1.0f, 1.0f)) * inverseVP;
-  float2 uvM = fragCoord * inverseVP;
-
-  float3 rgbNW = sampleLinear(input, toon.width, toon.height, uvNW).xyz;
-  float3 rgbNE = sampleLinear(input, toon.width, toon.height, uvNE).xyz;
-  float3 rgbSW = sampleLinear(input, toon.width, toon.height, uvSW).xyz;
-  float3 rgbSE = sampleLinear(input, toon.width, toon.height, uvSE).xyz;
-  float4 texColor = sampleLinear(input, toon.width, toon.height, uvM);
-  float3 rgbM = texColor.xyz;
-  float3 lumaCoeff = float3(0.299f, 0.587f, 0.114f);
-
-  float lumaNW = dot(rgbNW, lumaCoeff);
-  float lumaNE = dot(rgbNE, lumaCoeff);
-  float lumaSW = dot(rgbSW, lumaCoeff);
-  float lumaSE = dot(rgbSE, lumaCoeff);
-  float lumaM = dot(rgbM, lumaCoeff);
-  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
-  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
-
-  float2 dir;
-  dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
-  dir.y = (lumaNW + lumaSW) - (lumaNE + lumaSE);
-
-  const float fxaaReduceMin = 1.0f / 128.0f;
-  const float fxaaReduceMul = 1.0f / 8.0f;
-  const float fxaaSpanMax = 8.0f;
-  float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25f * fxaaReduceMul), fxaaReduceMin);
-  float rcpDirMin = 1.0f / (min(fabs(dir.x), fabs(dir.y)) + dirReduce);
-  dir = clamp(dir * rcpDirMin, float2(-fxaaSpanMax), float2(fxaaSpanMax)) * inverseVP;
-
-  float3 rgbA = 0.5f * (sampleLinear(input, toon.width, toon.height, uvM + dir * (1.0f / 3.0f - 0.5f)).xyz +
-                        sampleLinear(input, toon.width, toon.height, uvM + dir * (2.0f / 3.0f - 0.5f)).xyz);
-  float3 rgbB = rgbA * 0.5f +
-                0.25f * (sampleLinear(input, toon.width, toon.height, uvM + dir * -0.5f).xyz +
-                         sampleLinear(input, toon.width, toon.height, uvM + dir * 0.5f).xyz);
-
-  float lumaB = dot(rgbB, lumaCoeff);
-  float3 rgb = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
-  output[pixelIndex(gid.x, gid.y, toon.width)] = float4(rgb, texColor.w);
-}
-
-[[kernel]] void compositeKernel(device const float4* tonemapped [[buffer(0)]],
-                                device const float4* detailContour [[buffer(1)]],
-                                device const float4* objectContour [[buffer(2)]],
-                                constant ToonUniforms& toon [[buffer(3)]],
-                                device float4* output [[buffer(4)]],
-                                uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= toon.width || gid.y >= toon.height) return;
-  uint index = pixelIndex(gid.x, gid.y, toon.width);
-  float4 color = tonemapped[index];
-  color.xyz = mix(toon.backgroundColor.xyz, color.xyz, color.w);
-  float detailMask = toon.enableDetailContour != 0u ? clamp(detailContour[index].x * toon.detailContourStrength, 0.0f, 1.0f)
-                                                    : 0.0f;
-  float objectMask = toon.enableObjectContour != 0u ? clamp(objectContour[index].x * toon.objectContourStrength, 0.0f, 1.0f)
-                                                    : 0.0f;
-  color.xyz = mix(color.xyz, toon.edgeColor.xyz, detailMask);
-  color.xyz = mix(color.xyz, toon.edgeColor.xyz, objectMask);
-  output[index] = float4(color.xyz, 1.0f);
-}
-
-[[kernel]] void bufferToTextureKernel(device const float4* input [[buffer(0)]],
-                                      texture2d<half, access::write> output [[texture(0)]],
-                                      uint2 gid [[thread_position_in_grid]]) {
-  uint w = output.get_width();
-  uint h = output.get_height();
-  if (gid.x >= w || gid.y >= h) return;
-  output.write(half4(input[gid.y * w + gid.x]), gid);
-}
-
-[[kernel]] void textureToBufferKernel(texture2d<half, access::read> input [[texture(0)]],
-                                      device float4* output [[buffer(0)]],
-                                      uint2 gid [[thread_position_in_grid]]) {
-  uint w = input.get_width();
-  uint h = input.get_height();
-  if (gid.x >= w || gid.y >= h) return;
-  output[gid.y * w + gid.x] = float4(input.read(gid));
-}
-
-[[kernel]] void depthToTextureKernel(device const float* input [[buffer(0)]],
-                                     texture2d<float, access::write> output [[texture(0)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
-  uint w = output.get_width();
-  uint h = output.get_height();
-  if (gid.x >= w || gid.y >= h) return;
-  output.write(float4(input[gid.y * w + gid.x], 0, 0, 0), gid);
-}
-
-[[kernel]] void roughnessToTextureKernel(device const float* input [[buffer(0)]],
-                                          texture2d<half, access::write> output [[texture(0)]],
-                                          uint2 gid [[thread_position_in_grid]]) {
-  uint w = output.get_width();
-  uint h = output.get_height();
-  if (gid.x >= w || gid.y >= h) return;
-  output.write(half4(half(input[gid.y * w + gid.x]), 0, 0, 0), gid);
-}
-
-[[kernel]] void motionToTextureKernel(device const float4* input [[buffer(0)]],
-                                       texture2d<half, access::write> output [[texture(0)]],
-                                       uint2 gid [[thread_position_in_grid]]) {
-  uint w = output.get_width();
-  uint h = output.get_height();
-  if (gid.x >= w || gid.y >= h) return;
-  float4 v = input[gid.y * w + gid.x];
-  output.write(half4(v.x, v.y, 0, 0), gid);
 }

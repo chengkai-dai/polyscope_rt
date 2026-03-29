@@ -7,6 +7,9 @@
 
 namespace rt {
 
+// ---------------------------------------------------------------------------
+// Backend-agnostic interface — all ray tracing backends implement this.
+// ---------------------------------------------------------------------------
 class IRayTracingBackend {
 public:
   virtual ~IRayTracingBackend() = default;
@@ -20,7 +23,10 @@ public:
   virtual RenderBuffer downloadRenderBuffer() const = 0;
 };
 
-struct MetalPostprocessTestInput {
+// ---------------------------------------------------------------------------
+// Backend-agnostic postprocess test harness.
+// ---------------------------------------------------------------------------
+struct PostprocessTestInput {
   RenderMode renderMode = RenderMode::Toon;
   uint32_t width = 0;
   uint32_t height = 0;
@@ -32,7 +38,7 @@ struct MetalPostprocessTestInput {
   ToonSettings toon;
 };
 
-struct MetalPostprocessTestOutput {
+struct PostprocessTestOutput {
   uint32_t width = 0;
   uint32_t height = 0;
   float minDepth = 0.0f;
@@ -45,13 +51,30 @@ struct MetalPostprocessTestOutput {
   std::vector<glm::vec3> finalColor;
 };
 
-class IMetalShaderTestHarness {
+class IPostProcessTestHarness {
 public:
-  virtual ~IMetalShaderTestHarness() = default;
-  virtual MetalPostprocessTestOutput runPostprocess(const MetalPostprocessTestInput& input) = 0;
+  virtual ~IPostProcessTestHarness() = default;
+  virtual PostprocessTestOutput runPostprocess(const PostprocessTestInput& input) = 0;
 };
 
-std::unique_ptr<IRayTracingBackend> createMetalPathTracerBackend(const std::string& shaderLibraryPath = {});
-std::unique_ptr<IMetalShaderTestHarness> createMetalShaderTestHarness(const std::string& shaderLibraryPath = {});
+// ---------------------------------------------------------------------------
+// Backend selection.
+// ---------------------------------------------------------------------------
+enum class BackendType { Metal, Vulkan };
+
+std::unique_ptr<IRayTracingBackend>    createBackend(BackendType type, const std::string& shaderLibraryPath = {});
+std::unique_ptr<IPostProcessTestHarness> createTestHarness(BackendType type, const std::string& shaderLibraryPath = {});
+
+// Convenience aliases for backward compatibility.
+using MetalPostprocessTestInput  = PostprocessTestInput;
+using MetalPostprocessTestOutput = PostprocessTestOutput;
+using IMetalShaderTestHarness    = IPostProcessTestHarness;
+
+inline std::unique_ptr<IRayTracingBackend> createMetalPathTracerBackend(const std::string& shaderLibraryPath = {}) {
+  return createBackend(BackendType::Metal, shaderLibraryPath);
+}
+inline std::unique_ptr<IMetalShaderTestHarness> createMetalShaderTestHarness(const std::string& shaderLibraryPath = {}) {
+  return createTestHarness(BackendType::Metal, shaderLibraryPath);
+}
 
 } // namespace rt

@@ -11,11 +11,6 @@
 
 namespace {
 
-bool isSkippableBackendError(const std::string& message) {
-  return message.find("Metal is unavailable") != std::string::npos ||
-         message.find("does not report ray tracing support") != std::string::npos;
-}
-
 size_t pixelIndex(uint32_t x, uint32_t y, uint32_t width) {
   return static_cast<size_t>(y) * width + x;
 }
@@ -46,9 +41,9 @@ glm::vec3 toneMapUnchartedReference(const glm::vec3& color, float gamma, float e
   return gammaCorrection(mapped * whiteScale, gamma);
 }
 
-rt::MetalPostprocessTestInput makeInput(uint32_t width, uint32_t height) {
+rt::PostprocessTestInput makeInput(uint32_t width, uint32_t height) {
   const size_t count = static_cast<size_t>(width) * height;
-  rt::MetalPostprocessTestInput input;
+  rt::PostprocessTestInput input;
   input.renderMode = rt::RenderMode::Toon;
   input.width = width;
   input.height = height;
@@ -74,7 +69,7 @@ rt::MetalPostprocessTestInput makeInput(uint32_t width, uint32_t height) {
   return input;
 }
 
-void testTonemapMatchesReference(rt::IMetalShaderTestHarness& harness) {
+void testTonemapMatchesReference(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(1, 1);
   input.rawColor[0] = glm::vec4(0.18f, 0.18f, 0.18f, 1.0f);
   input.linearDepth[0] = 2.0f;
@@ -87,7 +82,7 @@ void testTonemapMatchesReference(rt::IMetalShaderTestHarness& harness) {
   require(glm::length(got - expected) < 1e-3f, "tonemap kernel diverged from reference formula");
 }
 
-void testStandardTonemapUsesLightingControls(rt::IMetalShaderTestHarness& harness) {
+void testStandardTonemapUsesLightingControls(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(1, 1);
   input.renderMode = rt::RenderMode::Standard;
   input.rawColor[0] = glm::vec4(0.3f, 0.2f, 0.1f, 1.0f);
@@ -109,7 +104,7 @@ void testStandardTonemapUsesLightingControls(rt::IMetalShaderTestHarness& harnes
   require(glm::length(got - expected) < 1e-3f, "standard tonemap should use lighting exposure/gamma/saturation");
 }
 
-void testDepthMinMaxIgnoresBackground(rt::IMetalShaderTestHarness& harness) {
+void testDepthMinMaxIgnoresBackground(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(4, 4);
   input.objectId[pixelIndex(1, 1, input.width)] = 1u;
   input.objectId[pixelIndex(2, 2, input.width)] = 1u;
@@ -121,7 +116,7 @@ void testDepthMinMaxIgnoresBackground(rt::IMetalShaderTestHarness& harness) {
   require(nearlyEqual(output.maxDepth, 6.5f, 1e-4f), "depth min/max kernel computed the wrong maximum");
 }
 
-void testObjectContourDetectsBoundary(rt::IMetalShaderTestHarness& harness) {
+void testObjectContourDetectsBoundary(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(5, 5);
   for (uint32_t y = 0; y < input.height; ++y) {
     for (uint32_t x = 0; x < input.width; ++x) {
@@ -137,7 +132,7 @@ void testObjectContourDetectsBoundary(rt::IMetalShaderTestHarness& harness) {
   require(output.objectContour[pixelIndex(1, 2, input.width)] > 0.9f, "object contour should light up on object boundaries");
 }
 
-void testDetailContourDetectsNormalDiscontinuity(rt::IMetalShaderTestHarness& harness) {
+void testDetailContourDetectsNormalDiscontinuity(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(5, 5);
   for (uint32_t y = 0; y < input.height; ++y) {
     for (uint32_t x = 0; x < input.width; ++x) {
@@ -157,7 +152,7 @@ void testDetailContourDetectsNormalDiscontinuity(rt::IMetalShaderTestHarness& ha
           "detail contour should detect the normal discontinuity");
 }
 
-void testDepthContourStaysLowOnFlatSurface(rt::IMetalShaderTestHarness& harness) {
+void testDepthContourStaysLowOnFlatSurface(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(5, 5);
   input.toon.enableNormalEdge = false;
   input.toon.enableDepthEdge = true;
@@ -177,7 +172,7 @@ void testDepthContourStaysLowOnFlatSurface(rt::IMetalShaderTestHarness& harness)
           "depth contour should stay dark on a flat constant-depth surface");
 }
 
-void testDepthContourDoesNotWashOutSmoothSurface(rt::IMetalShaderTestHarness& harness) {
+void testDepthContourDoesNotWashOutSmoothSurface(rt::IPostProcessTestHarness& harness) {
   auto input = makeInput(17, 17);
   input.toon.enableNormalEdge = false;
   input.toon.enableDepthEdge = true;
@@ -207,7 +202,7 @@ void testDepthContourDoesNotWashOutSmoothSurface(rt::IMetalShaderTestHarness& ha
   require(fxaaMean < 0.45, "FXAA depth contour should not wash out a smooth depth surface");
 }
 
-void testFxaaAndCompositeBackground(rt::IMetalShaderTestHarness& harness) {
+void testFxaaAndCompositeBackground(rt::IPostProcessTestHarness& harness) {
   // Part 1: verify the composite kernel restores the background color for non-object pixels.
   {
     auto input = makeInput(4, 4);
@@ -254,7 +249,7 @@ void testFxaaAndCompositeBackground(rt::IMetalShaderTestHarness& harness) {
 
 int main() {
   try {
-    auto harness = rt::createMetalShaderTestHarness();
+    auto harness = rt::createTestHarness(rt::BackendType::Metal);
   testTonemapMatchesReference(*harness);
   testStandardTonemapUsesLightingControls(*harness);
   testDepthMinMaxIgnoresBackground(*harness);
@@ -263,15 +258,15 @@ int main() {
     testDepthContourStaysLowOnFlatSurface(*harness);
     testDepthContourDoesNotWashOutSmoothSurface(*harness);
     testFxaaAndCompositeBackground(*harness);
-    std::cout << "metal_shader_unit_test passed" << std::endl;
+    std::cout << "postprocess_test passed" << std::endl;
     return 0;
   } catch (const std::exception& e) {
     const std::string message = e.what();
     if (isSkippableBackendError(message)) {
-      std::cout << "metal_shader_unit_test skipped: " << message << std::endl;
+      std::cout << "postprocess_test skipped: " << message << std::endl;
       return 0;
     }
-    std::cerr << "metal_shader_unit_test failed: " << message << std::endl;
+    std::cerr << "postprocess_test failed: " << message << std::endl;
     return 1;
   }
 }

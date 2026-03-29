@@ -57,12 +57,23 @@ add_library(
   src/plugin/polyscope_rt_runtime_gui.cpp
   src/scene/polyscope_scene_snapshot.cpp
   src/scene/ray_tracing_geometry_primitives.cpp
-  src/rendering/metal_path_tracer_backend.mm
+  src/rendering/metal/metal_device.mm
+  src/rendering/metal/metal_scene_builder.mm
+  src/rendering/metal/metal_standard_preset.mm
+  src/rendering/metal/metal_toon_preset.mm
+  src/rendering/metal/metal_backend.mm
+  src/rendering/metal/metal_test_harness.mm
   src/rendering/toon_shading.cpp
   src/plugin/polyscope_rt_plugin.cpp
 )
-set_source_files_properties(src/rendering/metal_path_tracer_backend.mm PROPERTIES
-  COMPILE_FLAGS "-Wno-deprecated-declarations"
+set_source_files_properties(
+  src/rendering/metal/metal_device.mm
+  src/rendering/metal/metal_scene_builder.mm
+  src/rendering/metal/metal_standard_preset.mm
+  src/rendering/metal/metal_toon_preset.mm
+  src/rendering/metal/metal_backend.mm
+  src/rendering/metal/metal_test_harness.mm
+  PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations"
 )
 add_library(polyscope_rt::plugin ALIAS polyscope_rt_plugin)
 set_target_properties(polyscope_rt_plugin PROPERTIES
@@ -106,14 +117,40 @@ target_link_libraries(
 
 target_compile_definitions(polyscope_rt_plugin PUBLIC GLM_ENABLE_EXPERIMENTAL)
 
+set(METAL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering/metal/shaders)
+set(METAL_SHADER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering)
+set(METAL_SOURCES
+  ${METAL_SHADER_DIR}/path_tracer.metal
+  ${METAL_SHADER_DIR}/intersection.metal
+  ${METAL_SHADER_DIR}/standard_postprocess.metal
+  ${METAL_SHADER_DIR}/toon_postprocess.metal
+  ${METAL_SHADER_DIR}/utility.metal
+)
+set(METAL_SHARED_HEADERS
+  ${METAL_SHADER_INCLUDE_DIR}/gpu_shared_types.h
+  ${METAL_SHADER_DIR}/shader_common.h
+)
+set(METAL_AIR_FILES)
+foreach(SHADER ${METAL_SOURCES})
+  get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+  set(AIR_FILE ${CMAKE_BINARY_DIR}/${SHADER_NAME}.air)
+  add_custom_command(
+    OUTPUT ${AIR_FILE}
+    COMMAND xcrun -sdk macosx metal -c ${SHADER}
+            -o ${AIR_FILE} -std=metal4.0 -O2
+            -I ${METAL_SHADER_INCLUDE_DIR}
+            -I ${METAL_SHADER_DIR}
+    DEPENDS ${SHADER} ${METAL_SHARED_HEADERS}
+    COMMENT "Compiling Metal shader: ${SHADER_NAME}.metal"
+  )
+  list(APPEND METAL_AIR_FILES ${AIR_FILE})
+endforeach()
 add_custom_command(
   OUTPUT ${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.metallib
-  COMMAND xcrun -sdk macosx metal -c ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering/metal_path_tracer_shaders.metal
-          -o ${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.air -std=metal4.0 -O2
-  COMMAND xcrun -sdk macosx metallib ${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.air
+  COMMAND xcrun -sdk macosx metallib ${METAL_AIR_FILES}
           -o ${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.metallib
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering/metal_path_tracer_shaders.metal
-  COMMENT "Compiling Metal shaders"
+  DEPENDS ${METAL_AIR_FILES}
+  COMMENT "Linking Metal shader library"
 )
 add_custom_target(metal_shaders DEPENDS ${CMAKE_BINARY_DIR}/metal_path_tracer_shaders.metallib)
 execute_process(COMMAND xcrun -sdk macosx --find metal RESULT_VARIABLE METAL_FOUND OUTPUT_QUIET ERROR_QUIET)
@@ -251,7 +288,9 @@ if(BUILD_TESTING)
   polyscope_rt_add_private_test(toon_shading_test tests/toon_shading_test.cpp)
   polyscope_rt_add_private_test(polyscope_scene_snapshot_test tests/polyscope_scene_snapshot_test.cpp)
   polyscope_rt_add_private_test(polyscope_rt_namespace_compatibility_test tests/polyscope_rt_namespace_compatibility_test.cpp)
-  polyscope_rt_add_private_test(metal_backend_smoke_test tests/metal_backend_smoke_test.cpp)
-  polyscope_rt_add_private_test(metal_shader_unit_test tests/metal_shader_unit_test.cpp)
+  polyscope_rt_add_private_test(backend_smoke_test tests/backend_smoke_test.cpp)
+  polyscope_rt_add_private_test(postprocess_test tests/postprocess_test.cpp)
   polyscope_rt_add_private_test(point_cloud_rendering_test tests/point_cloud_rendering_test.cpp)
+  polyscope_rt_add_private_test(vector_field_rendering_test tests/vector_field_rendering_test.cpp)
+  polyscope_rt_add_private_test(preset_switching_test tests/preset_switching_test.cpp)
 endif()
