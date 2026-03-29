@@ -63,7 +63,6 @@ add_library(
   src/rendering/metal/metal_toon_preset.mm
   src/rendering/metal/metal_backend.mm
   src/rendering/metal/metal_test_harness.mm
-  src/rendering/toon_shading.cpp
   src/plugin/polyscope_rt_plugin.cpp
 )
 set_source_files_properties(
@@ -285,7 +284,6 @@ function(polyscope_rt_add_private_test target_name source_file)
 endfunction()
 
 if(BUILD_TESTING)
-  polyscope_rt_add_private_test(toon_shading_test tests/toon_shading_test.cpp)
   polyscope_rt_add_private_test(polyscope_scene_snapshot_test tests/polyscope_scene_snapshot_test.cpp)
   polyscope_rt_add_private_test(polyscope_rt_namespace_compatibility_test tests/polyscope_rt_namespace_compatibility_test.cpp)
   polyscope_rt_add_private_test(backend_smoke_test tests/backend_smoke_test.cpp)
