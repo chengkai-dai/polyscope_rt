@@ -205,13 +205,19 @@ void testCurveNodeColorExtracted() {
           "node color quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
-  // Layout: [sphere_node0=red, sphere_node2=blue, cyl_edge0=avg(red,green), cyl_edge1=avg(green,blue)]
-  // Two endpoint spheres (nodes 0 and 2) come first; cylinders after.
-  // cn.primitiveColors[2] is the first cylinder (edge 0: avg of red and green → yellowish).
+  require(cn.primitiveColors1.size() == cn.primitives.size(),
+          "primitiveColors1 must be parallel to primitives");
+  // Layout: [sphere_node0=red, sphere_node2=blue, cyl_edge0, cyl_edge1]
+  // Cylinders now store per-endpoint colors: primitiveColors=tail, primitiveColors1=tip.
   const size_t cylOffset = cn.primitives.size() - 2; // 2 cylinders at the end
-  require(cn.primitiveColors[cylOffset].r > 0.3f, "edge 0 blended color should have red component");
-  require(cn.primitiveColors[cylOffset].g > 0.3f, "edge 0 blended color should have green component");
-  require(cn.primitiveColors[cylOffset].b < 0.1f, "edge 0 blended color should have low blue");
+  // Edge 0: tail=node0 (red), tip=node1 (green).
+  require(cn.primitiveColors[cylOffset].r  > 0.9f, "edge 0 tail should be red");
+  require(cn.primitiveColors[cylOffset].g  < 0.1f, "edge 0 tail should have low green");
+  require(cn.primitiveColors1[cylOffset].g > 0.9f, "edge 0 tip should be green");
+  require(cn.primitiveColors1[cylOffset].r < 0.1f, "edge 0 tip should have low red");
+  // Gradient: tail != tip for node color quantities.
+  require(cn.primitiveColors[cylOffset] != cn.primitiveColors1[cylOffset],
+          "node color: tail and tip colors should differ for a gradient segment");
 }
 
 // ---------------------------------------------------------------------------
@@ -232,15 +238,18 @@ void testCurveEdgeColorExtracted() {
   require(!cn.primitiveColors.empty(), "edge color quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
+  require(cn.primitiveColors1.size() == cn.primitives.size(),
+          "primitiveColors1 must be parallel to primitives");
 
-  // Layout: [sphere_node0 (yellow, only touches edge0), sphere_node2 (cyan, only touches edge1),
-  //           cyl_edge0=yellow, cyl_edge1=cyan]
-  // Use the cylinder index (nSpheres offset) for the first cylinder check.
+  // Edge color: uniform per segment → tail == tip for each cylinder.
   const size_t cylOffset8 = cn.primitives.size() - 2;
   if (cylOffset8 < cn.primitiveColors.size()) {
     const glm::vec3& cylColor0 = cn.primitiveColors[cylOffset8];
     require(cylColor0.r > 0.5f && cylColor0.g > 0.5f,
             "edge 0 cylinder should be yellow (R+G)");
+    // Edge color: no gradient — both endpoints have the same color.
+    require(cn.primitiveColors[cylOffset8] == cn.primitiveColors1[cylOffset8],
+            "edge color: tail and tip should be identical (uniform per segment)");
   }
 }
 
@@ -261,10 +270,16 @@ void testCurveNodeScalarExtracted() {
           "node scalar quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
+  require(cn.primitiveColors1.size() == cn.primitives.size(),
+          "primitiveColors1 must be parallel to primitives");
   // Both nodes (0 and 1) are endpoints (degree=1), so both get sphere primitives.
   // Nodes 0 and 1 have different scalar values → sphere colors differ.
   require(cn.primitiveColors[0] != cn.primitiveColors[1],
           "different node scalars should produce different sphere colors");
+  // The single cylinder (edge 0→1) should have a gradient: tail ≠ tip.
+  const size_t cylIdx9 = cn.primitives.size() - 1; // 2 spheres + 1 cylinder
+  require(cn.primitiveColors[cylIdx9] != cn.primitiveColors1[cylIdx9],
+          "node scalar: cylinder tail and tip should differ (gradient)");
 }
 
 // ---------------------------------------------------------------------------
@@ -285,12 +300,17 @@ void testCurveEdgeScalarExtracted() {
           "edge scalar quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
-  // Layout: [sphere_node0 (adjacent to edge0=0.0), sphere_node2 (adjacent to edge1=1.0),
-  //           cyl_edge0, cyl_edge1].
-  // Sphere primitiveColors[0] and [1] have different average-scalar-based colors.
+  require(cn.primitiveColors1.size() == cn.primitives.size(),
+          "primitiveColors1 must be parallel to primitives");
+  // Layout: [sphere_node0, sphere_node2, cyl_edge0, cyl_edge1].
   require((int)cn.primitives.size() >= 3, "expected 2 sphere + 2 cylinder primitives");
+  // Sphere colors differ (nodes 0 and 2 have different adjacent-edge averages).
   require(cn.primitiveColors[0] != cn.primitiveColors[1],
           "endpoint spheres should have different colormap colors (edge scalars 0.0 vs 1.0)");
+  // Edge scalar: uniform per segment → tail == tip for each cylinder.
+  const size_t cylOffset10 = cn.primitives.size() - 2;
+  require(cn.primitiveColors[cylOffset10] == cn.primitiveColors1[cylOffset10],
+          "edge scalar: cylinder tail and tip should be identical (uniform per segment)");
 }
 
 // ---------------------------------------------------------------------------

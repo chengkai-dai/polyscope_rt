@@ -177,8 +177,12 @@ struct GPUCurvePrimitive {
   float4 p_prev;
   float4 p_next;
   uint4  materialObjectId;
-  // Per-primitive color override; w=0 means "use material baseColorFactor", w=1 means use xyz.
+  // Per-primitive color override.
+  // baseColor.w  = 0: use material baseColorFactor (uniform), 1: use baseColor/baseColor1 gradient.
+  // baseColor.xyz  = color at p0 (tail endpoint).
+  // baseColor1.xyz = color at p1 (tip endpoint).  Interpolated along curveParam in [0,1].
   float4 baseColor;
+  float4 baseColor1;
 };
 
 struct GPUPointPrimitive {

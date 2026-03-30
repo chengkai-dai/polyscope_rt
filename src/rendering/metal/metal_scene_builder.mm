@@ -258,6 +258,7 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
     acc.materials.push_back(curveMaterial);
 
     const bool hasPrimColors = curveNet.primitiveColors.size() == curveNet.primitives.size();
+    const bool hasPrimColors1 = curveNet.primitiveColors1.size() == curveNet.primitives.size();
 
     // Build a per-node adjacency list so we can find Catmull-Rom ghost points.
     // nodeAdj[i] holds the set of node indices connected to node i by a non-degenerate edge.
@@ -304,8 +305,9 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
     for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
       if (prim.type != rt::RTCurvePrimitiveType::Cylinder) { ++spherePrimIdx; continue; }
 
-      glm::vec3 col = hasPrimColors ? curveNet.primitiveColors[cylPrimIdx]
-                                    : glm::vec3(curveNet.baseColor);
+      glm::vec3 col0 = hasPrimColors  ? curveNet.primitiveColors[cylPrimIdx]
+                                      : glm::vec3(curveNet.baseColor);
+      glm::vec3 col1 = hasPrimColors1 ? curveNet.primitiveColors1[cylPrimIdx] : col0;
 
       // Compute Catmull-Rom ghost control points using the stored node graph.
       glm::vec3 pPrev = prim.p0, pNext = prim.p1; // fallback: straight line
@@ -322,7 +324,8 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
       shaderPrim.p_prev           = simd_make_float4(pPrev.x, pPrev.y, pPrev.z, 0.0f);
       shaderPrim.p_next           = simd_make_float4(pNext.x, pNext.y, pNext.z, 0.0f);
       shaderPrim.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
-      shaderPrim.baseColor        = simd_make_float4(col.r, col.g, col.b, hasPrimColors ? 1.0f : 0.0f);
+      shaderPrim.baseColor        = simd_make_float4(col0.r, col0.g, col0.b, hasPrimColors ? 1.0f : 0.0f);
+      shaderPrim.baseColor1       = simd_make_float4(col1.r, col1.g, col1.b, 1.0f);
       acc.curvePrimitives.push_back(shaderPrim);
 
       // Catmull-Rom: 4 control points per segment [p_prev, p0, p1, p_next]

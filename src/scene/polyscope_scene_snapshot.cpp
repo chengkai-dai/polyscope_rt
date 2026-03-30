@@ -380,22 +380,25 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     q->colors.ensureHostBufferPopulated();
     const auto& nc = q->colors.data;
     out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
-    // Sphere colors: direct node color.
-    for (size_t ni : sphereNodeIndices)
-      out.primitiveColors.push_back(ni < nc.size() ? nc[ni] : fallback);
-    // Cylinder colors: average of the two endpoint node colors.
+    out.primitiveColors1.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: direct node color (no gradient needed).
+    for (size_t ni : sphereNodeIndices) {
+      glm::vec3 c = ni < nc.size() ? nc[ni] : fallback;
+      out.primitiveColors.push_back(c);
+      out.primitiveColors1.push_back(c);
+    }
+    // Cylinder colors: tail color at p0, tip color at p1 → smooth gradient along segment.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
       uint32_t t = edgeTails[ei], p = edgeTips[ei];
-      glm::vec3 ct = (t < nc.size()) ? nc[t] : fallback;
-      glm::vec3 cp = (p < nc.size()) ? nc[p] : fallback;
-      out.primitiveColors.push_back((ct + cp) * 0.5f);
+      out.primitiveColors.push_back(t < nc.size() ? nc[t] : fallback);
+      out.primitiveColors1.push_back(p < nc.size() ? nc[p] : fallback);
     }
 
   } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeColorQuantity*>(network.dominantQuantity)) {
     q->colors.ensureHostBufferPopulated();
     const auto& ec = q->colors.data;
-    // Compute per-node average of adjacent edge colors on the CPU.
+    // Compute per-node average of adjacent edge colors on the CPU (for sphere cap coloring).
     std::vector<glm::vec3> nodeColorSum(nNodes, glm::vec3(0.0f));
     std::vector<int>       nodeColorCnt(nNodes, 0);
     for (size_t i = 0; i < edgeCount; ++i) {
@@ -405,16 +408,20 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
       nodeColorSum[p] += ec[i]; nodeColorCnt[p]++;
     }
     out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
-    // Sphere colors: node average.
+    out.primitiveColors1.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: node average (no gradient).
     for (size_t ni : sphereNodeIndices) {
       glm::vec3 col = (nodeColorCnt[ni] > 0)
           ? nodeColorSum[ni] / float(nodeColorCnt[ni]) : fallback;
       out.primitiveColors.push_back(col);
+      out.primitiveColors1.push_back(col);
     }
-    // Cylinder colors: direct per-edge color.
+    // Cylinder colors: edge has one color → both endpoints the same (uniform per segment).
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
-      out.primitiveColors.push_back(ei < ec.size() ? ec[ei] : fallback);
+      glm::vec3 col = ei < ec.size() ? ec[ei] : fallback;
+      out.primitiveColors.push_back(col);
+      out.primitiveColors1.push_back(col);
     }
 
   } else if (auto* q = dynamic_cast<polyscope::CurveNetworkNodeScalarQuantity*>(network.dominantQuantity)) {
@@ -423,16 +430,19 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
     std::vector<glm::vec3> nc = colormapScalars(q->values.data, cmap, vizMin, vizMax);
     out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
-    // Sphere colors: direct node colormap value.
-    for (size_t ni : sphereNodeIndices)
-      out.primitiveColors.push_back(ni < nc.size() ? nc[ni] : fallback);
-    // Cylinder colors: average of the two endpoint colormap values.
+    out.primitiveColors1.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: direct node colormap value (no gradient).
+    for (size_t ni : sphereNodeIndices) {
+      glm::vec3 c = ni < nc.size() ? nc[ni] : fallback;
+      out.primitiveColors.push_back(c);
+      out.primitiveColors1.push_back(c);
+    }
+    // Cylinder: tail color from scalar at p0, tip color from scalar at p1.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
       uint32_t t = edgeTails[ei], p = edgeTips[ei];
-      glm::vec3 ct = (t < nc.size()) ? nc[t] : fallback;
-      glm::vec3 cp = (p < nc.size()) ? nc[p] : fallback;
-      out.primitiveColors.push_back((ct + cp) * 0.5f);
+      out.primitiveColors.push_back(t < nc.size() ? nc[t] : fallback);
+      out.primitiveColors1.push_back(p < nc.size() ? nc[p] : fallback);
     }
 
   } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeScalarQuantity*>(network.dominantQuantity)) {
@@ -441,7 +451,7 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
     const auto& ev = q->values.data;
     const double range = (vizMax > vizMin) ? (vizMax - vizMin) : 1.0;
-    // Compute per-node average scalar from adjacent edge scalars on the CPU.
+    // Compute per-node average scalar from adjacent edge scalars on the CPU (for sphere caps).
     std::vector<float> nodeScalarSum(nNodes, 0.0f);
     std::vector<int>   nodeScalarCnt(nNodes, 0);
     for (size_t i = 0; i < edgeCount; ++i) {
@@ -451,7 +461,8 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
       nodeScalarSum[p] += ev[i]; nodeScalarCnt[p]++;
     }
     out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
-    // Sphere colors: node-average scalar, colormapped.
+    out.primitiveColors1.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: node-average scalar, colormapped (no gradient).
     for (size_t ni : sphereNodeIndices) {
       glm::vec3 col = fallback;
       if (nodeScalarCnt[ni] > 0) {
@@ -459,13 +470,15 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
         col = cmap.getValue((avg - vizMin) / range);
       }
       out.primitiveColors.push_back(col);
+      out.primitiveColors1.push_back(col);
     }
-    // Cylinder colors: direct per-edge scalar, colormapped.
+    // Cylinder: edge scalar is uniform → both endpoints get the same colormapped color.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
       glm::vec3 col = (ei < ev.size())
           ? cmap.getValue((ev[ei] - vizMin) / range) : fallback;
       out.primitiveColors.push_back(col);
+      out.primitiveColors1.push_back(col);
     }
   }
 

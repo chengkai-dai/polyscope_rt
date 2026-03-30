@@ -97,7 +97,12 @@ struct RTCurveNetwork {
   // Layout mirrors primitives:
   //   [0 .. nSpheres-1]  colors for degree≠2 sphere nodes (endpoints & branch points)
   //   [nSpheres ..]      colors for cylinder edges
+  // primitiveColors  = color at p0 (tail) for cylinders, or sphere color.
+  // primitiveColors1 = color at p1 (tip)  for cylinders (interpolated along the segment).
+  //                    Same as primitiveColors for spheres (no gradient).
+  //                    If empty, shader falls back to primitiveColors for both endpoints.
   std::vector<glm::vec3> primitiveColors;
+  std::vector<glm::vec3> primitiveColors1;
 
   // Original node graph — used by the Metal backend to build Catmull-Rom
   // ghost points so adjacent segments blend smoothly at shared junctions.

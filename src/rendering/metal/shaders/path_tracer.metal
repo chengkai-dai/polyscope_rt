@@ -443,8 +443,11 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   out.hitPos = hitPos;
   out.geomNormal = normal;
   out.normal = normal;
-  // Use per-primitive color if set (w == 1), otherwise fall back to material baseColorFactor.
-  float3 baseCol = (prim.baseColor.w > 0.5f) ? prim.baseColor.xyz : material.baseColorFactor.xyz;
+  // Use per-primitive color gradient if set (baseColor.w == 1):
+  // linearly interpolate from baseColor (tail, p0) to baseColor1 (tip, p1) along t.
+  float3 baseCol = (prim.baseColor.w > 0.5f)
+      ? mix(prim.baseColor.xyz, prim.baseColor1.xyz, t)
+      : material.baseColorFactor.xyz;
   out.baseColor = clamp(baseCol, 0.0f, 1.0f);
   out.emissive = material.emissiveFactor.xyz;
   out.metallic = material.metallicRoughnessNormal.x;
