@@ -46,6 +46,11 @@ void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
     const float edgeBaryThreshold = mesh.wireframe ? (mesh.edgeWidth / 100.0f) : 0.0f;
     material.wireframeEdgeData =
         simd_make_float4(mesh.edgeColor.r, mesh.edgeColor.g, mesh.edgeColor.b, edgeBaryThreshold);
+    const bool hasIsolines = !mesh.isoScalars.empty();
+    // isoParams.x encodes style: 0=off, 1=stripe, 2=contour
+    float isoStyleF = hasIsolines ? static_cast<float>(mesh.isoStyle) : 0.0f;
+    material.isoParams = simd_make_float4(isoStyleF, mesh.isoSpacing,
+                                          mesh.isoDarkness, mesh.isoContourThickness);
 
     if (mesh.hasBaseColorTexture && !mesh.baseColorTexture.pixels.empty()) {
       material.baseColorTextureData = simd_make_uint4(registerTextureInAcc(acc, mesh.baseColorTexture), 1u, 0u, 0u);
@@ -83,6 +88,8 @@ void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
       }
       glm::vec2 uv = i < mesh.texcoords.size() ? mesh.texcoords[i] : glm::vec2(0.0f);
       acc.texcoords.push_back(simd_make_float2(uv.x, uv.y));
+      float isoVal = (hasIsolines && i < mesh.isoScalars.size()) ? mesh.isoScalars[i] : 0.0f;
+      acc.isoScalars.push_back(isoVal);
     }
 
     for (const glm::uvec3& tri : mesh.indices) {

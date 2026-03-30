@@ -153,6 +153,8 @@ struct GPUMaterial {
   uint4  normalTextureData;
   float4 transmissionIor;
   float4 wireframeEdgeData;
+  // isoParams: x=style(0=off,1=stripe,2=contour), y=spacing(period), z=darkness, w=contourThickness
+  float4 isoParams;
 };
 
 struct GPUTexture {
@@ -194,6 +196,7 @@ struct SceneGpuAccumulator {
   std::vector<simd_float4>          normals;
   std::vector<simd_float4>          vertexColors;
   std::vector<simd_float2>          texcoords;
+  std::vector<float>                isoScalars;   // parallel to positions; 0.0 when isolines inactive
   std::vector<PackedTriangleIndices> accelIndices;
   std::vector<GPUTriangle>          shaderTriangles;
   std::vector<GPUMaterial>          materials;

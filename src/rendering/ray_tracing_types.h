@@ -64,6 +64,14 @@ struct RTMesh {
   bool wireframe = false;
   glm::vec3 edgeColor{0.0f, 0.0f, 0.0f};
   float edgeWidth = 1.0f;
+
+  // Isoline stripe pattern (from active scalar quantity with isolines enabled).
+  // isoScalars is per-vertex raw scalar values; empty means isolines are off.
+  std::vector<float> isoScalars;
+  float isoSpacing = 0.1f;          // period in raw data units (from getIsolinePeriod())
+  float isoDarkness = 0.5f;         // dark band multiplier (from getIsolineDarkness())
+  float isoContourThickness = 0.3f; // contour line width factor (from getIsolineContourThickness())
+  int   isoStyle = 1;               // 1=stripe, 2=contour (from getIsolineStyle())
 };
 
 enum class RTCurvePrimitiveType : uint32_t {

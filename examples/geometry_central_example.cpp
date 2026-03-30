@@ -118,14 +118,21 @@ int main(int argc, char **argv) {
   ps::init();
   registerGeodesicColorMap();
 
-  // mesh 
+  // mesh
   auto *psMesh = ps::registerSurfaceMesh(
       "bunny", geometry->inputVertexPositions, mesh->getFaceVertexList());
+  // Contour-style isolines on the geodesic scalar — 20 thin lines across the
+  // full range, mirroring Polyscope's CONTOUR_VALUECOLOR.  Switch to
+  // IsolineStyle::Stripe for flat periodic bands instead.
   psMesh->addVertexScalarQuantity("geodesic distance", distValues)
       ->setColorMap("geodesic_hot_r")
-      ->setMapRange({0.0f, static_cast<float>(maxDist)});
-
-  psMesh->setEnabled(false);
+      ->setMapRange({0.0f, static_cast<float>(maxDist)})
+      ->setIsolinesEnabled(true)
+      ->setIsolineStyle(ps::IsolineStyle::Contour)
+      ->setIsolinePeriod(maxDist / 20.0, /*isRelative=*/false)
+      ->setIsolineDarkness(0.8)
+      ->setIsolineContourThickness(0.4)
+      ->setEnabled(true);
 
   // curve
   auto *psCurve =

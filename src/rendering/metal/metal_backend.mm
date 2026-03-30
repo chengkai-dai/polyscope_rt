@@ -421,6 +421,7 @@ public:
     }
     [encoder setBuffer:pointPrimitiveBuffer_   offset:0 atIndex:25];
     [encoder setAccelerationStructure:pointAcceleration_ atBufferIndex:26];
+    [encoder setBuffer:isoScalarsBuffer_       offset:0 atIndex:27];
     if (triangleBLAS_ != nil && triangleBLAS_ != meshCurveAcceleration_) {
       [encoder useResource:triangleBLAS_ usage:MTLResourceUsageRead];
     }
@@ -619,6 +620,7 @@ private:
         acc.normals.push_back(simd_make_float4(0.0f, 1.0f, 0.0f, 0.0f));
         acc.vertexColors.push_back(simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f));
         acc.texcoords.push_back(simd_make_float2(0.0f, 0.0f));
+        acc.isoScalars.push_back(0.0f);
       }
       acc.accelIndices.push_back({0, 1, 2});
       GPUMaterial dummyMat{};
@@ -646,6 +648,11 @@ private:
     texcoordBuffer_ = [device_ newBufferWithBytes:acc.texcoords.data()
                                            length:acc.texcoords.size() * sizeof(simd_float2)
                                           options:MTLResourceStorageModeShared];
+    // Ensure isoScalars is parallel to positions; pad with zeros if shorter.
+    while (acc.isoScalars.size() < acc.positions.size()) acc.isoScalars.push_back(0.0f);
+    isoScalarsBuffer_ = [device_ newBufferWithBytes:acc.isoScalars.data()
+                                             length:acc.isoScalars.size() * sizeof(float)
+                                            options:MTLResourceStorageModeShared];
     accelIndexBuffer_ = [device_ newBufferWithBytes:acc.accelIndices.data()
                                              length:acc.accelIndices.size() * sizeof(PackedTriangleIndices)
                                             options:MTLResourceStorageModeShared];
@@ -932,6 +939,7 @@ private:
   id<MTLBuffer> normalVertexBuffer_ = nil;
   id<MTLBuffer> vertexColorBuffer_ = nil;
   id<MTLBuffer> texcoordBuffer_ = nil;
+  id<MTLBuffer> isoScalarsBuffer_ = nil;
   id<MTLBuffer> accelIndexBuffer_ = nil;
   id<MTLBuffer> triangleBuffer_ = nil;
   id<MTLBuffer> materialBuffer_ = nil;

@@ -356,6 +356,11 @@ struct SurfaceHitInfo {
   float opacity = 1.0f;
   bool unlit = false;
   bool isInfinitePlane = false;
+  // Isoline data used for contour post-processing (style 2).
+  // Populated by intersectSurface when a contour-style iso material is hit.
+  float4 isoParams = float4(0.0f);  // x=style, y=period, z=darkness, w=thickness
+  float  isoScalarVal = 0.0f;
+  float3 isoGradWorld = float3(0.0f);
 };
 
 SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame) {
@@ -396,7 +401,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const GPUPointPrimitive* pointPrimitives,
                          constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
-                         intersection_function_table<curve_data, triangle_data, instancing> ftable);
+                         intersection_function_table<curve_data, triangle_data, instancing> ftable,
+                         device const float* isoScalars, float tanHalfFov);
 
 float3 sampleMissRadiance(float3 dir, constant GPULighting& lighting) {
   return evalSimpleSky(dir, lighting);
@@ -477,6 +483,46 @@ SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIn
   return out;
 }
 
+// Apply isoline contour lines (mirrors Polyscope CONTOUR_VALUECOLOR).
+// Must be called after intersectSurface when surf.isoParams.x is in [1.5, 2.5].
+// ray_dir    — direction of the ray that produced this hit.
+// tan_hfov   — tan(0.5 * vertical_fov_radians).
+// img_height — render target height in pixels.
+inline void applyContour(thread SurfaceHitInfo& surf, float3 ray_dir,
+                         float tan_hfov, uint img_height) {
+  // Only active for contour style (isoParams.x ≈ 2).
+  if (surf.isoParams.x < 1.5f) return;
+
+  float period    = surf.isoParams.y;
+  float darkness  = surf.isoParams.z;
+  float thickness = surf.isoParams.w;
+  if (period < 1e-8f || thickness < 1e-8f) return;
+
+  // World-space size of one pixel at the hit distance (vertical direction).
+  // pixel_world_size = [world_unit / pixel]
+  float pixel_world_size = 2.0f * surf.distance * tan_hfov / float(img_height);
+  if (pixel_world_size < 1e-12f) return;
+
+  // Project the world-space gradient onto the plane perpendicular to the ray.
+  // grad_perp is in [scalar_value / world_unit].
+  float3 grad_perp = surf.isoGradWorld - dot(surf.isoGradWorld, ray_dir) * ray_dir;
+
+  // Screen-space gradient magnitude: [scalar_value/world_unit] * [world_unit/pixel]
+  // = [scalar_value / pixel]  — same units as GLSL dFdx(shadeValue).
+  float grad_screen = length(grad_perp) * pixel_world_size;
+  if (grad_screen < 1e-12f) return;
+
+  // Polyscope CONTOUR_VALUECOLOR formula:
+  //   w  = 1 / (10 / period * thickness * length(gradF))
+  //   s  = darkness * exp( -pow( w*(fract(|val/period|)-0.5), 8 ) )
+  //   color *= 1 - s
+  // Use abs() on the base to avoid undefined Metal pow() behaviour for negative x.
+  float w     = 1.0f / (10.0f / period * thickness * grad_screen);
+  float phase = fract(abs(surf.isoScalarVal / period)) - 0.5f;
+  float s     = darkness * exp(-pow(abs(w * phase), 8.0f));
+  surf.baseColor *= (1.0f - s);
+}
+
 SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, device const float4* normals,
                                 device const float2* texcoords, device const float4* vertexColors,
                                 device const GPUTriangle* triangles,
@@ -486,7 +532,8 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
                                 device const GPUPointPrimitive* pointPrimitives,
                                 intersector<curve_data, triangle_data, instancing> isector,
                                 instance_acceleration_structure scene, instance_acceleration_structure pointScene,
-                                intersection_function_table<curve_data, triangle_data, instancing> ftable) {
+                                intersection_function_table<curve_data, triangle_data, instancing> ftable,
+                                device const float* isoScalars) {
   SurfaceHitInfo out;
   auto mcHit = isector.intersect(currentRay, scene, 0xFFu);
   auto ptHit = isector.intersect(currentRay, pointScene, 0xFFu, ftable);
@@ -586,6 +633,40 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
       out.transmission = 0.0f;
       out.opacity     = 1.0f;
       out.unlit       = true;
+    }
+  }
+
+  // Isoline effect — mirrors Polyscope's stripe/contour rendering.
+  // isoParams.x: 0=off, 1=stripe (ISOLINE_STRIPE_VALUECOLOR), 2=contour (CONTOUR_VALUECOLOR).
+  if (material.isoParams.x > 0.5f) {
+    float s0 = isoScalars[tri.indicesMaterial.x];
+    float s1 = isoScalars[tri.indicesMaterial.y];
+    float s2 = isoScalars[tri.indicesMaterial.z];
+    float scalarVal = s0 * w0 + s1 * w1 + s2 * w2;
+    float period    = material.isoParams.y;
+    float darkness  = material.isoParams.z;
+
+    // Store for caller-side contour post-processing.
+    out.isoParams     = material.isoParams;
+    out.isoScalarVal  = scalarVal;
+
+    uint style = (uint)round(material.isoParams.x);  // 1=stripe, 2=contour
+    if (style == 1u && period > 1e-8f) {
+      // Stripe: periodic dark bands, applied immediately.
+      float modVal = fmod(scalarVal, 2.0f * period);
+      if (modVal < 0.0f) modVal += 2.0f * period;
+      if (modVal > period) {
+        out.baseColor *= darkness;
+      }
+    } else if (style == 2u) {
+      // Contour: compute world-space gradient; caller applies screen-space formula.
+      float3 N  = cross(p1 - p0, p2 - p0);  // unnormalized normal, |N|² = (2A)²
+      float A2sq = dot(N, N);
+      if (A2sq > 1e-20f) {
+        out.isoGradWorld = (s0 * cross(p2 - p1, N) +
+                            s1 * cross(p0 - p2, N) +
+                            s2 * cross(p1 - p0, N)) / A2sq;
+      }
     }
   }
 
@@ -752,7 +833,8 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
                          device const GPUPointPrimitive* pointPrimitives,
                          constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
-                         intersection_function_table<curve_data, triangle_data, instancing> ftable) {
+                         intersection_function_table<curve_data, triangle_data, instancing> ftable,
+                         device const float* isoScalars, float tanHalfFov) {
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
   float3 currentViewDir = viewDir;
@@ -764,7 +846,8 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       surf = firstHit;
     } else {
       surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                              curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable);
+                              curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
+      applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
       SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
       if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
         surf = planeSurf;
@@ -840,7 +923,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       radiance += throughput *
                   traceSpecularPath(reflectedRay, max(frame.maxBounces - bounce - 1u, 1u), positions, normals, texcoords, vertexColors,
                                     triangles, materials, textures, texturePixels, sceneLights, curvePrimitives, pointPrimitives,
-                                    frame, lighting, rng, isector, scene, pointScene, ftable) *
+                                    frame, lighting, rng, isector, scene, pointScene, ftable, isoScalars, tanHalfFov) *
                   fresnel;
 
       float3 tint = mix(float3(1.0f), surf.baseColor, 0.08f);
@@ -927,7 +1010,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const GPUPointPrimitive* pointPrimitives,
                          constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
-                         intersection_function_table<curve_data, triangle_data, instancing> ftable) {
+                         intersection_function_table<curve_data, triangle_data, instancing> ftable,
+                         device const float* isoScalars, float tanHalfFov) {
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
   float3 currentViewDir = -currentRay.direction;
@@ -935,7 +1019,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
 
   for (uint bounce = 0u; bounce < max(remainingBounces, 1u); ++bounce) {
     SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable);
+                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
+    applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
     SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
     if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
       surf = planeSurf;
@@ -1091,6 +1176,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                                 device const GPUCurvePrimitive* curvePrimitives [[buffer(23)]],
                                 intersection_function_table<curve_data, triangle_data, instancing> ftable [[buffer(24)]],
                                 device const GPUPointPrimitive* pointPrimitives [[buffer(25)]],
+                                device const float* isoScalars [[buffer(27)]],
                                 uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= frame.width || gid.y >= frame.height) return;
 
@@ -1133,8 +1219,12 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     float3 sampleColor = float3(0.0f);
     float sampleAlpha = 1.0f;
 
+    // Pre-compute tan(fov/2) for contour screen-space gradient approximation.
+    float tanHalfFov = tan(0.5f * camera.clipData.x);
+
     SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable);
+                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
+    applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
     SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
     if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
       surf = planeSurf;
@@ -1144,7 +1234,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
         sampleColor =
             traceStandardPath(currentRay, normalize(camera.position.xyz - surf.hitPos), surf, positions, normals, texcoords, vertexColors,
                               triangles, materials, textures, texturePixels, sceneLights, curvePrimitives, pointPrimitives,
-                              frame, lighting, rng, isector, scene, pointScene, ftable);
+                              frame, lighting, rng, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
         float lum = dot(sampleColor, float3(0.212671f, 0.715160f, 0.072169f));
         if (lum > 5.0f) {
           sampleColor *= 5.0f / lum;

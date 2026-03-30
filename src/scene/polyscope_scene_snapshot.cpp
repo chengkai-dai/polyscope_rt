@@ -95,6 +95,14 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
       out.vertexColors.push_back(cmap.getValue(t));
     }
     out.baseColorFactor = glm::vec4(1.0f);
+    // Propagate isoline settings so the RT shader can draw stripes.
+    if (vsq->getIsolinesEnabled()) {
+      out.isoScalars          = scalars;
+      out.isoSpacing          = static_cast<float>(vsq->getIsolinePeriod());
+      out.isoDarkness         = static_cast<float>(vsq->getIsolineDarkness());
+      out.isoContourThickness = static_cast<float>(vsq->getIsolineContourThickness());
+      out.isoStyle            = (vsq->getIsolineStyle() == polyscope::IsolineStyle::Contour) ? 2 : 1;
+    }
   }
 
   return out;
@@ -255,6 +263,11 @@ void addMeshAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTMesh&& mesh, polysco
   hashBytes(snapshot.scene.hash, &mesh.wireframe, sizeof(bool));
   hashBytes(snapshot.scene.hash, &mesh.edgeColor[0], sizeof(float) * 3);
   hashBytes(snapshot.scene.hash, &mesh.edgeWidth, sizeof(float));
+  hashVector(snapshot.scene.hash, mesh.isoScalars);
+  hashBytes(snapshot.scene.hash, &mesh.isoSpacing, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.isoDarkness, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.isoContourThickness, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.isoStyle, sizeof(int));
 
   snapshot.scene.meshes.push_back(std::move(mesh));
 }
