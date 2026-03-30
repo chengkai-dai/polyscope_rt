@@ -7,10 +7,7 @@
 #include <vector>
 
 #include "polyscope/polyscope.h"
-#include "polyscope/curve_network.h"
-#include "polyscope/rt/curve_network.h"
 
-#include "scene/direct_rt_curve_registry.h"
 #include "plugin/polyscope_rt_runtime.h"
 #include "rendering/ray_tracing_types.h"
 
@@ -138,7 +135,6 @@ void frameTick() {
 void shutdown(bool allowMidFrameShutdown) {
   if (g_runtime) g_runtime->setEnabled(false);
   removeUserCallbackHook();
-  clearDirectRtCurveNetworks();
   g_apiLights.clear();  g_materialOverrides.clear();
   g_nextLightHandle = 1;
   if (g_ownsRuntime) {
@@ -150,7 +146,6 @@ void shutdown(bool allowMidFrameShutdown) {
 }
 
 void removeEverything() {
-  clearDirectRtCurveNetworks();
   ::polyscope::removeEverything();
   if (g_runtime) {
     g_runtime->resetAccumulation();
@@ -325,67 +320,6 @@ void resetAccumulation() {
 
 void exportPNG(const std::string& path, int targetSPP) {
   if (g_runtime) g_runtime->exportPNG(path, targetSPP);
-}
-
-// ---------------------------------------------------------------------------
-// Direct curve network API
-// ---------------------------------------------------------------------------
-
-void registerCurveNetwork(const std::string& name,
-                          const std::vector<glm::vec3>& nodes,
-                          const std::vector<std::pair<uint32_t, uint32_t>>& edges,
-                          float radius,
-                          glm::vec4 color,
-                          bool unlit) {
-  constexpr float kMinRadius = 1e-4f;
-  radius = std::max(radius, kMinRadius);
-
-  // --- RT path: build RTCurveNetwork for the ray tracer ---
-  ::rt::RTCurveNetwork net;
-  net.name = name;
-  net.baseColor = color;
-  net.unlit = unlit;
-
-  net.primitives.reserve(edges.size());
-  for (const auto& [tail, tip] : edges) {
-    if (tail >= nodes.size() || tip >= nodes.size()) continue;
-    const glm::vec3& p0 = nodes[tail];
-    const glm::vec3& p1 = nodes[tip];
-    if (glm::length(p1 - p0) < 1e-6f) continue;
-    ::rt::RTCurvePrimitive prim;
-    prim.type = ::rt::RTCurvePrimitiveType::Cylinder;
-    prim.p0 = p0;
-    prim.p1 = p1;
-    prim.radius = radius;
-    net.primitives.push_back(prim);
-  }
-  registerDirectRtCurveNetwork(std::move(net));
-
-  // --- Fallback path: register with Polyscope so OpenGL rendering works ---
-  // Convert edges to the array-of-pairs format polyscope expects.
-  std::vector<std::array<size_t, 2>> psEdges;
-  psEdges.reserve(edges.size());
-  for (const auto& [tail, tip] : edges) {
-    psEdges.push_back({static_cast<size_t>(tail), static_cast<size_t>(tip)});
-  }
-  auto* psCurve = ::polyscope::registerCurveNetwork(name, nodes, psEdges);
-  if (psCurve) {
-    psCurve->setColor(glm::vec3(color));
-    psCurve->setRadius(radius, /*isRelative=*/false);
-  }
-}
-
-void removeCurveNetworkRT(const std::string& name) {
-  removeDirectRtCurveNetwork(name);
-  ::polyscope::removeCurveNetwork(name, /*errorIfAbsent=*/false);
-}
-
-void clearCurveNetworksRT() {
-  // Remove each directly-registered network from Polyscope too.
-  for (const auto& net : getDirectRtCurveNetworks()) {
-    ::polyscope::removeCurveNetwork(net.name, /*errorIfAbsent=*/false);
-  }
-  clearDirectRtCurveNetworks();
 }
 
 } // namespace rt

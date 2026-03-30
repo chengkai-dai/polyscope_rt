@@ -52,11 +52,9 @@ set(POLYSCOPE_RT_BUNDLED_UI_HEADERS
 add_library(
   polyscope_rt_plugin
   SHARED
-  src/scene/direct_rt_curve_registry.cpp
   src/plugin/polyscope_rt_runtime.cpp
   src/plugin/polyscope_rt_runtime_gui.cpp
   src/scene/polyscope_scene_snapshot.cpp
-  src/scene/ray_tracing_geometry_primitives.cpp
   src/rendering/metal/metal_device.mm
   src/rendering/metal/metal_scene_builder.mm
   src/rendering/metal/metal_standard_preset.mm

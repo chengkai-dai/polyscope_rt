@@ -21,8 +21,6 @@
 #include "polyscope/vector_quantity.h"
 #include "polyscope/volume_mesh.h"
 
-#include "scene/direct_rt_curve_registry.h"
-#include "scene/ray_tracing_geometry_primitives.h"
 #include "utility/rt_mesh_material_helpers.h"
 
 namespace {
@@ -515,22 +513,6 @@ PolyscopeSceneSnapshot capturePolyscopeSceneSnapshot(const std::unordered_map<st
         addMeshAndHash(snapshot, std::move(mesh), *structure);
       }
     }
-  }
-
-  // Include curve networks registered directly via polyscope::rt::registerCurveNetwork().
-  for (const rt::RTCurveNetwork& directNet : getDirectRtCurveNetworks()) {
-    snapshot.supportedStructureCount++;
-    hashString(snapshot.scene.hash, directNet.name);
-    hashBytes(snapshot.scene.hash, &directNet.baseColor[0], sizeof(float) * 4);
-    hashBytes(snapshot.scene.hash, &directNet.metallic, sizeof(float));
-    hashBytes(snapshot.scene.hash, &directNet.roughness, sizeof(float));
-    for (const rt::RTCurvePrimitive& prim : directNet.primitives) {
-      hashBytes(snapshot.scene.hash, &prim.type, sizeof(prim.type));
-      hashBytes(snapshot.scene.hash, &prim.p0[0], sizeof(float) * 3);
-      hashBytes(snapshot.scene.hash, &prim.p1[0], sizeof(float) * 3);
-      hashBytes(snapshot.scene.hash, &prim.radius, sizeof(float));
-    }
-    snapshot.scene.curveNetworks.push_back(directNet);
   }
 
   addLightsAndHash(snapshot, apiLights);
