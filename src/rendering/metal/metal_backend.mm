@@ -803,7 +803,7 @@ private:
         curveGeom.segmentControlPointCount = 2;
         curveGeom.curveBasis = MTLCurveBasisLinear;
         curveGeom.curveType = MTLCurveTypeRound;
-        curveGeom.curveEndCaps = MTLCurveEndCapsDisk;
+        curveGeom.curveEndCaps = MTLCurveEndCapsSphere;
         curveGeom.intersectionFunctionTableOffset = NSUIntegerMax;
 
         auto* curveDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];

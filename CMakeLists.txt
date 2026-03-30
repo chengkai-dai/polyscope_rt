@@ -199,9 +199,25 @@ target_compile_definitions(
   POLYSCOPE_RT_EXAMPLE_DEFAULT_MESH="${CMAKE_CURRENT_SOURCE_DIR}/examples/assets/bunny.obj"
 )
 
+add_executable(
+  curve_network_rt_example
+  examples/curve_network_example.cpp
+)
+target_link_libraries(
+  curve_network_rt_example
+  PRIVATE
+  polyscope_rt_plugin
+)
+target_compile_definitions(
+  curve_network_rt_example
+  PRIVATE
+  GLM_ENABLE_EXPERIMENTAL
+)
+
 if(APPLE)
   target_compile_definitions(polyscope_rt_surface_mesh_example PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_definitions(geometry_central_rt_example PRIVATE GL_SILENCE_DEPRECATION)
+  target_compile_definitions(curve_network_rt_example PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_definitions(polyscope_rt_plugin PRIVATE GL_SILENCE_DEPRECATION)
 endif()
 

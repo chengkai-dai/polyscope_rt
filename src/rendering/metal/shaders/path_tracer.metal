@@ -420,13 +420,15 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   uint objId = prim.materialObjectId.y;
 
   float3 axis = normalize(p1 - p0);
-  float3 normal;
-  if (curveParam < 0.01f || curveParam > 0.99f) {
-    normal = (curveParam < 0.5f) ? -axis : axis;
-  } else {
-    float3 pointOnAxis = mix(p0, p1, curveParam);
-    normal = normalize(hitPos - pointOnAxis);
-  }
+  // Compute the closest point on the segment axis to hitPos, then derive a
+  // smooth outward normal.  This is correct for both the cylindrical body and
+  // the hemispherical end caps produced by MTLCurveEndCapsSphere: for a point
+  // on the body the projection falls inside [p0,p1]; for a cap the projection
+  // clamps to p0 or p1 and the resulting normal is the sphere normal.
+  float segLen = length(p1 - p0);
+  float tProj  = (segLen > 1e-7f) ? clamp(dot(hitPos - p0, axis), 0.0f, segLen) : 0.0f;
+  float3 pointOnAxis = p0 + axis * tProj;
+  float3 normal = normalize(hitPos - pointOnAxis);
   if (dot(normal, -currentRay.direction) < 0.0f) {
     normal = -normal;
   }
