@@ -108,7 +108,11 @@ int main() {
       if (prim.type == rt::RTCurvePrimitiveType::Cylinder) hasCylinders = true;
       require(prim.radius > 0.0f, "curve primitive should have positive radius");
     }
-    require(hasSpheres, "curve network should contain sphere primitives for nodes");
+    // Catmull-Rom curves are C1-continuous through every degree-2 node,
+    // so junction spheres are NOT generated for interior nodes.
+    // However, degree-1 endpoint nodes (and degree-≥3 branch nodes) still
+    // get sphere primitives to cap the open tube ends.
+    require(hasSpheres, "snapshot should generate sphere primitives for endpoint nodes (degree≠2)");
     require(hasCylinders, "curve network should contain cylinder primitives for edges");
 
     // -----------------------------------------------------------------------

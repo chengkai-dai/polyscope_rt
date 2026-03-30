@@ -784,7 +784,7 @@ private:
 
       if (hasCurves) {
         std::vector<uint32_t> curveIndices(curveSegmentCount_);
-        for (uint32_t i = 0; i < curveSegmentCount_; ++i) curveIndices[i] = i * 2;
+        for (uint32_t i = 0; i < curveSegmentCount_; ++i) curveIndices[i] = i * 4;
         id<MTLBuffer> curveIndexBuf = [device_ newBufferWithBytes:curveIndices.data()
                                                           length:curveIndices.size() * sizeof(uint32_t)
                                                          options:MTLResourceStorageModeShared];
@@ -800,10 +800,10 @@ private:
         curveGeom.indexBuffer = curveIndexBuf;
         curveGeom.indexType = MTLIndexTypeUInt32;
         curveGeom.segmentCount = curveSegmentCount_;
-        curveGeom.segmentControlPointCount = 2;
-        curveGeom.curveBasis = MTLCurveBasisLinear;
+        curveGeom.segmentControlPointCount = 4;
+        curveGeom.curveBasis = MTLCurveBasisCatmullRom;
         curveGeom.curveType = MTLCurveTypeRound;
-        curveGeom.curveEndCaps = MTLCurveEndCapsSphere;
+        curveGeom.curveEndCaps = MTLCurveEndCapsNone;
         curveGeom.intersectionFunctionTableOffset = NSUIntegerMax;
 
         auto* curveDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];

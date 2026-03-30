@@ -94,8 +94,16 @@ struct RTCurveNetwork {
   bool unlit = false;
   std::vector<RTCurvePrimitive> primitives;
   // Per-primitive color override (same length as primitives if populated, or empty for uniform color).
-  // Layout mirrors primitives: [0..nNodes-1] = node sphere colors, [nNodes..] = edge cylinder colors.
+  // Layout mirrors primitives:
+  //   [0 .. nSpheres-1]  colors for degree≠2 sphere nodes (endpoints & branch points)
+  //   [nSpheres ..]      colors for cylinder edges
   std::vector<glm::vec3> primitiveColors;
+
+  // Original node graph — used by the Metal backend to build Catmull-Rom
+  // ghost points so adjacent segments blend smoothly at shared junctions.
+  std::vector<glm::vec3> nodePositions; // world-space positions, one per node
+  std::vector<uint32_t>  edgeTailInds;  // index into nodePositions for each edge tail
+  std::vector<uint32_t>  edgeTipInds;   // index into nodePositions for each edge tip
 };
 
 struct RTPointCloud {

@@ -259,6 +259,34 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
 
     const bool hasPrimColors = curveNet.primitiveColors.size() == curveNet.primitives.size();
 
+    // Build a per-node adjacency list so we can find Catmull-Rom ghost points.
+    // nodeAdj[i] holds the set of node indices connected to node i by a non-degenerate edge.
+    const size_t nNodes = curveNet.nodePositions.size();
+    const size_t nEdges = curveNet.edgeTailInds.size();
+    std::vector<std::vector<uint32_t>> nodeAdj(nNodes);
+    for (size_t ei = 0; ei < nEdges; ++ei) {
+      uint32_t a = curveNet.edgeTailInds[ei];
+      uint32_t b = curveNet.edgeTipInds[ei];
+      if (a < nNodes) nodeAdj[a].push_back(b);
+      if (b < nNodes) nodeAdj[b].push_back(a);
+    }
+
+    // Helper: given the two endpoints of a segment, return the Catmull-Rom ghost
+    // point on the `from` side: the neighbour of `fromIdx` that is not `toIdx`,
+    // falling back to a mirrored ghost when no such neighbour exists.
+    auto ghostPoint = [&](uint32_t fromIdx, uint32_t toIdx) -> glm::vec3 {
+      if (fromIdx < nNodes) {
+        for (uint32_t nb : nodeAdj[fromIdx]) {
+          if (nb != toIdx) return curveNet.nodePositions[nb];
+        }
+        return curveNet.nodePositions[fromIdx] * 2.0f
+             - curveNet.nodePositions[toIdx];   // mirror
+      }
+      // Fallback for networks without node data: plain mirror.
+      return curveNet.nodePositions[fromIdx] * 2.0f
+           - curveNet.nodePositions[toIdx];
+    };
+
     // Track which primitive index in curveNet.primitives each cylinder / sphere corresponds to.
     size_t sphereCount = 0;
     size_t cylCount = 0;
@@ -270,23 +298,46 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
     size_t spherePrimIdx = 0;
     size_t cylPrimIdx    = sphereCount;
 
+    // Track which edge index each cylinder corresponds to (mirrors snapshot ordering).
+    size_t cylinderEdgeSlot = 0; // index into curveNet.edgeTailInds / edgeTipInds
+
     for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
       if (prim.type != rt::RTCurvePrimitiveType::Cylinder) { ++spherePrimIdx; continue; }
 
       glm::vec3 col = hasPrimColors ? curveNet.primitiveColors[cylPrimIdx]
                                     : glm::vec3(curveNet.baseColor);
+
+      // Compute Catmull-Rom ghost control points using the stored node graph.
+      glm::vec3 pPrev = prim.p0, pNext = prim.p1; // fallback: straight line
+      if (cylinderEdgeSlot < nEdges) {
+        uint32_t tail = curveNet.edgeTailInds[cylinderEdgeSlot];
+        uint32_t tip  = curveNet.edgeTipInds[cylinderEdgeSlot];
+        pPrev = ghostPoint(tail, tip);
+        pNext = ghostPoint(tip,  tail);
+      }
+
       GPUCurvePrimitive shaderPrim;
-      shaderPrim.p0_radius = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
-      shaderPrim.p1_type = simd_make_float4(prim.p1.x, prim.p1.y, prim.p1.z, 1.0f);
+      shaderPrim.p0_radius        = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
+      shaderPrim.p1_type          = simd_make_float4(prim.p1.x, prim.p1.y, prim.p1.z, 1.0f);
+      shaderPrim.p_prev           = simd_make_float4(pPrev.x, pPrev.y, pPrev.z, 0.0f);
+      shaderPrim.p_next           = simd_make_float4(pNext.x, pNext.y, pNext.z, 0.0f);
       shaderPrim.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
-      shaderPrim.baseColor = simd_make_float4(col.r, col.g, col.b, hasPrimColors ? 1.0f : 0.0f);
+      shaderPrim.baseColor        = simd_make_float4(col.r, col.g, col.b, hasPrimColors ? 1.0f : 0.0f);
       acc.curvePrimitives.push_back(shaderPrim);
 
+      // Catmull-Rom: 4 control points per segment [p_prev, p0, p1, p_next]
+      curveControlPoints.push_back(simd_make_float3(pPrev.x,   pPrev.y,   pPrev.z));
       curveControlPoints.push_back(simd_make_float3(prim.p0.x, prim.p0.y, prim.p0.z));
       curveControlPoints.push_back(simd_make_float3(prim.p1.x, prim.p1.y, prim.p1.z));
+      curveControlPoints.push_back(simd_make_float3(pNext.x,   pNext.y,   pNext.z));
+      // Uniform radius at all 4 control points
       curveRadii.push_back(prim.radius);
       curveRadii.push_back(prim.radius);
+      curveRadii.push_back(prim.radius);
+      curveRadii.push_back(prim.radius);
+
       ++cylPrimIdx;
+      ++cylinderEdgeSlot;
     }
 
     spherePrimIdx = 0;

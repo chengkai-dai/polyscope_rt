@@ -419,16 +419,18 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   uint matIdx = prim.materialObjectId.x;
   uint objId = prim.materialObjectId.y;
 
-  float3 axis = normalize(p1 - p0);
-  // Compute the closest point on the segment axis to hitPos, then derive a
-  // smooth outward normal.  This is correct for both the cylindrical body and
-  // the hemispherical end caps produced by MTLCurveEndCapsSphere: for a point
-  // on the body the projection falls inside [p0,p1]; for a cap the projection
-  // clamps to p0 or p1 and the resulting normal is the sphere normal.
-  float segLen = length(p1 - p0);
-  float tProj  = (segLen > 1e-7f) ? clamp(dot(hitPos - p0, axis), 0.0f, segLen) : 0.0f;
-  float3 pointOnAxis = p0 + axis * tProj;
-  float3 normal = normalize(hitPos - pointOnAxis);
+  // Evaluate the Catmull-Rom curve axis position at the hit parameter t.
+  // Control points: [p_prev, p0, p1, p_next]  (curve runs p0→p1 for t∈[0,1]).
+  float t  = clamp(curveParam, 0.0f, 1.0f);
+  float t2 = t * t, t3 = t2 * t;
+  float3 pm1 = prim.p_prev.xyz;
+  float3 p2  = prim.p_next.xyz;
+  float3 axisPoint = 0.5f * ((2.0f * p0)
+                            + (-pm1 + p1)                          * t
+                            + (2.0f*pm1 - 5.0f*p0 + 4.0f*p1 - p2) * t2
+                            + (-pm1 + 3.0f*p0 - 3.0f*p1 + p2)     * t3);
+
+  float3 normal = normalize(hitPos - axisPoint);
   if (dot(normal, -currentRay.direction) < 0.0f) {
     normal = -normal;
   }

@@ -171,6 +171,11 @@ struct GPUPunctualLight {
 struct GPUCurvePrimitive {
   float4 p0_radius;
   float4 p1_type;
+  // Ghost control points for Catmull-Rom spline evaluation in the shader.
+  // p_prev is the node before p0; p_next is the node after p1.
+  // When no neighbour exists the ghost point is mirrored (2*p0 - p1 or 2*p1 - p0).
+  float4 p_prev;
+  float4 p_next;
   uint4  materialObjectId;
   // Per-primitive color override; w=0 means "use material baseColorFactor", w=1 means use xyz.
   float4 baseColor;

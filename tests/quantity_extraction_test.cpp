@@ -8,10 +8,10 @@
 //  4.  Face scalar isoline parameters propagate to RTMesh
 //  5.  PointCloud ColorQuantity has higher priority than ScalarQuantity
 //  6.  PointCloud ColorQuantity overrides baseColor
-//  7.  Curve network node color  → primitiveColors (spheres + cylinder midpoint)
-//  8.  Curve network edge color  → primitiveColors (nodeAverage for spheres)
-//  9.  Curve network node scalar → primitiveColors via colormap
-// 10.  Curve network edge scalar → primitiveColors via colormap
+//  7.  Curve network node color  → primitiveColors (spheres first, then averaged onto edge cylinders)
+//  8.  Curve network edge color  → primitiveColors (spheres get nodeAverageColor, cylinders get direct edge color)
+//  9.  Curve network node scalar → primitiveColors via colormap (spheres get direct node colormap)
+// 10.  Curve network edge scalar → primitiveColors via colormap (spheres get nodeAverage colormap)
 // 11.  Hash invalidates when face quantity is toggled
 // 12.  Hash invalidates when curve quantity is toggled
 // 13.  Disabled curve quantity does not populate primitiveColors
@@ -205,9 +205,13 @@ void testCurveNodeColorExtracted() {
           "node color quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
-  // Node 0 is red → sphere 0 should be red.
-  require(cn.primitiveColors[0].r > 0.9f, "node 0 sphere should be red");
-  require(cn.primitiveColors[0].g < 0.1f, "node 0 sphere should not be green");
+  // Layout: [sphere_node0=red, sphere_node2=blue, cyl_edge0=avg(red,green), cyl_edge1=avg(green,blue)]
+  // Two endpoint spheres (nodes 0 and 2) come first; cylinders after.
+  // cn.primitiveColors[2] is the first cylinder (edge 0: avg of red and green → yellowish).
+  const size_t cylOffset = cn.primitives.size() - 2; // 2 cylinders at the end
+  require(cn.primitiveColors[cylOffset].r > 0.3f, "edge 0 blended color should have red component");
+  require(cn.primitiveColors[cylOffset].g > 0.3f, "edge 0 blended color should have green component");
+  require(cn.primitiveColors[cylOffset].b < 0.1f, "edge 0 blended color should have low blue");
 }
 
 // ---------------------------------------------------------------------------
@@ -229,19 +233,14 @@ void testCurveEdgeColorExtracted() {
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
 
-  // Count cylinders — they should have the per-edge color.
-  int cylIdx = 0;
-  int nNodes = 0;
-  for (const auto& p : cn.primitives) {
-    if (p.type == rt::RTCurvePrimitiveType::Sphere) ++nNodes;
-  }
-  // Cylinders start at index nNodes in the flat list.
-  // Cylinder for edge 0 (yellow) should have high R and G.
-  if ((int)cn.primitiveColors.size() > nNodes) {
-    const glm::vec3& cylColor0 = cn.primitiveColors[nNodes];
+  // Layout: [sphere_node0 (yellow, only touches edge0), sphere_node2 (cyan, only touches edge1),
+  //           cyl_edge0=yellow, cyl_edge1=cyan]
+  // Use the cylinder index (nSpheres offset) for the first cylinder check.
+  const size_t cylOffset8 = cn.primitives.size() - 2;
+  if (cylOffset8 < cn.primitiveColors.size()) {
+    const glm::vec3& cylColor0 = cn.primitiveColors[cylOffset8];
     require(cylColor0.r > 0.5f && cylColor0.g > 0.5f,
             "edge 0 cylinder should be yellow (R+G)");
-    (void)cylIdx;
   }
 }
 
@@ -262,9 +261,10 @@ void testCurveNodeScalarExtracted() {
           "node scalar quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
-  // Nodes 0 and 1 have different scalar values → different colormap outputs.
+  // Both nodes (0 and 1) are endpoints (degree=1), so both get sphere primitives.
+  // Nodes 0 and 1 have different scalar values → sphere colors differ.
   require(cn.primitiveColors[0] != cn.primitiveColors[1],
-          "different node scalars should produce different primitive colors");
+          "different node scalars should produce different sphere colors");
 }
 
 // ---------------------------------------------------------------------------
@@ -285,14 +285,12 @@ void testCurveEdgeScalarExtracted() {
           "edge scalar quantity should populate primitiveColors");
   require(cn.primitiveColors.size() == cn.primitives.size(),
           "primitiveColors must be parallel to primitives");
-  // Cylinders have per-edge colors.  The two cylinder colors should differ.
-  int nNodes = 0;
-  for (const auto& p : cn.primitives)
-    if (p.type == rt::RTCurvePrimitiveType::Sphere) ++nNodes;
-  const int nCyls = static_cast<int>(cn.primitives.size()) - nNodes;
-  require(nCyls >= 2, "expected at least 2 cylinder primitives");
-  require(cn.primitiveColors[nNodes] != cn.primitiveColors[nNodes + 1],
-          "edge-0 and edge-1 cylinders should have different colormap colors");
+  // Layout: [sphere_node0 (adjacent to edge0=0.0), sphere_node2 (adjacent to edge1=1.0),
+  //           cyl_edge0, cyl_edge1].
+  // Sphere primitiveColors[0] and [1] have different average-scalar-based colors.
+  require((int)cn.primitives.size() >= 3, "expected 2 sphere + 2 cylinder primitives");
+  require(cn.primitiveColors[0] != cn.primitiveColors[1],
+          "endpoint spheres should have different colormap colors (edge scalars 0.0 vs 1.0)");
 }
 
 // ---------------------------------------------------------------------------

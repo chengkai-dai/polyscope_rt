@@ -289,15 +289,38 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
   size_t nNodes = nodePositions.size();
   size_t edgeCount = std::min(edgeTails.size(), edgeTips.size());
 
-  out.primitives.reserve(nNodes + edgeCount);
+  out.primitives.reserve(edgeCount + nNodes); // upper bound
 
-  for (const glm::vec3& node : nodePositions) {
-    glm::vec3 worldPos = glm::vec3(transform * glm::vec4(node, 1.0f));
+  // Build per-node edge-degree counts from the valid (non-degenerate) edge set.
+  // Nodes with degree == 2 are smooth interior joints; the Catmull-Rom spline
+  // is C1-continuous through them so no sphere is needed.
+  // Nodes with degree != 2 (endpoints with degree=1, branch points with degree≥3,
+  // isolated nodes with degree=0) get a sphere primitive so the tube has a
+  // clean visual termination or fill at those positions.
+  std::vector<int> nodeDegree(nNodes, 0);
+  for (size_t i = 0; i < edgeCount; ++i) {
+    uint32_t tail = edgeTails[i];
+    uint32_t tip  = edgeTips[i];
+    if (tail >= nNodes || tip >= nNodes) continue;
+    glm::vec3 wt = glm::vec3(transform * glm::vec4(nodePositions[tail], 1.0f));
+    glm::vec3 wp = glm::vec3(transform * glm::vec4(nodePositions[tip],  1.0f));
+    if (glm::length(wp - wt) < 1e-6f) continue;
+    nodeDegree[tail]++;
+    nodeDegree[tip]++;
+  }
+
+  // Sphere primitives for non-degree-2 nodes (endpoints & branch points).
+  // sphereNodeIndices[k] = original node index of the k-th sphere primitive.
+  std::vector<size_t> sphereNodeIndices;
+  for (size_t ni = 0; ni < nNodes; ++ni) {
+    if (nodeDegree[ni] == 2) continue;
+    glm::vec3 worldPos = glm::vec3(transform * glm::vec4(nodePositions[ni], 1.0f));
     rt::RTCurvePrimitive prim;
-    prim.type = rt::RTCurvePrimitiveType::Sphere;
-    prim.p0 = worldPos;
+    prim.type   = rt::RTCurvePrimitiveType::Sphere;
+    prim.p0     = worldPos;
     prim.radius = radius;
     out.primitives.push_back(prim);
+    sphereNodeIndices.push_back(ni);
   }
 
   // Track which edge index each cylinder corresponds to (some may be skipped for degenerate edges).
@@ -319,11 +342,26 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     cylinderEdgeIndex.push_back(i);
   }
 
+  // Store world-space node positions and edge connectivity so the Metal backend
+  // can build Catmull-Rom ghost points for smooth curve rendering.
+  out.nodePositions.reserve(nNodes);
+  for (const glm::vec3& node : nodePositions)
+    out.nodePositions.push_back(glm::vec3(transform * glm::vec4(node, 1.0f)));
+  out.edgeTailInds.reserve(cylinderEdgeIndex.size());
+  out.edgeTipInds.reserve(cylinderEdgeIndex.size());
+  for (size_t ci : cylinderEdgeIndex) {
+    out.edgeTailInds.push_back(edgeTails[ci]);
+    out.edgeTipInds.push_back(edgeTips[ci]);
+  }
+
   // ------------------------------------------------------------------
   // Extract per-primitive colors from the dominant quantity (if any).
-  // primitiveColors layout: [0..nNodes-1] = node spheres, [nNodes..] = cylinders.
+  // primitiveColors layout mirrors primitives:
+  //   [0 .. nSpheres-1]  = colors for degree≠2 sphere nodes (sphereNodeIndices)
+  //   [nSpheres ..]      = colors for cylinder edges (cylinderEdgeIndex)
   // ------------------------------------------------------------------
   const glm::vec3 fallback = glm::vec3(network.getColor());
+  const size_t nSpheres = sphereNodeIndices.size();
 
   auto colormapScalars = [&](const std::vector<float>& scalars,
                               const polyscope::render::ValueColorMap& cmap,
@@ -339,12 +377,13 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
   };
 
   if (auto* q = dynamic_cast<polyscope::CurveNetworkNodeColorQuantity*>(network.dominantQuantity)) {
-    // Node color: directly interpolate onto edge midpoints.
     q->colors.ensureHostBufferPopulated();
     const auto& nc = q->colors.data;
-    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
-    for (size_t i = 0; i < nNodes; ++i)
-      out.primitiveColors.push_back(i < nc.size() ? nc[i] : fallback);
+    out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: direct node color.
+    for (size_t ni : sphereNodeIndices)
+      out.primitiveColors.push_back(ni < nc.size() ? nc[ni] : fallback);
+    // Cylinder colors: average of the two endpoint node colors.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
       uint32_t t = edgeTails[ei], p = edgeTips[ei];
@@ -354,14 +393,25 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     }
 
   } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeColorQuantity*>(network.dominantQuantity)) {
-    // Edge color: node spheres use pre-averaged node colors; cylinders use per-edge color.
     q->colors.ensureHostBufferPopulated();
-    q->nodeAverageColors.ensureHostBufferPopulated();
     const auto& ec = q->colors.data;
-    const auto& nav = q->nodeAverageColors.data;
-    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
-    for (size_t i = 0; i < nNodes; ++i)
-      out.primitiveColors.push_back(i < nav.size() ? nav[i] : fallback);
+    // Compute per-node average of adjacent edge colors on the CPU.
+    std::vector<glm::vec3> nodeColorSum(nNodes, glm::vec3(0.0f));
+    std::vector<int>       nodeColorCnt(nNodes, 0);
+    for (size_t i = 0; i < edgeCount; ++i) {
+      uint32_t t = edgeTails[i], p = edgeTips[i];
+      if (t >= nNodes || p >= nNodes || i >= ec.size()) continue;
+      nodeColorSum[t] += ec[i]; nodeColorCnt[t]++;
+      nodeColorSum[p] += ec[i]; nodeColorCnt[p]++;
+    }
+    out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: node average.
+    for (size_t ni : sphereNodeIndices) {
+      glm::vec3 col = (nodeColorCnt[ni] > 0)
+          ? nodeColorSum[ni] / float(nodeColorCnt[ni]) : fallback;
+      out.primitiveColors.push_back(col);
+    }
+    // Cylinder colors: direct per-edge color.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
       out.primitiveColors.push_back(ei < ec.size() ? ec[ei] : fallback);
@@ -372,9 +422,11 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     const auto [vizMin, vizMax] = q->getMapRange();
     const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
     std::vector<glm::vec3> nc = colormapScalars(q->values.data, cmap, vizMin, vizMax);
-    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
-    for (size_t i = 0; i < nNodes; ++i)
-      out.primitiveColors.push_back(i < nc.size() ? nc[i] : fallback);
+    out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: direct node colormap value.
+    for (size_t ni : sphereNodeIndices)
+      out.primitiveColors.push_back(ni < nc.size() ? nc[ni] : fallback);
+    // Cylinder colors: average of the two endpoint colormap values.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
       uint32_t t = edgeTails[ei], p = edgeTips[ei];
@@ -385,18 +437,34 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
 
   } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeScalarQuantity*>(network.dominantQuantity)) {
     q->values.ensureHostBufferPopulated();
-    q->nodeAverageValues.ensureHostBufferPopulated();
     const auto [vizMin, vizMax] = q->getMapRange();
     const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
     const auto& ev = q->values.data;
-    // Node spheres use pre-averaged node values.
-    std::vector<glm::vec3> nodeColors = colormapScalars(q->nodeAverageValues.data, cmap, vizMin, vizMax);
-    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
-    for (size_t i = 0; i < nNodes; ++i)
-      out.primitiveColors.push_back(i < nodeColors.size() ? nodeColors[i] : fallback);
+    const double range = (vizMax > vizMin) ? (vizMax - vizMin) : 1.0;
+    // Compute per-node average scalar from adjacent edge scalars on the CPU.
+    std::vector<float> nodeScalarSum(nNodes, 0.0f);
+    std::vector<int>   nodeScalarCnt(nNodes, 0);
+    for (size_t i = 0; i < edgeCount; ++i) {
+      uint32_t t = edgeTails[i], p = edgeTips[i];
+      if (t >= nNodes || p >= nNodes || i >= ev.size()) continue;
+      nodeScalarSum[t] += ev[i]; nodeScalarCnt[t]++;
+      nodeScalarSum[p] += ev[i]; nodeScalarCnt[p]++;
+    }
+    out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
+    // Sphere colors: node-average scalar, colormapped.
+    for (size_t ni : sphereNodeIndices) {
+      glm::vec3 col = fallback;
+      if (nodeScalarCnt[ni] > 0) {
+        double avg = nodeScalarSum[ni] / float(nodeScalarCnt[ni]);
+        col = cmap.getValue((avg - vizMin) / range);
+      }
+      out.primitiveColors.push_back(col);
+    }
+    // Cylinder colors: direct per-edge scalar, colormapped.
     for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
       size_t ei = cylinderEdgeIndex[ci];
-      glm::vec3 col = (ei < ev.size()) ? cmap.getValue((ev[ei] - vizMin) / ((vizMax > vizMin) ? (vizMax - vizMin) : 1.0)) : fallback;
+      glm::vec3 col = (ei < ev.size())
+          ? cmap.getValue((ev[ei] - vizMin) / range) : fallback;
       out.primitiveColors.push_back(col);
     }
   }
