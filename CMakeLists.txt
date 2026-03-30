@@ -214,10 +214,26 @@ target_compile_definitions(
   GLM_ENABLE_EXPERIMENTAL
 )
 
+add_executable(
+  geometry_showcase_rt_example
+  examples/geometry_showcase_example.cpp
+)
+target_link_libraries(
+  geometry_showcase_rt_example
+  PRIVATE
+  polyscope_rt_plugin
+)
+target_compile_definitions(
+  geometry_showcase_rt_example
+  PRIVATE
+  GLM_ENABLE_EXPERIMENTAL
+)
+
 if(APPLE)
   target_compile_definitions(polyscope_rt_surface_mesh_example PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_definitions(geometry_central_rt_example PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_definitions(curve_network_rt_example PRIVATE GL_SILENCE_DEPRECATION)
+  target_compile_definitions(geometry_showcase_rt_example PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_definitions(polyscope_rt_plugin PRIVATE GL_SILENCE_DEPRECATION)
 endif()
 

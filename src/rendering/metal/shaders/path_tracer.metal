@@ -5,7 +5,16 @@ using namespace metal::raytracing;
 #include "gpu_shared_types.h"
 #include "shader_common.h"
 
+// Forward declaration so evaluateDirectionalLight can call shadowVisibility.
+float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
+                       device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                       thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
+                       instance_acceleration_structure scene, instance_acceleration_structure pointScene,
+                       intersection_function_table<curve_data, triangle_data, instancing> ftable);
+
 float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 normal,
+                               device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                               thread uint& rng,
                                intersector<curve_data, triangle_data, instancing> isector,
                                instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                intersection_function_table<curve_data, triangle_data, instancing> ftable) {
@@ -13,24 +22,9 @@ float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hit
   float nDotL = max(dot(normal, toLight), 0.0f);
   if (nDotL <= 0.0f) return 0.0f;
 
-  ray shadowRay;
-  shadowRay.origin = hitPos;
-  shadowRay.direction = toLight;
-  shadowRay.min_distance = 5e-3f;
-  shadowRay.max_distance = 1e6f;
-  isector.accept_any_intersection(true);
-  auto mcShadow = isector.intersect(shadowRay, scene, 0xFFu);
-  auto ptShadow = isector.intersect(shadowRay, pointScene, 0xFFu, ftable);
-  isector.accept_any_intersection(false);
-  if (mcShadow.type != intersection_type::none || ptShadow.type != intersection_type::none) return 0.0f;
-  return nDotL * lightIntensity;
+  float visibility = shadowVisibility(hitPos, toLight, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
+  return nDotL * lightIntensity * visibility;
 }
-
-float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
-                       device const GPUTriangle* triangles, device const GPUMaterial* materials,
-                       thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
-                       instance_acceleration_structure scene, instance_acceleration_structure pointScene,
-                       intersection_function_table<curve_data, triangle_data, instancing> ftable);
 
 bool sampleAreaLight(float3 hitPos, float3 normal, constant GPULighting& lighting,
                      device const GPUTriangle* triangles, device const GPUMaterial* materials,
@@ -128,9 +122,15 @@ float3 evalSimpleSky(float3 dir, constant GPULighting& lighting) {
 }
 
 float3 sampleEnvironment(float3 dir, constant GPULighting& lighting) {
+  // Use the same sky gradient as sampleMissRadiance so ambient IBL matches
+  // what bounce rays actually see.  This makes metal ambient consistent.
+  float3 sky = evalSimpleSky(dir, lighting);
+  // Blend the user-controlled environment tint on top.
   float hemi = saturate(dir.y * 0.5f + 0.5f);
-  float3 sky = mix(float3(0.04f, 0.04f, 0.05f), lighting.environmentTintIntensity.xyz, hemi);
-  return sky * lighting.environmentTintIntensity.w;
+  float3 tinted = mix(float3(0.04f, 0.04f, 0.05f), lighting.environmentTintIntensity.xyz, hemi)
+                  * lighting.environmentTintIntensity.w;
+  // Average the two contributions so we get both sky colour and user tint.
+  return (sky + tinted) * 0.5f;
 }
 
 float3 cosineWeightedHemisphere(float3 normal, thread uint& rng) {
@@ -230,7 +230,13 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
     float transmission = clamp(materials[objectId].transmissionIor.x, 0.0f, 1.0f);
 
     if (opacity < 1e-5f && transmission < 1e-5f) {
-      return 0.0f;
+      // Fully invisible surface: advance shadow ray through without blocking.
+      float traveled = mcHit.distance + 2e-3f;
+      shadowRay.origin = shadowRay.origin + toLight * traveled;
+      shadowRay.min_distance = 1e-3f;
+      shadowRay.max_distance = maxDistance - traveled;
+      if (shadowRay.max_distance <= 0.0f) return 1.0f;
+      continue;
     }
 
     bool fullyOpaque = (opacity >= 0.999f) && (transmission <= 0.001f);
@@ -764,6 +770,16 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
     }
   }
 
+  // Environment ambient (IBL approximation).
+  // Metal surfaces have no diffuse term, so without this they stay black everywhere
+  // the GGX specular lobe doesn't directly face a light.  The path-bounce already
+  // picks up the sky, but this ensures the *first* convergence is not pitch-black.
+  float3 envAmbient = sampleEnvironment(N, lighting);
+  float3 ambientSpec = F0 * envAmbient;
+  float3 kDa         = (float3(1.0f) - F0) * (1.0f - metallic);
+  float3 ambientDiff = kDa * albedo * envAmbient * (1.0f / 3.14159265f);
+  directLighting += ambientSpec + ambientDiff;
+
   return directLighting;
 }
 
@@ -1255,7 +1271,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
           float direct = 0.0f;
           if (lighting.mainLightColorIntensity.w > 1e-5f) {
             direct += evaluateDirectionalLight(lighting.mainLightDirection.xyz, lighting.mainLightColorIntensity.w, surf.hitPos,
-                                              surf.normal, isector, scene, pointScene, ftable);
+                                              surf.normal, triangles, materials, rng, isector, scene, pointScene, ftable);
           }
           if (frame.lightCount > 0u) {
             for (uint lightIndex = 0u; lightIndex < frame.lightCount; ++lightIndex) {

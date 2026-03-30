@@ -40,7 +40,6 @@ void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
     material.normalTextureData = simd_make_uint4(0u, 0u, 0u, 0u);
     float opacityPacked = mesh.opacity;
     float transmissionPacked = mesh.transmissionFactor;
-    if (opacityPacked < 1e-5f && transmissionPacked < 1e-5f) opacityPacked = 1.0f;
     material.transmissionIor =
         simd_make_float4(transmissionPacked, mesh.indexOfRefraction, mesh.unlit ? 1.0f : 0.0f, opacityPacked);
     const float edgeBaryThreshold = mesh.wireframe ? (mesh.edgeWidth / 100.0f) : 0.0f;
