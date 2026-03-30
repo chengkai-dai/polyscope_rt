@@ -97,6 +97,7 @@ rt::RTMesh makeMeshFromSimpleTriangleMesh(polyscope::SimpleTriangleMesh& mesh) {
   out.name = mesh.getName();
   out.transform = mesh.getTransform();
   out.baseColorFactor = glm::vec4(mesh.getSurfaceColor(), 1.0f);
+  out.opacity = mesh.getTransparency();
   out.vertices = mesh.vertices.data;
   out.indices = mesh.faces.data;
   return out;
@@ -107,6 +108,8 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
   out.name = mesh.getName();
   out.transform = mesh.getTransform();
   out.baseColorFactor = glm::vec4(mesh.getSurfaceColor(), 1.0f);
+  // Honour the Polyscope UI transparency slider (0=transparent, 1=opaque).
+  out.opacity = mesh.getTransparency();
   out.vertices = mesh.vertexPositions.data;
 
   const auto& triIndices = mesh.triangleVertexInds.data;
@@ -490,6 +493,7 @@ rt::RTMesh makeMeshFromVolumeMesh(polyscope::VolumeMesh& mesh) {
   out.name = mesh.getName();
   out.transform = mesh.getTransform();
   out.baseColorFactor = glm::vec4(mesh.getColor(), 1.0f);
+  out.opacity = mesh.getTransparency();
   out.vertices = mesh.vertexPositions.data;
   applyMaterialPreset(out, mesh.getMaterial());
 

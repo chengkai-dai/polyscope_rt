@@ -391,8 +391,9 @@ int main() {
   ps::init();
 
   // ── Lighting ────────────────────────────────────────────────────────────
-  // Bright white sky so bounce rays reflect a light environment (critical for metals).
-  ps::setBackgroundColor({0.85f, 0.90f, 0.95f});
+  // Dark studio background → bounce rays see a moderate sky, so near-white
+  // metals (Silver, Mirror) show colour rather than blowing out to pure white.
+  ps::setBackgroundColor({0.10f, 0.13f, 0.22f});
 
   // Warm main directional light from upper-left front.
   ps::setMainLight({-0.5f, -1.0f, 0.4f},
@@ -419,11 +420,11 @@ int main() {
   ps::setAreaLight({0.0f, 2.2f, -0.35f},
                    {1.2f, 0.0f, 0.0f},
                    {0.0f, 0.0f, 1.4f},
-                   {1.5f, 1.46f, 1.43f});   // slightly brighter warm-white emission
+                   {1.5f, 1.46f, 1.43f});
 
   ps::setAmbientFloor(0.07f);
-  // Environment tint: bright sky-blue, high intensity so metals pick up IBL.
-  ps::setEnvironment({0.85f, 0.90f, 1.0f}, 0.60f);
+  // Brighter environment tint – feeds the ambient IBL term added to the PBR shader.
+  ps::setEnvironment({0.85f, 0.90f, 1.0f}, 0.50f);
 
   // ── Geometry ────────────────────────────────────────────────────────────
   addMetalRow();              // Row A: Gold, Silver, Copper, Chrome, Mirror

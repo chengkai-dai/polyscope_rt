@@ -12,7 +12,10 @@ inline void applyPhysicalParamsFromPreset(::rt::RTMesh& mesh, const MaterialPres
   mesh.emissiveFactor = preset.emissive;
   mesh.transmissionFactor = preset.transmission;
   mesh.indexOfRefraction = preset.ior;
-  mesh.opacity = preset.opacity;
+  // Only override opacity when the preset explicitly requests non-opaque (e.g. Transparent()).
+  // For fully-opaque presets (opacity==1) we preserve the value already set from
+  // Polyscope's per-structure transparency slider so the RT renderer respects it.
+  if (preset.opacity < 1.0f) mesh.opacity = preset.opacity;
   mesh.unlit = preset.unlit;
 }
 

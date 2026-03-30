@@ -122,15 +122,9 @@ float3 evalSimpleSky(float3 dir, constant GPULighting& lighting) {
 }
 
 float3 sampleEnvironment(float3 dir, constant GPULighting& lighting) {
-  // Use the same sky gradient as sampleMissRadiance so ambient IBL matches
-  // what bounce rays actually see.  This makes metal ambient consistent.
-  float3 sky = evalSimpleSky(dir, lighting);
-  // Blend the user-controlled environment tint on top.
   float hemi = saturate(dir.y * 0.5f + 0.5f);
-  float3 tinted = mix(float3(0.04f, 0.04f, 0.05f), lighting.environmentTintIntensity.xyz, hemi)
-                  * lighting.environmentTintIntensity.w;
-  // Average the two contributions so we get both sky colour and user tint.
-  return (sky + tinted) * 0.5f;
+  float3 sky = mix(float3(0.04f, 0.04f, 0.05f), lighting.environmentTintIntensity.xyz, hemi);
+  return sky * lighting.environmentTintIntensity.w;
 }
 
 float3 cosineWeightedHemisphere(float3 normal, thread uint& rng) {
@@ -773,11 +767,12 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
   // Environment ambient (IBL approximation).
   // Metal surfaces have no diffuse term, so without this they stay black everywhere
   // the GGX specular lobe doesn't directly face a light.  The path-bounce already
-  // picks up the sky, but this ensures the *first* convergence is not pitch-black.
-  float3 envAmbient = sampleEnvironment(N, lighting);
-  float3 ambientSpec = F0 * envAmbient;
-  float3 kDa         = (float3(1.0f) - F0) * (1.0f - metallic);
-  float3 ambientDiff = kDa * albedo * envAmbient * (1.0f / 3.14159265f);
+  // picks up the sky stochastically; this term ensures the first convergence isn't
+  // pitch-black.  Scale by 0.3 so near-white metals (Silver, Mirror) don't blow out.
+  float3 envAmbient   = sampleEnvironment(N, lighting);
+  float3 ambientSpec  = F0 * envAmbient * 0.3f;
+  float3 kDa          = (float3(1.0f) - F0) * (1.0f - metallic);
+  float3 ambientDiff  = kDa * albedo * envAmbient * (0.3f / 3.14159265f);
   directLighting += ambientSpec + ambientDiff;
 
   return directLighting;
