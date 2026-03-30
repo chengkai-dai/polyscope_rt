@@ -257,27 +257,47 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
     curveMaterial.transmissionIor = simd_make_float4(0.0f, 1.5f, curveNet.unlit ? 1.0f : 0.0f, 1.0f);
     acc.materials.push_back(curveMaterial);
 
-    for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
-      if (prim.type != rt::RTCurvePrimitiveType::Cylinder) continue;
+    const bool hasPrimColors = curveNet.primitiveColors.size() == curveNet.primitives.size();
 
+    // Track which primitive index in curveNet.primitives each cylinder / sphere corresponds to.
+    size_t sphereCount = 0;
+    size_t cylCount = 0;
+    for (const rt::RTCurvePrimitive& p : curveNet.primitives) {
+      if (p.type == rt::RTCurvePrimitiveType::Sphere) ++sphereCount;
+      else                                             ++cylCount;
+    }
+    // Spheres are stored first (indices 0..sphereCount-1), then cylinders.
+    size_t spherePrimIdx = 0;
+    size_t cylPrimIdx    = sphereCount;
+
+    for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
+      if (prim.type != rt::RTCurvePrimitiveType::Cylinder) { ++spherePrimIdx; continue; }
+
+      glm::vec3 col = hasPrimColors ? curveNet.primitiveColors[cylPrimIdx]
+                                    : glm::vec3(curveNet.baseColor);
       GPUCurvePrimitive shaderPrim;
       shaderPrim.p0_radius = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
       shaderPrim.p1_type = simd_make_float4(prim.p1.x, prim.p1.y, prim.p1.z, 1.0f);
       shaderPrim.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
+      shaderPrim.baseColor = simd_make_float4(col.r, col.g, col.b, hasPrimColors ? 1.0f : 0.0f);
       acc.curvePrimitives.push_back(shaderPrim);
 
       curveControlPoints.push_back(simd_make_float3(prim.p0.x, prim.p0.y, prim.p0.z));
       curveControlPoints.push_back(simd_make_float3(prim.p1.x, prim.p1.y, prim.p1.z));
       curveRadii.push_back(prim.radius);
       curveRadii.push_back(prim.radius);
+      ++cylPrimIdx;
     }
 
+    spherePrimIdx = 0;
     for (const rt::RTCurvePrimitive& prim : curveNet.primitives) {
-      if (prim.type != rt::RTCurvePrimitiveType::Sphere) continue;
+      if (prim.type != rt::RTCurvePrimitiveType::Sphere) { ++cylPrimIdx; continue; }
+
+      glm::vec3 col = hasPrimColors ? curveNet.primitiveColors[spherePrimIdx]
+                                    : glm::vec3(curveNet.baseColor);
       GPUPointPrimitive gpuPt;
       gpuPt.center_radius = simd_make_float4(prim.p0.x, prim.p0.y, prim.p0.z, prim.radius);
-      gpuPt.baseColor =
-          simd_make_float4(curveNet.baseColor.r, curveNet.baseColor.g, curveNet.baseColor.b, 1.0f);
+      gpuPt.baseColor = simd_make_float4(col.r, col.g, col.b, 1.0f);
       gpuPt.materialObjectId = simd_make_uint4(curveMaterialIndex, curveObjectId, 0u, 0u);
       pointPrimitives.push_back(gpuPt);
 
@@ -285,6 +305,7 @@ void gatherCurveGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene,
       bb.min = {prim.p0.x - prim.radius, prim.p0.y - prim.radius, prim.p0.z - prim.radius};
       bb.max = {prim.p0.x + prim.radius, prim.p0.y + prim.radius, prim.p0.z + prim.radius};
       pointBboxData.push_back(bb);
+      ++spherePrimIdx;
     }
   }
 }

@@ -8,8 +8,11 @@
 #include <vector>
 
 #include "polyscope/curve_network.h"
+#include "polyscope/curve_network_color_quantity.h"
+#include "polyscope/curve_network_scalar_quantity.h"
 #include "polyscope/polyscope.h"
 #include "polyscope/point_cloud.h"
+#include "polyscope/point_cloud_color_quantity.h"
 #include "polyscope/point_cloud_scalar_quantity.h"
 #include "polyscope/render/color_maps.h"
 #include "polyscope/render/engine.h"
@@ -53,6 +56,42 @@ void hashVector(uint64_t& hash, const std::vector<T>& values) {
   hashBytes(hash, values.data(), values.size() * sizeof(T));
 }
 
+// Average per-face colors to per-vertex by summing all adjacent face contributions.
+// Vertices not touched by any triangle fall back to `fallback`.
+void faceColorsToVertex(const std::vector<glm::vec3>& faceColors,
+                        const std::vector<uint32_t>&  triVertInds,
+                        const std::vector<uint32_t>&  triFaceInds,
+                        size_t nVerts, glm::vec3 fallback,
+                        std::vector<glm::vec3>& outColors) {
+  std::vector<glm::vec3> sum(nVerts, glm::vec3(0.f));
+  std::vector<int>        cnt(nVerts, 0);
+  for (size_t i = 0; i < triVertInds.size(); ++i) {
+    uint32_t v = triVertInds[i], f = triFaceInds[i];
+    if (v < nVerts && f < faceColors.size()) { sum[v] += faceColors[f]; ++cnt[v]; }
+  }
+  outColors.reserve(nVerts);
+  for (size_t i = 0; i < nVerts; ++i)
+    outColors.push_back(cnt[i] > 0 ? sum[i] / float(cnt[i]) : fallback);
+}
+
+// Average per-face scalars to per-vertex; returns the per-vertex float array.
+std::vector<float> faceScalarsToVertex(const std::vector<float>& faceScalars,
+                                       const std::vector<uint32_t>& triVertInds,
+                                       const std::vector<uint32_t>& triFaceInds,
+                                       size_t nVerts, float fallback) {
+  std::vector<double> sum(nVerts, 0.0);
+  std::vector<int>    cnt(nVerts, 0);
+  for (size_t i = 0; i < triVertInds.size(); ++i) {
+    uint32_t v = triVertInds[i], f = triFaceInds[i];
+    if (v < nVerts && f < faceScalars.size()) { sum[v] += faceScalars[f]; ++cnt[v]; }
+  }
+  std::vector<float> out;
+  out.reserve(nVerts);
+  for (size_t i = 0; i < nVerts; ++i)
+    out.push_back(cnt[i] > 0 ? float(sum[i] / cnt[i]) : fallback);
+  return out;
+}
+
 rt::RTMesh makeMeshFromSimpleTriangleMesh(polyscope::SimpleTriangleMesh& mesh) {
   rt::RTMesh out;
   out.name = mesh.getName();
@@ -80,7 +119,17 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
     out.indices.emplace_back(triIndices[i + 0], triIndices[i + 1], triIndices[i + 2]);
   }
 
+  // Propagate Polyscope's smooth vertex normals so the path tracer interpolates
+  // them properly instead of falling back to flat (geometric) normals.
+  mesh.vertexNormals.ensureHostBufferPopulated();
+  if (mesh.vertexNormals.data.size() == mesh.vertexPositions.data.size()) {
+    out.normals = mesh.vertexNormals.data;
+  }
+
+  const size_t nVerts = mesh.vertexPositions.data.size();
+
   if (auto* vcq = dynamic_cast<polyscope::SurfaceVertexColorQuantity*>(mesh.dominantQuantity)) {
+    vcq->colors.ensureHostBufferPopulated();
     out.vertexColors = vcq->colors.data;
     out.baseColorFactor = glm::vec4(1.0f);
   } else if (auto* vsq = dynamic_cast<polyscope::SurfaceVertexScalarQuantity*>(mesh.dominantQuantity)) {
@@ -102,6 +151,39 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
       out.isoDarkness         = static_cast<float>(vsq->getIsolineDarkness());
       out.isoContourThickness = static_cast<float>(vsq->getIsolineContourThickness());
       out.isoStyle            = (vsq->getIsolineStyle() == polyscope::IsolineStyle::Contour) ? 2 : 1;
+    }
+  } else if (auto* fcq = dynamic_cast<polyscope::SurfaceFaceColorQuantity*>(mesh.dominantQuantity)) {
+    // Face color: average each face's color onto its vertices.
+    fcq->colors.ensureHostBufferPopulated();
+    mesh.triangleFaceInds.ensureHostBufferPopulated();
+    faceColorsToVertex(fcq->colors.data, triIndices, mesh.triangleFaceInds.data,
+                       nVerts, mesh.getSurfaceColor(), out.vertexColors);
+    out.baseColorFactor = glm::vec4(1.0f);
+  } else if (auto* fsq = dynamic_cast<polyscope::SurfaceFaceScalarQuantity*>(mesh.dominantQuantity)) {
+    // Face scalar: average adjacent face scalars to each vertex, then colormap.
+    mesh.triangleFaceInds.ensureHostBufferPopulated();
+    const auto& faceScalars = fsq->values.data;
+    const auto [vizMin, vizMax] = fsq->getMapRange();
+    const double range = (vizMax > vizMin) ? (vizMax - vizMin) : 1.0;
+    const polyscope::render::ValueColorMap& cmap =
+        polyscope::render::engine->getColorMap(fsq->getColorMap());
+
+    const std::vector<float> vertScalars = faceScalarsToVertex(
+        faceScalars, triIndices, mesh.triangleFaceInds.data, nVerts, float(vizMin));
+
+    out.vertexColors.reserve(nVerts);
+    for (float s : vertScalars) {
+      double t = (static_cast<double>(s) - vizMin) / range;
+      out.vertexColors.push_back(cmap.getValue(t));
+    }
+    out.baseColorFactor = glm::vec4(1.0f);
+
+    if (fsq->getIsolinesEnabled()) {
+      out.isoScalars          = vertScalars;
+      out.isoSpacing          = static_cast<float>(fsq->getIsolinePeriod());
+      out.isoDarkness         = static_cast<float>(fsq->getIsolineDarkness());
+      out.isoContourThickness = static_cast<float>(fsq->getIsolineContourThickness());
+      out.isoStyle            = (fsq->getIsolineStyle() == polyscope::IsolineStyle::Contour) ? 2 : 1;
     }
   }
 
@@ -149,26 +231,40 @@ rt::RTPointCloud makeRTPointCloud(polyscope::PointCloud& cloud) {
   out.roughness = tmp.roughnessFactor;
   out.unlit     = tmp.unlit;
 
-  // If an enabled scalar quantity exists, compute per-point colors from its colormap.
+  // Priority 1: per-point color quantity (direct RGB, no colormap needed).
   for (auto& [qName, qPtr] : cloud.quantities) {
     if (!qPtr->isEnabled()) continue;
-    auto* scalarQ = dynamic_cast<polyscope::PointCloudScalarQuantity*>(qPtr.get());
-    if (!scalarQ) continue;
+    auto* colorQ = dynamic_cast<polyscope::PointCloudColorQuantity*>(qPtr.get());
+    if (!colorQ) continue;
+    colorQ->colors.ensureHostBufferPopulated();
+    const auto& rawColors = colorQ->colors.data;
+    out.colors.reserve(rawColors.size());
+    for (const auto& c : rawColors) out.colors.push_back(c);
+    break;
+  }
 
-    const std::string& cmapName = scalarQ->getColorMap();
-    const polyscope::render::ValueColorMap& cmap =
-        polyscope::render::engine->getColorMap(cmapName);
-    auto [lo, hi] = scalarQ->getMapRange();
-    const std::vector<float>& vals = scalarQ->values.data;
+  // Priority 2: per-point scalar quantity mapped through a colormap.
+  if (out.colors.empty()) {
+    for (auto& [qName, qPtr] : cloud.quantities) {
+      if (!qPtr->isEnabled()) continue;
+      auto* scalarQ = dynamic_cast<polyscope::PointCloudScalarQuantity*>(qPtr.get());
+      if (!scalarQ) continue;
 
-    out.colors.reserve(out.centers.size());
-    double range = (hi != lo) ? (hi - lo) : 1.0;
-    for (size_t i = 0; i < out.centers.size(); ++i) {
-      float v = (i < vals.size()) ? vals[i] : 0.0f;
-      double t = (v - lo) / range;
-      out.colors.push_back(cmap.getValue(t));
+      const std::string& cmapName = scalarQ->getColorMap();
+      const polyscope::render::ValueColorMap& cmap =
+          polyscope::render::engine->getColorMap(cmapName);
+      auto [lo, hi] = scalarQ->getMapRange();
+      const std::vector<float>& vals = scalarQ->values.data;
+
+      out.colors.reserve(out.centers.size());
+      double range = (hi != lo) ? (hi - lo) : 1.0;
+      for (size_t i = 0; i < out.centers.size(); ++i) {
+        float v = (i < vals.size()) ? vals[i] : 0.0f;
+        double t = (v - lo) / range;
+        out.colors.push_back(cmap.getValue(t));
+      }
+      break; // Use the first enabled scalar quantity.
     }
-    break; // Use the first enabled scalar quantity.
   }
 
   return out;
@@ -183,12 +279,17 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
   float radius = std::max(kMinProceduralRadius, network.getRadius());
   glm::mat4 transform = network.getTransform();
 
+  network.nodePositions.ensureHostBufferPopulated();
+  network.edgeTailInds.ensureHostBufferPopulated();
+  network.edgeTipInds.ensureHostBufferPopulated();
+
   const auto& nodePositions = network.nodePositions.data;
   const auto& edgeTails = network.edgeTailInds.data;
   const auto& edgeTips = network.edgeTipInds.data;
+  size_t nNodes = nodePositions.size();
   size_t edgeCount = std::min(edgeTails.size(), edgeTips.size());
 
-  out.primitives.reserve(nodePositions.size() + edgeCount);
+  out.primitives.reserve(nNodes + edgeCount);
 
   for (const glm::vec3& node : nodePositions) {
     glm::vec3 worldPos = glm::vec3(transform * glm::vec4(node, 1.0f));
@@ -199,10 +300,13 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     out.primitives.push_back(prim);
   }
 
+  // Track which edge index each cylinder corresponds to (some may be skipped for degenerate edges).
+  std::vector<size_t> cylinderEdgeIndex;
+  cylinderEdgeIndex.reserve(edgeCount);
   for (size_t i = 0; i < edgeCount; ++i) {
     uint32_t tail = edgeTails[i];
     uint32_t tip = edgeTips[i];
-    if (tail >= nodePositions.size() || tip >= nodePositions.size()) continue;
+    if (tail >= nNodes || tip >= nNodes) continue;
     glm::vec3 worldTail = glm::vec3(transform * glm::vec4(nodePositions[tail], 1.0f));
     glm::vec3 worldTip = glm::vec3(transform * glm::vec4(nodePositions[tip], 1.0f));
     if (glm::length(worldTip - worldTail) < 1e-6f) continue;
@@ -212,6 +316,89 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     prim.p1 = worldTip;
     prim.radius = radius;
     out.primitives.push_back(prim);
+    cylinderEdgeIndex.push_back(i);
+  }
+
+  // ------------------------------------------------------------------
+  // Extract per-primitive colors from the dominant quantity (if any).
+  // primitiveColors layout: [0..nNodes-1] = node spheres, [nNodes..] = cylinders.
+  // ------------------------------------------------------------------
+  const glm::vec3 fallback = glm::vec3(network.getColor());
+
+  auto colormapScalars = [&](const std::vector<float>& scalars,
+                              const polyscope::render::ValueColorMap& cmap,
+                              double vizMin, double vizMax) -> std::vector<glm::vec3> {
+    const double range = (vizMax > vizMin) ? (vizMax - vizMin) : 1.0;
+    std::vector<glm::vec3> colors;
+    colors.reserve(scalars.size());
+    for (float s : scalars) {
+      double t = (static_cast<double>(s) - vizMin) / range;
+      colors.push_back(cmap.getValue(t));
+    }
+    return colors;
+  };
+
+  if (auto* q = dynamic_cast<polyscope::CurveNetworkNodeColorQuantity*>(network.dominantQuantity)) {
+    // Node color: directly interpolate onto edge midpoints.
+    q->colors.ensureHostBufferPopulated();
+    const auto& nc = q->colors.data;
+    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
+    for (size_t i = 0; i < nNodes; ++i)
+      out.primitiveColors.push_back(i < nc.size() ? nc[i] : fallback);
+    for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
+      size_t ei = cylinderEdgeIndex[ci];
+      uint32_t t = edgeTails[ei], p = edgeTips[ei];
+      glm::vec3 ct = (t < nc.size()) ? nc[t] : fallback;
+      glm::vec3 cp = (p < nc.size()) ? nc[p] : fallback;
+      out.primitiveColors.push_back((ct + cp) * 0.5f);
+    }
+
+  } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeColorQuantity*>(network.dominantQuantity)) {
+    // Edge color: node spheres use pre-averaged node colors; cylinders use per-edge color.
+    q->colors.ensureHostBufferPopulated();
+    q->nodeAverageColors.ensureHostBufferPopulated();
+    const auto& ec = q->colors.data;
+    const auto& nav = q->nodeAverageColors.data;
+    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
+    for (size_t i = 0; i < nNodes; ++i)
+      out.primitiveColors.push_back(i < nav.size() ? nav[i] : fallback);
+    for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
+      size_t ei = cylinderEdgeIndex[ci];
+      out.primitiveColors.push_back(ei < ec.size() ? ec[ei] : fallback);
+    }
+
+  } else if (auto* q = dynamic_cast<polyscope::CurveNetworkNodeScalarQuantity*>(network.dominantQuantity)) {
+    q->values.ensureHostBufferPopulated();
+    const auto [vizMin, vizMax] = q->getMapRange();
+    const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
+    std::vector<glm::vec3> nc = colormapScalars(q->values.data, cmap, vizMin, vizMax);
+    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
+    for (size_t i = 0; i < nNodes; ++i)
+      out.primitiveColors.push_back(i < nc.size() ? nc[i] : fallback);
+    for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
+      size_t ei = cylinderEdgeIndex[ci];
+      uint32_t t = edgeTails[ei], p = edgeTips[ei];
+      glm::vec3 ct = (t < nc.size()) ? nc[t] : fallback;
+      glm::vec3 cp = (p < nc.size()) ? nc[p] : fallback;
+      out.primitiveColors.push_back((ct + cp) * 0.5f);
+    }
+
+  } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeScalarQuantity*>(network.dominantQuantity)) {
+    q->values.ensureHostBufferPopulated();
+    q->nodeAverageValues.ensureHostBufferPopulated();
+    const auto [vizMin, vizMax] = q->getMapRange();
+    const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
+    const auto& ev = q->values.data;
+    // Node spheres use pre-averaged node values.
+    std::vector<glm::vec3> nodeColors = colormapScalars(q->nodeAverageValues.data, cmap, vizMin, vizMax);
+    out.primitiveColors.reserve(nNodes + cylinderEdgeIndex.size());
+    for (size_t i = 0; i < nNodes; ++i)
+      out.primitiveColors.push_back(i < nodeColors.size() ? nodeColors[i] : fallback);
+    for (size_t ci = 0; ci < cylinderEdgeIndex.size(); ++ci) {
+      size_t ei = cylinderEdgeIndex[ci];
+      glm::vec3 col = (ei < ev.size()) ? cmap.getValue((ev[ei] - vizMin) / ((vizMax > vizMin) ? (vizMax - vizMin) : 1.0)) : fallback;
+      out.primitiveColors.push_back(col);
+    }
   }
 
   return out;
@@ -291,6 +478,7 @@ void addCurveNetworkAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTCurveNetwork
     hashBytes(snapshot.scene.hash, &prim.p1[0], sizeof(float) * 3);
     hashBytes(snapshot.scene.hash, &prim.radius, sizeof(float));
   }
+  hashVector(snapshot.scene.hash, curveNet.primitiveColors);
 
   snapshot.scene.curveNetworks.push_back(std::move(curveNet));
 }

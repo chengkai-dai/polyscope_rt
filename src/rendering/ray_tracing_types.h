@@ -93,6 +93,9 @@ struct RTCurveNetwork {
   float roughness = 0.5f;
   bool unlit = false;
   std::vector<RTCurvePrimitive> primitives;
+  // Per-primitive color override (same length as primitives if populated, or empty for uniform color).
+  // Layout mirrors primitives: [0..nNodes-1] = node sphere colors, [nNodes..] = edge cylinder colors.
+  std::vector<glm::vec3> primitiveColors;
 };
 
 struct RTPointCloud {

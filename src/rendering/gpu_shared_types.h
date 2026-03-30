@@ -172,6 +172,8 @@ struct GPUCurvePrimitive {
   float4 p0_radius;
   float4 p1_type;
   uint4  materialObjectId;
+  // Per-primitive color override; w=0 means "use material baseColorFactor", w=1 means use xyz.
+  float4 baseColor;
 };
 
 struct GPUPointPrimitive {
