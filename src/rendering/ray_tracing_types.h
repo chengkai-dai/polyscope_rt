@@ -257,6 +257,9 @@ struct RenderBuffer {
   std::vector<float> linearDepth;
   std::vector<glm::vec3> normal;
   std::vector<uint32_t> objectId;
+  std::vector<glm::vec3> diffuseAlbedo;
+  std::vector<glm::vec3> specularAlbedo;
+  std::vector<float> roughness;
   std::vector<float> detailContour;
   std::vector<float> detailContourRaw;
   std::vector<float> objectContour;

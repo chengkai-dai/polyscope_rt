@@ -12,9 +12,11 @@
 //  7.  Empty scene (no geometry) produces the background color
 
 #include <cmath>
+#include <algorithm>
 #include <exception>
 #include <iostream>
 #include <stdexcept>
+#include <set>
 #include <vector>
 
 #include "glm/glm.hpp"
@@ -74,6 +76,52 @@ rt::RenderConfig standardConfig() {
   cfg.lighting.ambientFloor = 0.0f;
   cfg.lighting.mainLightIntensity = 1.0f;
   return cfg;
+}
+
+size_t pixelIndex(uint32_t width, int x, int y) {
+  return static_cast<size_t>(y) * width + static_cast<size_t>(x);
+}
+
+glm::vec3 averageCenterPatchVec3(const rt::RTCamera& cam, const std::vector<glm::vec3>& values, int halfExtent = 4) {
+  glm::vec3 sum(0.0f);
+  int count = 0;
+  const int centerX = static_cast<int>(cam.width / 2);
+  const int centerY = static_cast<int>(cam.height / 2);
+  for (int y = std::max(0, centerY - halfExtent); y <= std::min(static_cast<int>(cam.height) - 1, centerY + halfExtent); ++y) {
+    for (int x = std::max(0, centerX - halfExtent); x <= std::min(static_cast<int>(cam.width) - 1, centerX + halfExtent); ++x) {
+      sum += values[pixelIndex(cam.width, x, y)];
+      ++count;
+    }
+  }
+  return count > 0 ? sum / static_cast<float>(count) : glm::vec3(0.0f);
+}
+
+double averageCenterPatchScalar(const rt::RTCamera& cam, const std::vector<float>& values, int halfExtent = 4) {
+  double sum = 0.0;
+  int count = 0;
+  const int centerX = static_cast<int>(cam.width / 2);
+  const int centerY = static_cast<int>(cam.height / 2);
+  for (int y = std::max(0, centerY - halfExtent); y <= std::min(static_cast<int>(cam.height) - 1, centerY + halfExtent); ++y) {
+    for (int x = std::max(0, centerX - halfExtent); x <= std::min(static_cast<int>(cam.width) - 1, centerX + halfExtent); ++x) {
+      sum += values[pixelIndex(cam.width, x, y)];
+      ++count;
+    }
+  }
+  return count > 0 ? sum / static_cast<double>(count) : 0.0;
+}
+
+double averageCenterPatchCoverage(const rt::RTCamera& cam, const std::vector<uint32_t>& values, int halfExtent = 4) {
+  double sum = 0.0;
+  int count = 0;
+  const int centerX = static_cast<int>(cam.width / 2);
+  const int centerY = static_cast<int>(cam.height / 2);
+  for (int y = std::max(0, centerY - halfExtent); y <= std::min(static_cast<int>(cam.height) - 1, centerY + halfExtent); ++y) {
+    for (int x = std::max(0, centerX - halfExtent); x <= std::min(static_cast<int>(cam.width) - 1, centerX + halfExtent); ++x) {
+      sum += values[pixelIndex(cam.width, x, y)] != 0u ? 1.0 : 0.0;
+      ++count;
+    }
+  }
+  return count > 0 ? sum / static_cast<double>(count) : 0.0;
 }
 
 // Build a tessellated unit sphere with the given lat/lon subdivision.
@@ -345,6 +393,23 @@ void testMultipleMeshesCoexist(rt::IRayTracingBackend& backend) {
   for (const auto& c : buf.color) { redSum += c.x; blueSum += c.z; }
   require(redSum  > 0.5, "left red mesh must be visible");
   require(blueSum > 0.5, "right blue mesh must also be visible alongside the red one");
+
+  std::set<uint32_t> visibleIds;
+  int leftHitCount = 0;
+  int rightHitCount = 0;
+  for (int y = 0; y < static_cast<int>(cam.height); ++y) {
+    for (int x = 0; x < static_cast<int>(cam.width); ++x) {
+      const uint32_t objectId = buf.objectId[pixelIndex(cam.width, x, y)];
+      if (objectId == 0u) continue;
+      visibleIds.insert(objectId);
+      if (x < static_cast<int>(cam.width / 2)) ++leftHitCount;
+      else ++rightHitCount;
+    }
+  }
+  require(visibleIds.size() >= 2u,
+          "two visible meshes should produce at least two distinct non-zero object IDs");
+  require(leftHitCount > 0 && rightHitCount > 0,
+          "both halves of the image should contain visible object hits");
 }
 
 // -------------------------------------------------------------------------
@@ -451,6 +516,10 @@ void testDoubleSidedBackFaceShading(rt::IRayTracingBackend& backend) {
 
   require(doubleLum > singleLum + 5.0,
           "double-sided back-face quad should become visibly brighter than the single-sided version");
+
+  const size_t centerIdx = pixelIndex(cam.width, static_cast<int>(cam.width / 2), static_cast<int>(cam.height / 2));
+  require(singleSided.objectId[centerIdx] != 0u && doubleSided.objectId[centerIdx] != 0u,
+          "back-face quad should still hit geometry at the center pixel");
 }
 
 // -------------------------------------------------------------------------
@@ -481,11 +550,17 @@ void testDoubleSidedEmissiveBackFaceVisible(rt::IRayTracingBackend& backend) {
   rt::RenderBuffer singleSided = renderEmissiveBackFace(false, 780);
   rt::RenderBuffer doubleSided = renderEmissiveBackFace(true, 781);
 
-  const size_t centerIndex = (cam.height / 2) * cam.width + (cam.width / 2);
-  const glm::vec3 singleCenter = singleSided.color[centerIndex];
-  const glm::vec3 doubleCenter = doubleSided.color[centerIndex];
-  require(glm::length(doubleCenter) > glm::length(singleCenter) + 0.15f,
+  auto averageCenterPatch = [&](const rt::RenderBuffer& buffer) {
+    const glm::vec3 patch = averageCenterPatchVec3(cam, buffer.color);
+    return static_cast<double>(patch.x + patch.y + patch.z);
+  };
+
+  const double singlePatch = averageCenterPatch(singleSided);
+  const double doublePatch = averageCenterPatch(doubleSided);
+  require(doublePatch > singlePatch + 0.05,
           "double-sided emissive quad should stay visible from the back face");
+  require(averageCenterPatchCoverage(cam, doubleSided.objectId) > 0.8,
+          "double-sided emissive quad should still register as visible geometry");
 }
 
 // -------------------------------------------------------------------------
@@ -527,16 +602,63 @@ void testNormalMapAffectsShading(rt::IRayTracingBackend& backend) {
   rt::RenderBuffer mapped = renderNormalMappedQuad(true, 791);
 
   int diffCount = 0;
+  int normalDiffCount = 0;
   double mappedLum = 0.0;
   double flatLum = 0.0;
   for (size_t i = 0; i < flat.color.size(); ++i) {
     flatLum += flat.color[i].x + flat.color[i].y + flat.color[i].z;
     mappedLum += mapped.color[i].x + mapped.color[i].y + mapped.color[i].z;
     if (glm::length(flat.color[i] - mapped.color[i]) > 0.01f) ++diffCount;
+    if (glm::length(flat.normal[i] - mapped.normal[i]) > 0.02f) ++normalDiffCount;
   }
 
   require(diffCount > 20, "normal map should measurably alter the shading");
+  require(normalDiffCount > 20, "normal map should measurably alter the normal buffer");
   require(std::abs(mappedLum - flatLum) > 1.0, "normal map should change the integrated scene luminance");
+}
+
+// -------------------------------------------------------------------------
+// Test 11: material AOVs track metallic / dielectric splits and roughness.
+// -------------------------------------------------------------------------
+void testMaterialAovsTrackSurfaceParameters(rt::IRayTracingBackend& backend) {
+  auto cam = makeCamera();
+  backend.resize(cam.width, cam.height);
+  backend.updateCamera(cam);
+
+  auto cfg = standardConfig();
+  cfg.lighting.mainLightIntensity = 0.0f;
+
+  auto renderAovQuad = [&](float metallic, float roughness, uint32_t hash) {
+    rt::RTScene scene;
+    rt::RTMesh quad = makeQuad(metallic > 0.5f ? "metal_aov_quad" : "dielectric_aov_quad", true,
+                               {0.8f, 0.6f, 0.2f, 1.0f});
+    quad.metallicFactor = metallic;
+    quad.roughnessFactor = roughness;
+    scene.meshes.push_back(quad);
+    scene.hash = hash;
+    backend.setScene(scene);
+    backend.resetAccumulation();
+    backend.renderIteration(cfg);
+    return backend.downloadRenderBuffer();
+  };
+
+  rt::RenderBuffer dielectric = renderAovQuad(0.0f, 0.85f, 800);
+  rt::RenderBuffer metal = renderAovQuad(1.0f, 0.2f, 801);
+
+  const glm::vec3 dielectricDiffuse = averageCenterPatchVec3(cam, dielectric.diffuseAlbedo);
+  const glm::vec3 metalDiffuse = averageCenterPatchVec3(cam, metal.diffuseAlbedo);
+  const glm::vec3 dielectricSpecular = averageCenterPatchVec3(cam, dielectric.specularAlbedo);
+  const glm::vec3 metalSpecular = averageCenterPatchVec3(cam, metal.specularAlbedo);
+  const size_t centerIdx = pixelIndex(cam.width, static_cast<int>(cam.width / 2), static_cast<int>(cam.height / 2));
+  require(dielectric.objectId[centerIdx] != 0u && metal.objectId[centerIdx] != 0u,
+          "AOV test quad should hit geometry at the center pixel");
+  require(std::isfinite(dielectric.roughness[centerIdx]) && std::isfinite(metal.roughness[centerIdx]),
+          "roughness AOV should remain finite at surface hits");
+
+  require(glm::length(dielectricDiffuse) > glm::length(metalDiffuse) + 0.4f,
+          "dielectric surfaces should write substantially more diffuse albedo than metals");
+  require(glm::length(metalSpecular) > glm::length(dielectricSpecular) + 0.4f,
+          "metallic surfaces should write substantially more specular albedo than dielectrics");
 }
 
 } // namespace
@@ -555,6 +677,7 @@ int main() {
     testDoubleSidedBackFaceShading(*backend);
     testDoubleSidedEmissiveBackFaceVisible(*backend);
     testNormalMapAffectsShading(*backend);
+    testMaterialAovsTrackSurfaceParameters(*backend);
 
     std::cout << "rendering_quality_test passed" << std::endl;
     return 0;

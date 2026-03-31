@@ -109,10 +109,16 @@ int main() {
     require(buffer.linearDepth.size() == 64u * 64u, "unexpected linear depth buffer size");
     require(buffer.normal.size() == 64u * 64u, "unexpected normal buffer size");
     require(buffer.objectId.size() == 64u * 64u, "unexpected object id buffer size");
+    require(buffer.diffuseAlbedo.size() == 64u * 64u, "unexpected diffuse albedo buffer size");
+    require(buffer.specularAlbedo.size() == 64u * 64u, "unexpected specular albedo buffer size");
+    require(buffer.roughness.size() == 64u * 64u, "unexpected roughness buffer size");
 
     double colorSum = 0.0;
     double normalSum = 0.0;
     double linearDepthSum = 0.0;
+    double diffuseSum = 0.0;
+    double specularSum = 0.0;
+    double roughnessSum = 0.0;
     for (const auto& c : buffer.color) {
       require(std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z), "non-finite color value");
       colorSum += c.x + c.y + c.z;
@@ -125,9 +131,24 @@ int main() {
       require(std::isfinite(n.x) && std::isfinite(n.y) && std::isfinite(n.z), "non-finite normal value");
       normalSum += std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
     }
+    for (const auto& c : buffer.diffuseAlbedo) {
+      require(std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z), "non-finite diffuse albedo value");
+      diffuseSum += c.x + c.y + c.z;
+    }
+    for (const auto& c : buffer.specularAlbedo) {
+      require(std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z), "non-finite specular albedo value");
+      specularSum += c.x + c.y + c.z;
+    }
+    for (float r : buffer.roughness) {
+      require(std::isfinite(r), "non-finite roughness value");
+      roughnessSum += r;
+    }
     require(colorSum > 0.0, "expected non-black output from backend");
     require(linearDepthSum > 0.0, "expected positive hit depths from backend");
     require(normalSum > 0.0, "expected non-zero normal output from backend");
+    require(diffuseSum > 0.0, "expected non-zero diffuse albedo output from backend");
+    require(specularSum > 0.0, "expected non-zero specular albedo output from backend");
+    require(roughnessSum > 0.0, "expected non-zero roughness output from backend");
     require(firstFrame.depth == buffer.depth, "depth buffer should stay stable after the first accumulated frame");
     require(firstFrame.linearDepth == buffer.linearDepth,
             "linear depth buffer should stay stable after the first accumulated frame");

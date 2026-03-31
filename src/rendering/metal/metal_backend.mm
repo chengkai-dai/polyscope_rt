@@ -188,6 +188,9 @@ public:
     latestBuffer_.linearDepth.assign(pixelCount, -1.0f);
     latestBuffer_.normal.assign(pixelCount, glm::vec3(0.0f, 1.0f, 0.0f));
     latestBuffer_.objectId.assign(pixelCount, 0u);
+    latestBuffer_.diffuseAlbedo.assign(pixelCount, glm::vec3(0.0f));
+    latestBuffer_.specularAlbedo.assign(pixelCount, glm::vec3(0.0f));
+    latestBuffer_.roughness.assign(pixelCount, 0.0f);
     latestBuffer_.detailContour.assign(pixelCount, 0.0f);
     latestBuffer_.detailContourRaw.assign(pixelCount, 0.0f);
     latestBuffer_.objectContour.assign(pixelCount, 0.0f);
@@ -489,6 +492,9 @@ public:
     const auto* linearDepth = static_cast<const float*>(linearDepthBuffer_.contents);
     const auto* normal = static_cast<const simd_float4*>(normalBuffer_.contents);
     const auto* objectId = static_cast<const uint32_t*>(objectIdBuffer_.contents);
+    const auto* diffuseAlbedo = static_cast<const simd_float4*>(diffuseAlbedoBuffer_.contents);
+    const auto* specularAlbedo = static_cast<const simd_float4*>(specularAlbedoBuffer_.contents);
+    const auto* roughness = static_cast<const float*>(roughnessAuxBuffer_.contents);
 
     if (lastEnableMetalFX_ && metalFXTonemappedBuffer_ != nil) {
       const uint32_t outW = metalFXOutputWidth_;
@@ -503,6 +509,9 @@ public:
       latestBuffer_.linearDepth.resize(outPixels);
       latestBuffer_.normal.resize(outPixels);
       latestBuffer_.objectId.resize(outPixels);
+      latestBuffer_.diffuseAlbedo.resize(outPixels);
+      latestBuffer_.specularAlbedo.resize(outPixels);
+      latestBuffer_.roughness.resize(outPixels);
 
       for (size_t y = 0; y < outH; ++y) {
         for (size_t x = 0; x < outW; ++x) {
@@ -516,6 +525,11 @@ public:
           latestBuffer_.linearDepth[outIdx] = linearDepth[srcIdx];
           latestBuffer_.normal[outIdx] = glm::vec3(normal[srcIdx].x, normal[srcIdx].y, normal[srcIdx].z);
           latestBuffer_.objectId[outIdx] = objectId[srcIdx];
+          latestBuffer_.diffuseAlbedo[outIdx] =
+              glm::vec3(diffuseAlbedo[srcIdx].x, diffuseAlbedo[srcIdx].y, diffuseAlbedo[srcIdx].z);
+          latestBuffer_.specularAlbedo[outIdx] =
+              glm::vec3(specularAlbedo[srcIdx].x, specularAlbedo[srcIdx].y, specularAlbedo[srcIdx].z);
+          latestBuffer_.roughness[outIdx] = roughness[srcIdx];
         }
       }
       // Contour data: nearest-neighbor upsampled from render resolution
@@ -555,12 +569,18 @@ public:
       latestBuffer_.linearDepth.resize(pixelCount);
       latestBuffer_.normal.resize(pixelCount);
       latestBuffer_.objectId.resize(pixelCount);
+      latestBuffer_.diffuseAlbedo.resize(pixelCount);
+      latestBuffer_.specularAlbedo.resize(pixelCount);
+      latestBuffer_.roughness.resize(pixelCount);
       for (size_t i = 0; i < pixelCount; ++i) {
         latestBuffer_.color[i] = glm::vec3(output[i].x, output[i].y, output[i].z);
         latestBuffer_.depth[i] = depth[i];
         latestBuffer_.linearDepth[i] = linearDepth[i];
         latestBuffer_.normal[i] = glm::vec3(normal[i].x, normal[i].y, normal[i].z);
         latestBuffer_.objectId[i] = objectId[i];
+        latestBuffer_.diffuseAlbedo[i] = glm::vec3(diffuseAlbedo[i].x, diffuseAlbedo[i].y, diffuseAlbedo[i].z);
+        latestBuffer_.specularAlbedo[i] = glm::vec3(specularAlbedo[i].x, specularAlbedo[i].y, specularAlbedo[i].z);
+        latestBuffer_.roughness[i] = roughness[i];
       }
 
       metal_rt::IMetalPostProcessPreset* activePreset =

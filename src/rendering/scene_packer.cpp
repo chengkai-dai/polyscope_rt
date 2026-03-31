@@ -149,18 +149,30 @@ void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
     }
 
     for (const glm::uvec3& tri : mesh.indices) {
-      acc.accelIndices.push_back({baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z});
+      glm::uvec3 packedTri = tri;
+      if (hasVertexNormals) {
+        const glm::vec3 averagedNormal =
+            glm::normalize(worldNormals[tri.x] + worldNormals[tri.y] + worldNormals[tri.z]);
+        const glm::vec3 triCross =
+            glm::cross(worldVertices[tri.y] - worldVertices[tri.x], worldVertices[tri.z] - worldVertices[tri.x]);
+        if (glm::dot(averagedNormal, averagedNormal) > 1e-10f && glm::dot(triCross, triCross) > 1e-10f &&
+            glm::dot(averagedNormal, triCross) < 0.0f) {
+          packedTri = glm::uvec3(tri.x, tri.z, tri.y);
+        }
+      }
+
+      acc.accelIndices.push_back({baseVertex + packedTri.x, baseVertex + packedTri.y, baseVertex + packedTri.z});
       GPUTriangle triangle{};
       triangle.indicesMaterial =
-          simd_make_uint4(baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z, materialIndex);
+          simd_make_uint4(baseVertex + packedTri.x, baseVertex + packedTri.y, baseVertex + packedTri.z, materialIndex);
       triangle.objectFlags =
           simd_make_uint4(meshObjectId, hasVertexNormals ? 1u : 0u, mesh.wireframe ? 1u : 0u, 0u);
       const uint32_t triangleIndex = static_cast<uint32_t>(acc.shaderTriangles.size());
       acc.shaderTriangles.push_back(triangle);
       if (emitsLight) {
-        const glm::vec3& wp0 = worldVertices[tri.x];
-        const glm::vec3& wp1 = worldVertices[tri.y];
-        const glm::vec3& wp2 = worldVertices[tri.z];
+        const glm::vec3& wp0 = worldVertices[packedTri.x];
+        const glm::vec3& wp1 = worldVertices[packedTri.y];
+        const glm::vec3& wp2 = worldVertices[packedTri.z];
         const float triangleArea = 0.5f * glm::length(glm::cross(wp1 - wp0, wp2 - wp0));
         const float selectionWeight = triangleArea * emissivePowerEstimate;
         if (triangleArea <= 1e-8f || selectionWeight <= 1e-8f) continue;

@@ -1,4 +1,5 @@
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -10,9 +11,13 @@
 
 namespace {
 
+const std::filesystem::path kSourceDir = RT_SOURCE_DIR;
+
 std::string readTextFile(const std::string& path) {
-  std::ifstream in(path);
-  if (!in.good()) throw std::runtime_error("failed to open file: " + path);
+  const std::filesystem::path resolvedPath =
+      std::filesystem::path(path).is_absolute() ? std::filesystem::path(path) : (kSourceDir / path);
+  std::ifstream in(resolvedPath);
+  if (!in.good()) throw std::runtime_error("failed to open file: " + resolvedPath.string());
   std::ostringstream buffer;
   buffer << in.rdbuf();
   return buffer.str();

@@ -309,12 +309,14 @@ install(
 function(polyscope_rt_add_private_test target_name source_file)
   add_executable(${target_name} ${source_file})
   target_link_libraries(${target_name} PRIVATE polyscope_rt_plugin)
+  target_compile_definitions(${target_name} PRIVATE RT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_include_directories(
     ${target_name}
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   add_test(NAME ${target_name} COMMAND ${target_name})
+  set_tests_properties(${target_name} PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endfunction()
 
 if(BUILD_TESTING)
@@ -329,4 +331,5 @@ if(BUILD_TESTING)
   polyscope_rt_add_private_test(rendering_quality_test tests/rendering_quality_test.cpp)
   polyscope_rt_add_private_test(environment_model_test tests/environment_model_test.cpp)
   polyscope_rt_add_private_test(architecture_constraints_test tests/architecture_constraints_test.cpp)
+  polyscope_rt_add_private_test(scene_packer_test tests/scene_packer_test.cpp)
 endif()
