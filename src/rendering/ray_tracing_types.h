@@ -24,6 +24,8 @@ struct RTTexture {
 };
 
 struct RTPunctualLight {
+  // Analytic light source with no explicit scene geometry. Mirrors the common
+  // DCC / renderer distinction between punctual lights and emissive meshes.
   RTPunctualLightType type = RTPunctualLightType::Directional;
   glm::vec3 color{1.0f, 1.0f, 1.0f};
   float intensity = 1.0f;
@@ -176,7 +178,7 @@ struct LightingSettings {
   glm::vec3 areaLightEmission{18.0f, 18.0f, 18.0f};
   float environmentIntensity = 0.3f;
   glm::vec3 environmentTint{1.0f, 1.0f, 1.0f};
-  bool enableAreaLight = true;
+  bool enableAreaLight = false;
 };
 
 struct ToonSettings {

@@ -13,13 +13,11 @@
 //   Left  (x ≈ -2.0)  ─ Mesh quantity: vertex scalar + isolines  (colormap viridis)
 //   Right (x ≈ +2.0)  ─ Mesh quantity: face color (per-face RGB)
 //   Far   (z ≈ +1.6)  ─ Mesh quantity: vertex color + wireframe
-//   Center top          ─ Emissive sphere (visible light)
 //   Front right         ─ Point cloud with per-point scalar colormap
 //
 // Lighting:
-//   • Soft warm directional main light from upper-left
-//   • Cold blue point light behind the scene
-//   • Warm orange area light above the central axis
+//   • Analytic sun light for broad directional shaping
+//   • Finite area light for broad overhead highlights
 
 #include <array>
 #include <cmath>
@@ -361,16 +359,7 @@ static void addFaceScalarContourMesh() {
 }
 
 // ---------------------------------------------------------------------------
-// Section I: Emissive sphere (acts as a visible light source)
-// ---------------------------------------------------------------------------
-static void addEmissiveSphere() {
-  auto m = makeSphere({0.0f, 1.5f, -0.3f}, 0.12f, 16, 24);
-  ps::registerSurfaceMesh("emissive-sun", m.verts, m.faces);
-  ps::applyMaterial("emissive-sun", ps::Emissive({1.0f, 0.95f, 0.8f}, 8.0f));
-}
-
-// ---------------------------------------------------------------------------
-// Section J: Rainbow point cloud (right side)
+// Section I: Rainbow point cloud (right side)
 // ---------------------------------------------------------------------------
 static void addPointCloud() {
   constexpr int N      = 800;
@@ -404,7 +393,7 @@ static void addPointCloud() {
 // Section K: Mirror-ball that demonstrates reflections
 // ---------------------------------------------------------------------------
 static void addMirrorBall() {
-  auto m = makeSphere({0.0f, 0.0f, -1.4f}, 0.36f, 48, 64);
+  auto m = makeSphere({0.0f, 0.0f, 2.45f}, 0.36f, 48, 64);
   ps::registerSurfaceMesh("mirror-ball", m.verts, m.faces);
   ps::applyMaterial("mirror-ball", ps::Mirror());
 }
@@ -421,33 +410,18 @@ int main() {
   ps::setBackgroundColor({0.10f, 0.13f, 0.22f});
 
   // Warm main directional light from upper-left front.
+  // Analytic sun-style light: affects shading, but has no visible bulb.
   ps::setMainLight({-0.5f, -1.0f, 0.4f},
                    {1.0f, 0.95f, 0.85f},
                    2.0f);
 
-  // Cold-blue fill light in front of Row A/B.
-  ps::addPointLight({0.0f, 1.8f, -4.0f},
-                    {0.5f, 0.65f, 1.0f},
-                    5.0f);
-
-  // Warm orange point light on the right side.
-  ps::addPointLight({2.5f, 1.5f, -0.3f},
-                    {1.0f, 0.6f, 0.2f},
-                    4.0f);
-
-  // Cold fill from the left, aimed at the metal / dielectric rows.
-  ps::addPointLight({-2.5f, 1.5f, -1.0f},
-                    {0.8f, 0.9f, 1.0f},
-                    3.5f);
-
   // Large area light above spanning all four rows.
   // Centre (z=-0.35), v-half-width 1.4 -> covers z ~= -1.75 ... +1.05.
-  // Area-light emission is one-sided, so keep the basis winding such that it
-  // emits downward into the scene.
-  ps::setAreaLight({0.0f, 2.2f, -0.35f},
-                   {1.2f, 0.0f, 0.0f},
-                   {0.0f, 0.0f, -1.4f},
-                   {1.5f, 1.46f, 1.43f});
+  // This finite light is also visible in glossy reflections.
+  // ps::setAreaLight({0.0f, 2.2f, -0.35f},
+  //                  {1.2f, 0.0f, 0.0f},
+  //                  {0.0f, 0.0f, -1.4f},
+  //                  {1.5f, 1.46f, 1.43f});
 
   ps::setAmbientFloor(0.07f);
   // Brighter environment tint – feeds the ambient IBL term added to the PBR shader.
@@ -466,9 +440,15 @@ int main() {
   addFaceScalarContourMesh();      // Far left sphere: face scalar + contour lines
 
   addMirrorBall();            // Large mirror ball at back-centre
-  addEmissiveSphere();        // Glowing sphere above scene
-
   addPointCloud();            // Rainbow Fibonacci point cloud (right back)
+
+  // Stable initial camera framing for the full showcase. Without this, the
+  // default view can occasionally start inside scene geometry.
+  ps::view::lookAt({0.0f, 2.4f, -6.4f},
+                   {0.0f, 0.25f, 0.35f},
+                   {0.0f, 1.0f, 0.0f},
+                   false);
+  ps::view::fov = 50.0f;
 
   ps::show();
   return 0;

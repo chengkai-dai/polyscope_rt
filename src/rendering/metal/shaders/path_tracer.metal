@@ -17,6 +17,8 @@ constant uint kInvalidTriangleIndex = 0xFFFFFFFFu;
 constant uint kInvalidLightIndex = 0xFFFFFFFFu;
 constant uint kEnvironmentSampleWidth = 64u;
 constant uint kEnvironmentSampleHeight = 32u;
+constant float kRayMinDistance = 1e-3f;
+constant float kRayMaxDistance = 1e6f;
 
 struct BsdfEvalResult {
   float3 value = float3(0.0f);
@@ -31,10 +33,27 @@ struct BsdfEvalResult {
 
 struct BsdfSampleResult {
   bool valid = false;
-  bool delta = false;
+  bool skipLightHitMIS = false;
   float3 direction = float3(0.0f);
   float3 throughput = float3(0.0f);
   float pdf = 0.0f;
+};
+
+struct OpaqueBsdfSamplingWeights {
+  float diffuseWeight = 0.0f;
+  float specularWeight = 0.0f;
+  float diffuseProb = 0.0f;
+  float specularProb = 1.0f;
+};
+
+struct PathLightState {
+  float bsdfPdf = 1.0f;
+  bool skipLightHitMIS = true;
+};
+
+struct VisibleLightHit {
+  float3 radiance = float3(0.0f);
+  float lightPdf = 0.0f;
 };
 
 float3 orientedGeomNormal(float3 geomNormal, float3 rayDir) {
@@ -46,6 +65,28 @@ float3 offsetRayOrigin(float3 hitPos, float3 geomNormal, float3 rayDir) {
   float3 dir = normalize(rayDir);
   float3 offsetN = orientedGeomNormal(geomNormal, dir);
   return hitPos + offsetN * 2e-3f + dir * 5e-4f;
+}
+
+void initializePathRay(thread ray& pathRay, float3 origin, float3 direction) {
+  pathRay.origin = origin;
+  pathRay.direction = normalize(direction);
+  pathRay.min_distance = kRayMinDistance;
+  pathRay.max_distance = kRayMaxDistance;
+}
+
+void spawnPathRay(thread ray& pathRay, float3 hitPos, float3 geomNormal, float3 direction) {
+  initializePathRay(pathRay, offsetRayOrigin(hitPos, geomNormal, direction), direction);
+}
+
+PathLightState deltaPathLightState() {
+  return PathLightState();
+}
+
+PathLightState makePathLightState(float bsdfPdf, bool skipLightHitMIS) {
+  PathLightState state;
+  state.bsdfPdf = bsdfPdf;
+  state.skipLightHitMIS = skipLightHitMIS;
+  return state;
 }
 
 float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 geomNormal, float3 normal,
@@ -263,13 +304,30 @@ float luminance(float3 c) {
   return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
-float computeSpecularSamplingProbability(float3 F, float3 baseColor, float metallic) {
+OpaqueBsdfSamplingWeights computeOpaqueBsdfSamplingWeights(float3 F, float3 baseColor, float metallic) {
+  OpaqueBsdfSamplingWeights weights;
   float3 kD = (1.0f - F) * (1.0f - metallic);
-  float specWeight = luminance(max(F, float3(0.0f)));
-  float diffuseWeight = luminance(max(baseColor * kD, float3(0.0f)));
-  float totalWeight = specWeight + diffuseWeight;
-  if (totalWeight <= 1e-6f || diffuseWeight <= 1e-6f) return 1.0f;
-  return clamp(specWeight / totalWeight, 0.04f, 0.999f);
+  weights.specularWeight = luminance(max(F, float3(0.0f)));
+  weights.diffuseWeight = luminance(max(baseColor * kD, float3(0.0f)));
+
+  float totalWeight = weights.specularWeight + weights.diffuseWeight;
+  if (totalWeight <= 1e-6f || weights.diffuseWeight <= 1e-6f) {
+    weights.diffuseProb = 0.0f;
+    weights.specularProb = 1.0f;
+    return weights;
+  }
+
+  weights.specularProb = clamp(weights.specularWeight / totalWeight, 0.04f, 0.999f);
+  weights.diffuseProb = 1.0f - weights.specularProb;
+  return weights;
+}
+
+bool shouldSkipLightHitMISForOpaqueSample(bool sampledSpecular, OpaqueBsdfSamplingWeights weights) {
+  // Single-lobe opaque materials only continue through the specular branch in
+  // this BSDF model, so visible-light hits should be attributed to the BSDF
+  // continuation directly instead of being penalized against a non-existent
+  // diffuse light-sampling alternative.
+  return sampledSpecular && weights.diffuseWeight <= 1e-6f;
 }
 
 float3 cosineWeightedHemisphere(float3 normal, thread uint& rng) {
@@ -428,8 +486,7 @@ BsdfEvalResult evaluateOpaqueBsdf(float3 N, float3 V, float3 L, float3 albedo, f
   float3 diffuse = kD * albedo / kPi;
 
   float3 viewF = fresnelSchlick(NdotV, F0, grazingMax);
-  float specProb = computeSpecularSamplingProbability(viewF, albedo, metallic);
-  float diffProb = 1.0f - specProb;
+  OpaqueBsdfSamplingWeights weights = computeOpaqueBsdfSamplingWeights(viewF, albedo, metallic);
 
   out.value = diffuse + specular;
   out.diffuse = diffuse;
@@ -437,7 +494,7 @@ BsdfEvalResult evaluateOpaqueBsdf(float3 N, float3 V, float3 L, float3 albedo, f
   out.fresnel = F;
   out.diffusePdf = NdotL / kPi;
   out.specularPdf = ggxReflectionPdf(N, V, L, roughness);
-  out.pdf = diffProb * out.diffusePdf + specProb * out.specularPdf;
+  out.pdf = weights.diffuseProb * out.diffusePdf + weights.specularProb * out.specularPdf;
   out.NdotL = NdotL;
   return out;
 }
@@ -471,8 +528,8 @@ BsdfSampleResult sampleOpaqueBsdf(float3 N, float3 V, float3 albedo, float metal
   float grazingMax = mix(clamp(dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, metallic);
   float NdotV = max(dot(N, V), 0.0f);
   float3 viewF = fresnelSchlick(NdotV, F0, grazingMax);
-  float specProb = computeSpecularSamplingProbability(viewF, albedo, metallic);
-  bool sampledSpecular = rand01(rng) < specProb;
+  OpaqueBsdfSamplingWeights weights = computeOpaqueBsdfSamplingWeights(viewF, albedo, metallic);
+  bool sampledSpecular = rand01(rng) < weights.specularProb;
   if (sampledSpecular) {
     out.direction = sampleGGXBounce(N, V, roughness, rng);
     if (dot(out.direction, N) <= 0.0f) out.direction = reflect(-V, N);
@@ -484,10 +541,7 @@ BsdfSampleResult sampleOpaqueBsdf(float3 N, float3 V, float3 albedo, float metal
   if (eval.NdotL <= 0.0f || eval.pdf <= 0.0f || all(eval.value <= 0.0f)) return out;
 
   out.valid = true;
-  // Treat pure-specular continuations as delta-like for light-hit MIS. This
-  // keeps visible emitters and analytic lights from collapsing to dark patches
-  // on fully metallic reflections in low-sample renders.
-  out.delta = sampledSpecular && specProb >= 0.999f;
+  out.skipLightHitMIS = shouldSkipLightHitMISForOpaqueSample(sampledSpecular, weights);
   out.pdf = eval.pdf;
   out.throughput = eval.value * eval.NdotL / eval.pdf;
   return out;
@@ -726,10 +780,6 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                          intersection_function_table<curve_data, triangle_data, instancing> ftable,
                          device const float* isoScalars, float tanHalfFov);
-
-float3 sampleMissRadiance(float3 dir, constant GPULighting& lighting) {
-  return evaluateEnvironmentRadiance(dir, lighting);
-}
 
 SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam, uint segmentId,
                              device const GPUCurvePrimitive* curvePrimitives,
@@ -1007,8 +1057,8 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   return out;
 }
 
-float emissiveTriangleHitPdf(SurfaceHitInfo surf, float3 incomingDir,
-                             device const GPUEmissiveTriangle* emissiveTriangles) {
+float emissiveSurfaceLightPdf(SurfaceHitInfo surf, float3 incomingDir,
+                              device const GPUEmissiveTriangle* emissiveTriangles) {
   if (surf.emissiveLightIndex == kInvalidLightIndex) return 0.0f;
 
   GPUEmissiveTriangle emissive = emissiveTriangles[surf.emissiveLightIndex];
@@ -1019,29 +1069,38 @@ float emissiveTriangleHitPdf(SurfaceHitInfo surf, float3 incomingDir,
   return selectionPdf * max(surf.distance * surf.distance, 1e-6f) / max(lightCos * area, 1e-5f);
 }
 
-float emissiveSurfaceMISWeight(SurfaceHitInfo surf, float3 incomingDir, float bsdfPdf,
-                               bool prevWasDelta,
+float lightHitMISWeight(PathLightState state, float lightPdf) {
+  if (state.skipLightHitMIS || lightPdf <= 0.0f) return 1.0f;
+  return powerHeuristic(state.bsdfPdf, lightPdf);
+}
+
+float emissiveSurfaceMISWeight(SurfaceHitInfo surf, float3 incomingDir, PathLightState state,
                                device const GPUEmissiveTriangle* emissiveTriangles) {
-  if (prevWasDelta || surf.emissiveLightIndex == kInvalidLightIndex) return 1.0f;
-  float lightPdf = emissiveTriangleHitPdf(surf, incomingDir, emissiveTriangles);
+  if (surf.emissiveLightIndex == kInvalidLightIndex) return 1.0f;
+  float lightPdf = emissiveSurfaceLightPdf(surf, incomingDir, emissiveTriangles);
   if (lightPdf <= 0.0f) return 1.0f;
-  return powerHeuristic(bsdfPdf, lightPdf);
+  return lightHitMISWeight(state, lightPdf);
 }
 
-float environmentMISWeight(float3 dir, float bsdfPdf, bool prevWasDelta,
-                           device const GPUEnvironmentSampleCell* environmentCells) {
-  if (prevWasDelta) return 1.0f;
-  float lightPdf = environmentDirectionalPdf(dir, environmentCells);
-  if (lightPdf <= 0.0f) return 1.0f;
-  return powerHeuristic(bsdfPdf, lightPdf);
+VisibleLightHit sampleVisibleMissLight(ray currentRay, constant GPULighting& lighting,
+                                       device const GPUEnvironmentSampleCell* environmentCells) {
+  VisibleLightHit out;
+  // Only finite visible emitters and the environment participate here.
+  // Punctual lights remain analytic direct-lighting terms and do not become
+  // visible geometry in camera / reflection rays.
+  if (intersectVisibleAreaLight(currentRay, lighting, out.radiance, out.lightPdf)) {
+    return out;
+  }
+
+  out.radiance = evaluateEnvironmentRadiance(currentRay.direction, lighting);
+  out.lightPdf = environmentDirectionalPdf(currentRay.direction, environmentCells);
+  return out;
 }
 
-float areaLightMISWeight(ray currentRay, float bsdfPdf, bool prevWasDelta, constant GPULighting& lighting) {
-  if (prevWasDelta) return 1.0f;
-  float3 radiance;
-  float lightPdf = 0.0f;
-  if (!intersectVisibleAreaLight(currentRay, lighting, radiance, lightPdf) || lightPdf <= 0.0f) return 1.0f;
-  return powerHeuristic(bsdfPdf, lightPdf);
+float3 evaluateVisibleMissLight(ray currentRay, PathLightState state, constant GPULighting& lighting,
+                                device const GPUEnvironmentSampleCell* environmentCells) {
+  VisibleLightHit visibleLight = sampleVisibleMissLight(currentRay, lighting, environmentCells);
+  return visibleLight.radiance * lightHitMISWeight(state, visibleLight.lightPdf);
 }
 
 float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 normal, float3 viewDir,
@@ -1211,6 +1270,28 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 normal, floa
   return specularLighting;
 }
 
+SurfaceHitInfo intersectPathSurface(ray currentRay, device const float4* positions, device const float4* normals,
+                                    device const float2* texcoords, device const float4* vertexColors,
+                                    device const GPUTriangle* triangles,
+                                    device const GPUMaterial* materials, device const GPUTexture* textures,
+                                    device const float4* texturePixels,
+                                    device const GPUCurvePrimitive* curvePrimitives,
+                                    device const GPUPointPrimitive* pointPrimitives,
+                                    constant GPUFrameUniforms& frame,
+                                    intersector<curve_data, triangle_data, instancing> isector,
+                                    instance_acceleration_structure scene, instance_acceleration_structure pointScene,
+                                    intersection_function_table<curve_data, triangle_data, instancing> ftable,
+                                    device const float* isoScalars, float tanHalfFov) {
+  SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
+                                         curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
+  applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
+  SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
+  if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
+    surf = planeSurf;
+  }
+  return surf;
+}
+
 float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit, device const float4* positions, device const float4* normals,
                          device const float2* texcoords, device const float4* vertexColors,
                          device const GPUTriangle* triangles,
@@ -1227,32 +1308,18 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
   float3 currentViewDir = viewDir;
-  float prevBsdfPdf = 1.0f;
-  bool prevWasDelta = true;
+  PathLightState prevLightState = deltaPathLightState();
 
   for (uint bounce = 0u; bounce < max(frame.maxBounces, 1u); ++bounce) {
     SurfaceHitInfo surf;
     if (bounce == 0u && firstHit.hit != 0u) {
       surf = firstHit;
     } else {
-      surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                              curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
-      applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
-      SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
-      if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
-        surf = planeSurf;
-      }
+      surf = intersectPathSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
+                                  curvePrimitives, pointPrimitives, frame, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
     }
     if (surf.hit == 0u) {
-      float3 areaRadiance;
-      float areaPdf = 0.0f;
-      if (intersectVisibleAreaLight(currentRay, lighting, areaRadiance, areaPdf)) {
-        float missWeight = areaLightMISWeight(currentRay, prevBsdfPdf, prevWasDelta, lighting);
-        radiance += throughput * areaRadiance * missWeight;
-      } else {
-        float missWeight = environmentMISWeight(currentRay.direction, prevBsdfPdf, prevWasDelta, environmentCells);
-        radiance += throughput * sampleMissRadiance(currentRay.direction, lighting) * missWeight;
-      }
+      radiance += throughput * evaluateVisibleMissLight(currentRay, prevLightState, lighting, environmentCells);
       break;
     }
 
@@ -1265,19 +1332,14 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
           bool front = dot(currentRay.direction, surf.normal) < 0.0f;
           float3 rN = front ? surf.normal : -surf.normal;
           currentRay.direction = reflect(currentRay.direction, rN);
-          currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-          currentRay.min_distance = 1e-3f;
-          currentRay.max_distance = 1e6f;
+          spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
           currentViewDir = -currentRay.direction;
-          prevBsdfPdf = 1.0f;
-          prevWasDelta = true;
+          prevLightState = deltaPathLightState();
           continue;
         }
       }
       if (rand01(rng) > surf.opacity) {
-        currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-        currentRay.min_distance = 1e-3f;
-        currentRay.max_distance = 1e6f;
+        spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
         continue;
       }
     }
@@ -1288,7 +1350,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
     }
 
     if (any(surf.emissive > 0.0f)) {
-      float emissionWeight = emissiveSurfaceMISWeight(surf, currentRay.direction, prevBsdfPdf, prevWasDelta, emissiveTriangles);
+      float emissionWeight = emissiveSurfaceMISWeight(surf, currentRay.direction, prevLightState, emissiveTriangles);
       radiance += throughput * surf.emissive * emissionWeight;
     }
 
@@ -1308,20 +1370,15 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       float fresnel = f0 + (1.0f - f0) * pow(1.0f - cosTheta, 5.0f);
       if (cannotRefract) {
         currentRay.direction = reflect(currentRay.direction, orientedN);
-        currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-        currentRay.min_distance = 1e-3f;
-        currentRay.max_distance = 1e6f;
+        spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
         currentViewDir = -currentRay.direction;
-        prevBsdfPdf = 1.0f;
-        prevWasDelta = true;
+        prevLightState = deltaPathLightState();
         continue;
       }
 
       ray reflectedRay;
       reflectedRay.direction = reflect(currentRay.direction, orientedN);
-      reflectedRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, reflectedRay.direction);
-      reflectedRay.min_distance = 1e-3f;
-      reflectedRay.max_distance = 1e6f;
+      spawnPathRay(reflectedRay, surf.hitPos, surf.geomNormal, reflectedRay.direction);
       radiance += throughput *
                   traceSpecularPath(reflectedRay, max(frame.maxBounces - bounce - 1u, 1u), positions, normals, texcoords, vertexColors,
                                     triangles, materials, textures, texturePixels, sceneLights, emissiveTriangles, environmentCells, curvePrimitives, pointPrimitives,
@@ -1331,12 +1388,9 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       float3 tint = mix(float3(1.0f), surf.baseColor, 0.08f);
       throughput *= tint * surf.transmission * max(1.0f - fresnel, 1e-3f);
       currentRay.direction = normalize(refract(currentRay.direction, orientedN, eta));
-      currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-      currentRay.min_distance = 1e-3f;
-      currentRay.max_distance = 1e6f;
+      spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
       currentViewDir = -currentRay.direction;
-      prevBsdfPdf = 1.0f;
-      prevWasDelta = true;
+      prevLightState = deltaPathLightState();
       continue;
     }
 
@@ -1351,8 +1405,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
 
     throughput *= bsdfSample.throughput;
     currentRay.direction = bsdfSample.direction;
-    prevBsdfPdf = bsdfSample.pdf;
-    prevWasDelta = bsdfSample.delta;
+    prevLightState = makePathLightState(bsdfSample.pdf, bsdfSample.skipLightHitMIS);
 
     if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
 
@@ -1362,9 +1415,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       throughput /= rrProb;
     }
 
-    currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-    currentRay.min_distance = 1e-3f;
-    currentRay.max_distance = 1e6f;
+    spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
     currentViewDir = -currentRay.direction;
   }
 
@@ -1387,27 +1438,13 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
   float3 currentViewDir = -currentRay.direction;
-  float prevBsdfPdf = 1.0f;
-  bool prevWasDelta = true;
+  PathLightState prevLightState = deltaPathLightState();
 
   for (uint bounce = 0u; bounce < max(remainingBounces, 1u); ++bounce) {
-    SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
-    applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
-    SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
-    if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
-      surf = planeSurf;
-    }
+    SurfaceHitInfo surf = intersectPathSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
+                                               curvePrimitives, pointPrimitives, frame, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
     if (surf.hit == 0u) {
-      float3 areaRadiance;
-      float areaPdf = 0.0f;
-      if (intersectVisibleAreaLight(currentRay, lighting, areaRadiance, areaPdf)) {
-        float missWeight = areaLightMISWeight(currentRay, prevBsdfPdf, prevWasDelta, lighting);
-        radiance += throughput * areaRadiance * missWeight;
-      } else {
-        float missWeight = environmentMISWeight(currentRay.direction, prevBsdfPdf, prevWasDelta, environmentCells);
-        radiance += throughput * sampleMissRadiance(currentRay.direction, lighting) * missWeight;
-      }
+      radiance += throughput * evaluateVisibleMissLight(currentRay, prevLightState, lighting, environmentCells);
       break;
     }
 
@@ -1420,19 +1457,14 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
           bool front = dot(currentRay.direction, surf.normal) < 0.0f;
           float3 rN = front ? surf.normal : -surf.normal;
           currentRay.direction = reflect(currentRay.direction, rN);
-          currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-          currentRay.min_distance = 1e-3f;
-          currentRay.max_distance = 1e6f;
+          spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
           currentViewDir = -currentRay.direction;
-          prevBsdfPdf = 1.0f;
-          prevWasDelta = true;
+          prevLightState = deltaPathLightState();
           continue;
         }
       }
       if (rand01(rng) > surf.opacity) {
-        currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-        currentRay.min_distance = 1e-3f;
-        currentRay.max_distance = 1e6f;
+        spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
         continue;
       }
     }
@@ -1443,7 +1475,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     }
 
     if (any(surf.emissive > 0.0f)) {
-      float emissionWeight = emissiveSurfaceMISWeight(surf, currentRay.direction, prevBsdfPdf, prevWasDelta, emissiveTriangles);
+      float emissionWeight = emissiveSurfaceMISWeight(surf, currentRay.direction, prevLightState, emissiveTriangles);
       radiance += throughput * surf.emissive * emissionWeight;
     }
 
@@ -1466,12 +1498,9 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
         currentRay.direction = normalize(refract(currentRay.direction, orientedN, eta));
       }
 
-      currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-      currentRay.min_distance = 1e-3f;
-      currentRay.max_distance = 1e6f;
+      spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
       currentViewDir = -currentRay.direction;
-      prevBsdfPdf = 1.0f;
-      prevWasDelta = true;
+      prevLightState = deltaPathLightState();
       continue;
     }
 
@@ -1486,8 +1515,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
 
     throughput *= bsdfSample.throughput;
     currentRay.direction = bsdfSample.direction;
-    prevBsdfPdf = bsdfSample.pdf;
-    prevWasDelta = bsdfSample.delta;
+    prevLightState = makePathLightState(bsdfSample.pdf, bsdfSample.skipLightHitMIS);
 
     if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
     if (bounce >= 2u) {
@@ -1496,9 +1524,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       throughput /= rrProb;
     }
 
-    currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
-    currentRay.min_distance = 1e-3f;
-    currentRay.max_distance = 1e6f;
+    spawnPathRay(currentRay, surf.hitPos, surf.geomNormal, currentRay.direction);
     currentViewDir = -currentRay.direction;
   }
 
@@ -1569,10 +1595,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     float3 direction = normalize(camera.lookDir.xyz + ndcX * camera.rightDir.xyz + ndcY * camera.upDir.xyz);
 
     ray currentRay;
-    currentRay.origin = camera.position.xyz;
-    currentRay.direction = direction;
-    currentRay.min_distance = 1e-3f;
-    currentRay.max_distance = 1e6f;
+    initializePathRay(currentRay, camera.position.xyz, direction);
 
     float3 sampleColor = float3(0.0f);
     float sampleAlpha = 1.0f;
@@ -1580,13 +1603,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     // Pre-compute tan(fov/2) for contour screen-space gradient approximation.
     float tanHalfFov = tan(0.5f * camera.clipData.x);
 
-    SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                           curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
-    applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
-    SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
-    if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
-      surf = planeSurf;
-    }
+    SurfaceHitInfo surf = intersectPathSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
+                                               curvePrimitives, pointPrimitives, frame, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
     if (surf.hit != 0u) {
       if (frame.renderMode == 0u) {
         sampleColor =
@@ -1643,13 +1661,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
         firstObjectId = surf.objectId;
       }
     } else {
-      float3 areaRadiance;
-      float areaPdf = 0.0f;
-      if (intersectVisibleAreaLight(currentRay, lighting, areaRadiance, areaPdf)) {
-        sampleColor = areaRadiance;
-      } else {
-        sampleColor = sampleMissRadiance(direction, lighting);
-      }
+      sampleColor = evaluateVisibleMissLight(currentRay, deltaPathLightState(), lighting, environmentCells);
       if (firstFrameSample) {
         firstDepth = kBackgroundDepth;
         firstLinearDepth = -1.0f;
