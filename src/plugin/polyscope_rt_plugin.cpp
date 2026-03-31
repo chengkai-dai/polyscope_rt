@@ -1,5 +1,6 @@
 #include "polyscope/rt/plugin.h"
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -19,7 +20,7 @@ int maxBounces = 6;
 int samplesPerFrame = 1;
 float exposure = 3.5f;
 float gamma = 1.3f;
-float saturation = 1.6f;
+float saturation = 1.0f;
 } // namespace options
 
 namespace {
@@ -180,6 +181,13 @@ void setMainLight(glm::vec3 direction, glm::vec3 color, float intensity) {
   config.lighting.mainLightDirection = glm::normalize(direction);
   config.lighting.mainLightColor = color;
   config.lighting.mainLightIntensity = intensity;
+  g_runtime->setAppearance(config);
+}
+
+void setMainLightAngularRadius(float degrees) {
+  if (!g_runtime) return;
+  ::rt::AppearanceConfig config = g_runtime->getAppearance();
+  config.lighting.mainLightAngularRadius = glm::radians(std::max(degrees, 0.0f));
   g_runtime->setAppearance(config);
 }
 

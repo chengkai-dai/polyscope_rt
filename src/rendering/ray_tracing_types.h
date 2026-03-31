@@ -163,14 +163,17 @@ struct RTCamera {
 };
 
 struct LightingSettings {
-  glm::vec3 backgroundColor{1.0f, 1.0f, 1.0f};
+  glm::vec3 backgroundColor{0.95f, 0.95f, 0.95f};
   glm::vec3 mainLightDirection{-0.5f, -0.5f, 0.70710677f};
   glm::vec3 mainLightColor{1.0f, 1.0f, 1.0f};
   float mainLightIntensity = 0.0f;
+  // Angular radius in radians. Default is approximately the apparent radius of
+  // the real sun (about 0.27 degrees).
+  float mainLightAngularRadius = 0.00465f;
   float ambientFloor = 0.1f;
   float standardExposure = 4.0f;
   float standardGamma = 2.2f;
-  float standardSaturation = 1.6f;
+  float standardSaturation = 1.0f;
   int toonBandCount = 5;
   glm::vec3 areaLightCenter{0.0f, 2.72f, -1.35f};
   glm::vec3 areaLightU{0.55f, 0.0f, 0.0f};

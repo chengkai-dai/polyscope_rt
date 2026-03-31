@@ -89,18 +89,61 @@ PathLightState makePathLightState(float bsdfPdf, bool skipLightHitMIS) {
   return state;
 }
 
-float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 geomNormal, float3 normal,
-                               device const GPUTriangle* triangles, device const GPUMaterial* materials,
-                               thread uint& rng,
-                               intersector<curve_data, triangle_data, instancing> isector,
-                               instance_acceleration_structure scene, instance_acceleration_structure pointScene,
-                               intersection_function_table<curve_data, triangle_data, instancing> ftable) {
-  float3 toLight = normalize(-lightDir);
+void makeBasis(float3 axis, thread float3& tangent, thread float3& bitangent) {
+  float3 up = abs(axis.y) < 0.999f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+  tangent = normalize(cross(up, axis));
+  bitangent = cross(axis, tangent);
+}
+
+bool sampleSunLight(constant GPULighting& lighting, thread uint& rng,
+                    thread float3& toLight, thread float3& radiance, thread float& pdf) {
+  float intensity = lighting.mainLightColorIntensity.w;
+  if (intensity <= 1e-5f) return false;
+
+  float3 sunAxis = normalize(-lighting.mainLightDirection.xyz);
+  float angularRadius = max(lighting.mainLightDirection.w, 0.0f);
+  if (angularRadius <= 1e-4f) {
+    toLight = sunAxis;
+    radiance = lighting.mainLightColorIntensity.xyz * intensity;
+    pdf = 1.0f;
+    return true;
+  }
+
+  float cosThetaMax = cos(min(angularRadius, 1.55334306f));
+  float solidAngle = max(2.0f * kPi * (1.0f - cosThetaMax), 1e-6f);
+  float cosTheta = mix(cosThetaMax, 1.0f, rand01(rng));
+  float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+  float phi = 2.0f * kPi * rand01(rng);
+
+  float3 tangent;
+  float3 bitangent;
+  makeBasis(sunAxis, tangent, bitangent);
+  toLight = normalize(tangent * (cos(phi) * sinTheta) +
+                      bitangent * (sin(phi) * sinTheta) +
+                      sunAxis * cosTheta);
+  pdf = 1.0f / solidAngle;
+  radiance = lighting.mainLightColorIntensity.xyz * (intensity / solidAngle);
+  return true;
+}
+
+float evaluateSunLight(constant GPULighting& lighting, float3 hitPos, float3 geomNormal, float3 normal,
+                       device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                       thread uint& rng,
+                       intersector<curve_data, triangle_data, instancing> isector,
+                       instance_acceleration_structure scene, instance_acceleration_structure pointScene,
+                       intersection_function_table<curve_data, triangle_data, instancing> ftable) {
+  float3 toLight;
+  float3 radiance;
+  float pdf = 0.0f;
+  if (!sampleSunLight(lighting, rng, toLight, radiance, pdf)) return 0.0f;
+
   float nDotL = max(dot(normal, toLight), 0.0f);
   if (nDotL <= 0.0f) return 0.0f;
 
-  float visibility = shadowVisibility(hitPos, geomNormal, toLight, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
-  return nDotL * lightIntensity * visibility;
+  float visibility = shadowVisibility(hitPos, geomNormal, toLight, kRayMaxDistance,
+                                      triangles, materials, rng, isector, scene, pointScene, ftable);
+  if (visibility <= 0.0f || pdf <= 0.0f) return 0.0f;
+  return dot(radiance, float3(0.2126f, 0.7152f, 0.0722f)) * nDotL * visibility / pdf;
 }
 
 bool sampleAreaLight(float3 hitPos, float3 geomNormal, float3 normal, constant GPULighting& lighting,
@@ -280,8 +323,8 @@ float3 evaluateEnvironmentRadiance(float3 dir, constant GPULighting& lighting) {
   float3 bgColor = lighting.backgroundColor.xyz;
 
   float3 horizonColor = bgColor;
-  float3 zenithColor = mix(bgColor, bgColor * float3(0.35f, 0.55f, 1.05f), 0.75f);
-  float3 groundColor = bgColor * float3(0.08f, 0.08f, 0.09f);
+  float3 zenithColor = mix(bgColor, bgColor * 0.82f, 0.55f);
+  float3 groundColor = bgColor * 0.09f;
 
   float3 sky;
   if (y > 0.0f) {
@@ -289,11 +332,11 @@ float3 evaluateEnvironmentRadiance(float3 dir, constant GPULighting& lighting) {
     sky = mix(horizonColor, zenithColor, t);
   } else {
     float t = pow(clamp(-y, 0.0f, 1.0f), 0.92f);
-    sky = mix(horizonColor * 0.65f, groundColor, t);
+    sky = mix(horizonColor * 0.62f, groundColor, t);
   }
 
   float hemi = saturate(sampleDir.y * 0.5f + 0.5f);
-  float3 tintHorizon = bgColor * float3(0.45f, 0.48f, 0.55f);
+  float3 tintHorizon = bgColor * 0.48f;
   float3 envTint = mix(tintHorizon, lighting.environmentTintIntensity.xyz, hemi) * lighting.environmentTintIntensity.w;
   return max(sky + envTint, float3(0.0f));
 }
@@ -1118,13 +1161,18 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 normal, float3 view
 
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
-    float3 L = normalize(-lighting.mainLightDirection.xyz);
-    float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
-    if (visibility > 0.0f) {
-      BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
-      if (eval.NdotL > 0.0f) {
-        float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
-        directLighting += eval.value * radiance * eval.NdotL * visibility;
+    float3 L;
+    float3 radiance;
+    float lightPdf = 0.0f;
+    if (sampleSunLight(lighting, rng, L, radiance, lightPdf)) {
+      float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, kRayMaxDistance,
+                                          triangles, materials, rng, isector, scene, pointScene, ftable);
+      if (visibility > 0.0f) {
+        BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
+        if (eval.NdotL > 0.0f && eval.pdf > 0.0f && lightPdf > 0.0f) {
+          float weight = powerHeuristic(lightPdf, eval.pdf);
+          directLighting += eval.value * radiance * eval.NdotL * visibility * weight / lightPdf;
+        }
       }
     }
   }
@@ -1202,13 +1250,18 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 normal, floa
 
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
-    float3 L = normalize(-lighting.mainLightDirection.xyz);
-    float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
-    if (visibility > 0.0f) {
-      BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
-      if (eval.NdotL > 0.0f) {
-        float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
-        specularLighting += eval.value * radiance * eval.NdotL * visibility;
+    float3 L;
+    float3 radiance;
+    float lightPdf = 0.0f;
+    if (sampleSunLight(lighting, rng, L, radiance, lightPdf)) {
+      float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, kRayMaxDistance,
+                                          triangles, materials, rng, isector, scene, pointScene, ftable);
+      if (visibility > 0.0f) {
+        BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
+        if (eval.NdotL > 0.0f && eval.pdf > 0.0f && lightPdf > 0.0f) {
+          float weight = powerHeuristic(lightPdf, eval.pdf);
+          specularLighting += eval.value * radiance * eval.NdotL * visibility * weight / lightPdf;
+        }
       }
     }
   }
@@ -1617,8 +1670,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
         } else {
           float direct = 0.0f;
           if (lighting.mainLightColorIntensity.w > 1e-5f) {
-            direct += evaluateDirectionalLight(lighting.mainLightDirection.xyz, lighting.mainLightColorIntensity.w, surf.hitPos,
-                                              surf.geomNormal, surf.normal, triangles, materials, rng, isector, scene, pointScene, ftable);
+            direct += evaluateSunLight(lighting, surf.hitPos, surf.geomNormal, surf.normal,
+                                       triangles, materials, rng, isector, scene, pointScene, ftable);
           }
           if (frame.lightCount > 0u) {
             for (uint lightIndex = 0u; lightIndex < frame.lightCount; ++lightIndex) {

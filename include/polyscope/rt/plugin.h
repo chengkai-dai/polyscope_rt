@@ -47,9 +47,10 @@ void setShaderLibraryPath(std::string path);
 std::string getShaderLibraryPath();
 
 // Lighting
-// Main light is an analytic directional light (sun-like). It affects shading
-// but does not create visible scene geometry.
+// Main light is an analytic sun-like light with finite angular radius. It
+// affects shading but does not create visible scene geometry.
 void setMainLight(glm::vec3 direction, glm::vec3 color, float intensity);
+void setMainLightAngularRadius(float degrees);
 void setEnvironment(glm::vec3 tint, float intensity);
 void setAmbientFloor(float value);
 void setBackgroundColor(glm::vec3 color);

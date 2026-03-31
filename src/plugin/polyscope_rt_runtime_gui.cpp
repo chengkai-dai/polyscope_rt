@@ -121,6 +121,10 @@ void PolyscopeRtRuntime::buildAppearanceSection() {
       appearance_.lighting.mainLightDirection = defaultMainLightDirection();
     appearance_.lighting.mainLightDirection = glm::normalize(appearance_.lighting.mainLightDirection);
     ImGui::SliderFloat("Intensity",  &appearance_.lighting.mainLightIntensity,   0.0f, 12.0f, "%.2f");
+    float sunRadiusDeg = appearance_.lighting.mainLightAngularRadius * 57.2957795f;
+    if (ImGui::SliderFloat("Sun Radius", &sunRadiusDeg, 0.0f, 3.0f, "%.3f deg")) {
+      appearance_.lighting.mainLightAngularRadius = std::max(sunRadiusDeg, 0.0f) * 0.0174532925f;
+    }
     ImGui::SliderFloat("Env",        &appearance_.lighting.environmentIntensity, 0.0f,  2.0f, "%.2f");
     ImGui::TreePop();
   }

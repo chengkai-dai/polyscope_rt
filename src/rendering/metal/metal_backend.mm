@@ -41,8 +41,8 @@ simd_float3 evaluateEnvironmentRadiance(const rt::LightingSettings& lighting, co
   const float y = std::clamp(dir.y, -1.0f, 1.0f);
 
   const simd_float3 horizonColor = bg;
-  const simd_float3 zenithColor = lerp3(bg, bg * simd_make_float3(0.35f, 0.55f, 1.05f), 0.75f);
-  const simd_float3 groundColor = bg * simd_make_float3(0.08f, 0.08f, 0.09f);
+  const simd_float3 zenithColor = lerp3(bg, bg * 0.82f, 0.55f);
+  const simd_float3 groundColor = bg * 0.09f;
 
   simd_float3 sky;
   if (y > 0.0f) {
@@ -50,11 +50,11 @@ simd_float3 evaluateEnvironmentRadiance(const rt::LightingSettings& lighting, co
     sky = lerp3(horizonColor, zenithColor, t);
   } else {
     const float t = std::pow(std::clamp(-y, 0.0f, 1.0f), 0.92f);
-    sky = lerp3(horizonColor * 0.65f, groundColor, t);
+    sky = lerp3(horizonColor * 0.62f, groundColor, t);
   }
 
   const float hemi = std::clamp(y * 0.5f + 0.5f, 0.0f, 1.0f);
-  const simd_float3 tintHorizon = bg * simd_make_float3(0.45f, 0.48f, 0.55f);
+  const simd_float3 tintHorizon = bg * 0.48f;
   const simd_float3 envTint = lerp3(tintHorizon, tint, hemi) * envIntensity;
   return simd_max(sky + envTint, simd_make_float3(0.0f, 0.0f, 0.0f));
 }
@@ -348,7 +348,9 @@ public:
     // --- GPULighting ---
     GPULighting lighting;
     lighting.backgroundColor = metal_rt::makeFloat4(config.lighting.backgroundColor, 1.0f);
-    lighting.mainLightDirection = metal_rt::makeFloat4(glm::normalize(config.lighting.mainLightDirection), 0.0f);
+    lighting.mainLightDirection =
+        metal_rt::makeFloat4(glm::normalize(config.lighting.mainLightDirection),
+                             std::max(config.lighting.mainLightAngularRadius, 0.0f));
     lighting.mainLightColorIntensity =
         metal_rt::makeFloat4(config.lighting.mainLightColor, std::max(config.lighting.mainLightIntensity, 0.0f));
     lighting.environmentTintIntensity =

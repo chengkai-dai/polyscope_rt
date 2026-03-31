@@ -71,6 +71,7 @@ uint64_t computeRenderStateHash(const rt::RenderConfig& config) {
   hashBytes(seed, config.lighting.mainLightDirection);
   hashBytes(seed, config.lighting.mainLightColor);
   hashBytes(seed, config.lighting.mainLightIntensity);
+  hashBytes(seed, config.lighting.mainLightAngularRadius);
   hashBytes(seed, config.lighting.ambientFloor);
   hashBytes(seed, config.lighting.environmentTint);
   hashBytes(seed, config.lighting.environmentIntensity);
