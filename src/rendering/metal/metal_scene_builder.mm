@@ -10,6 +10,31 @@
 
 namespace metal_rt {
 
+namespace {
+
+float textureAverageLuminance(const rt::RTTexture& texture) {
+  if (texture.pixels.empty()) return 1.0f;
+
+  double sum = 0.0;
+  for (const glm::vec4& pixel : texture.pixels) {
+    sum += 0.2126 * pixel.r + 0.7152 * pixel.g + 0.0722 * pixel.b;
+  }
+
+  return static_cast<float>(sum / static_cast<double>(texture.pixels.size()));
+}
+
+float emissiveMeshPowerEstimate(const rt::RTMesh& mesh) {
+  float power = 0.2126f * mesh.emissiveFactor.r +
+                0.7152f * mesh.emissiveFactor.g +
+                0.0722f * mesh.emissiveFactor.b;
+  if (mesh.hasEmissiveTexture && !mesh.emissiveTexture.pixels.empty()) {
+    power *= textureAverageLuminance(mesh.emissiveTexture);
+  }
+  return std::max(power, 0.0f);
+}
+
+} // namespace
+
 void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
   for (const rt::RTMesh& mesh : scene.meshes) {
     if (mesh.vertices.empty() || mesh.indices.empty()) continue;
@@ -65,6 +90,10 @@ void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
       material.normalTextureData = simd_make_uint4(registerTextureInAcc(acc, mesh.normalTexture), 1u, 0u, 0u);
     }
     acc.materials.push_back(material);
+    const bool emitsLight =
+        glm::length(mesh.emissiveFactor) > 1e-6f ||
+        (mesh.hasEmissiveTexture && !mesh.emissiveTexture.pixels.empty());
+    const float emissivePowerEstimate = emissiveMeshPowerEstimate(mesh);
 
     std::vector<glm::vec3> worldVertices(mesh.vertices.size());
     std::vector<glm::vec3> worldNormals(mesh.vertices.size(), glm::vec3(0.0f));
@@ -97,7 +126,23 @@ void gatherMeshGpuData(SceneGpuAccumulator& acc, const rt::RTScene& scene) {
       triangle.indicesMaterial =
           simd_make_uint4(baseVertex + tri.x, baseVertex + tri.y, baseVertex + tri.z, materialIndex);
       triangle.objectFlags = simd_make_uint4(meshObjectId, hasVertexNormals ? 1u : 0u, mesh.wireframe ? 1u : 0u, 0u);
+      const uint32_t triangleIndex = static_cast<uint32_t>(acc.shaderTriangles.size());
       acc.shaderTriangles.push_back(triangle);
+      if (emitsLight) {
+        const glm::vec3& wp0 = worldVertices[tri.x];
+        const glm::vec3& wp1 = worldVertices[tri.y];
+        const glm::vec3& wp2 = worldVertices[tri.z];
+        const float triangleArea = 0.5f * glm::length(glm::cross(wp1 - wp0, wp2 - wp0));
+        const float selectionWeight = triangleArea * emissivePowerEstimate;
+        if (triangleArea <= 1e-8f || selectionWeight <= 1e-8f) continue;
+
+        GPUEmissiveTriangle emissiveTriangle{};
+        emissiveTriangle.data = simd_make_uint4(triangleIndex, 0u, 0u, 0u);
+        emissiveTriangle.params = simd_make_float4(triangleArea, selectionWeight, 0.0f, 0.0f);
+        const uint32_t emissiveIndex = static_cast<uint32_t>(acc.emissiveTriangles.size());
+        acc.emissiveTriangles.push_back(emissiveTriangle);
+        acc.shaderTriangles[triangleIndex].objectFlags.w = emissiveIndex + 1u;
+      }
     }
   }
 }

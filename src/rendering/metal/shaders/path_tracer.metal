@@ -5,14 +5,50 @@ using namespace metal::raytracing;
 #include "gpu_shared_types.h"
 #include "shader_common.h"
 
-// Forward declaration so evaluateDirectionalLight can call shadowVisibility.
-float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
+// Forward declaration so lighting helpers can query shadow visibility.
+float shadowVisibility(float3 hitPos, float3 geomNormal, float3 toLight, float maxDistance,
                        device const GPUTriangle* triangles, device const GPUMaterial* materials,
                        thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
                        instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                        intersection_function_table<curve_data, triangle_data, instancing> ftable);
 
-float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 normal,
+constant float kPi = 3.14159265f;
+constant uint kInvalidTriangleIndex = 0xFFFFFFFFu;
+constant uint kInvalidLightIndex = 0xFFFFFFFFu;
+constant uint kEnvironmentSampleWidth = 64u;
+constant uint kEnvironmentSampleHeight = 32u;
+
+struct BsdfEvalResult {
+  float3 value = float3(0.0f);
+  float3 diffuse = float3(0.0f);
+  float3 specular = float3(0.0f);
+  float3 fresnel = float3(0.0f);
+  float diffusePdf = 0.0f;
+  float specularPdf = 0.0f;
+  float pdf = 0.0f;
+  float NdotL = 0.0f;
+};
+
+struct BsdfSampleResult {
+  bool valid = false;
+  bool delta = false;
+  float3 direction = float3(0.0f);
+  float3 throughput = float3(0.0f);
+  float pdf = 0.0f;
+};
+
+float3 orientedGeomNormal(float3 geomNormal, float3 rayDir) {
+  float3 ng = normalize(geomNormal);
+  return dot(ng, rayDir) >= 0.0f ? ng : -ng;
+}
+
+float3 offsetRayOrigin(float3 hitPos, float3 geomNormal, float3 rayDir) {
+  float3 dir = normalize(rayDir);
+  float3 offsetN = orientedGeomNormal(geomNormal, dir);
+  return hitPos + offsetN * 2e-3f + dir * 5e-4f;
+}
+
+float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hitPos, float3 geomNormal, float3 normal,
                                device const GPUTriangle* triangles, device const GPUMaterial* materials,
                                thread uint& rng,
                                intersector<curve_data, triangle_data, instancing> isector,
@@ -22,14 +58,15 @@ float evaluateDirectionalLight(float3 lightDir, float lightIntensity, float3 hit
   float nDotL = max(dot(normal, toLight), 0.0f);
   if (nDotL <= 0.0f) return 0.0f;
 
-  float visibility = shadowVisibility(hitPos, toLight, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
+  float visibility = shadowVisibility(hitPos, geomNormal, toLight, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
   return nDotL * lightIntensity * visibility;
 }
 
-bool sampleAreaLight(float3 hitPos, float3 normal, constant GPULighting& lighting,
+bool sampleAreaLight(float3 hitPos, float3 geomNormal, float3 normal, constant GPULighting& lighting,
                      device const GPUTriangle* triangles, device const GPUMaterial* materials,
                      thread uint& rng, thread float3& toLight,
-                     thread float3& radiance, intersector<curve_data, triangle_data, instancing> isector,
+                     thread float3& radiance, thread float& pdf,
+                     intersector<curve_data, triangle_data, instancing> isector,
                      instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                      intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   if (lighting.areaLightCenterEnabled.w < 0.5f) return false;
@@ -44,16 +81,127 @@ bool sampleAreaLight(float3 hitPos, float3 normal, constant GPULighting& lightin
   toLight /= distance;
 
   float nDotL = max(dot(normal, toLight), 0.0f);
-  float lightCos = max(dot(lightNormal, -toLight), 0.0f);
+  float lightCos = abs(dot(lightNormal, -toLight));
   if (nDotL <= 0.0f || lightCos <= 0.0f) return false;
 
-  float visibility = shadowVisibility(hitPos, toLight, max(distance - 2e-2f, 1e-3f),
+  float visibility = shadowVisibility(hitPos, geomNormal, toLight, max(distance - 2e-2f, 1e-3f),
                                       triangles, materials, rng, isector, scene, pointScene, ftable);
   if (visibility <= 0.0f) return false;
 
   float area = 4.0f * length(cross(lighting.areaLightU.xyz, lighting.areaLightV.xyz));
-  radiance = lighting.areaLightEmission.xyz * (lightCos * area / distance2);
+  pdf = distance2 / max(lightCos * area, 1e-5f);
+  if (pdf <= 0.0f) return false;
+  radiance = lighting.areaLightEmission.xyz;
   return true;
+}
+
+bool intersectVisibleAreaLight(ray currentRay, constant GPULighting& lighting,
+                               thread float3& radiance, thread float& pdf) {
+  if (lighting.areaLightCenterEnabled.w < 0.5f) return false;
+
+  float3 center = lighting.areaLightCenterEnabled.xyz;
+  float3 U = lighting.areaLightU.xyz;
+  float3 V = lighting.areaLightV.xyz;
+  float3 lightNormal = normalize(-cross(U, V));
+  float denom = dot(currentRay.direction, lightNormal);
+  if (abs(denom) <= 1e-6f) return false;
+
+  float t = dot(center - currentRay.origin, lightNormal) / denom;
+  if (t <= max(currentRay.min_distance, 1e-5f) || t > currentRay.max_distance) return false;
+
+  float3 hitPoint = currentRay.origin + currentRay.direction * t;
+  float3 rel = hitPoint - center;
+  float uLen2 = max(dot(U, U), 1e-6f);
+  float vLen2 = max(dot(V, V), 1e-6f);
+  float su = dot(rel, U) / uLen2;
+  float sv = dot(rel, V) / vLen2;
+  if (abs(su) > 1.0f || abs(sv) > 1.0f) return false;
+
+  float lightCos = abs(dot(lightNormal, -currentRay.direction));
+  float area = 4.0f * length(cross(U, V));
+  if (lightCos <= 0.0f || area <= 1e-6f) return false;
+
+  radiance = lighting.areaLightEmission.xyz;
+  pdf = (t * t) / max(lightCos * area, 1e-5f);
+  return pdf > 0.0f;
+}
+
+bool sampleEmissiveTriangleLight(float3 hitPos, float3 geomNormal, float3 normal,
+                                 device const float4* positions, device const float2* texcoords,
+                                 device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                                 device const GPUTexture* textures, device const float4* texturePixels,
+                                 device const GPUEmissiveTriangle* emissiveTriangles, uint emissiveTriangleCount,
+                                 uint excludeTriangleIndex, thread uint& rng,
+                                 thread float3& toLight, thread float3& radiance, thread float& pdf,
+                                 intersector<curve_data, triangle_data, instancing> isector,
+                                 instance_acceleration_structure scene, instance_acceleration_structure pointScene,
+                                 intersection_function_table<curve_data, triangle_data, instancing> ftable) {
+  if (emissiveTriangleCount == 0u) return false;
+
+  for (uint attempt = 0u; attempt < min(emissiveTriangleCount, 4u); ++attempt) {
+    float uSelect = rand01(rng);
+    uint lo = 0u;
+    uint hi = emissiveTriangleCount - 1u;
+    while (lo < hi) {
+      uint mid = (lo + hi) >> 1u;
+      if (uSelect <= emissiveTriangles[mid].params.z) hi = mid;
+      else lo = mid + 1u;
+    }
+
+    GPUEmissiveTriangle emissive = emissiveTriangles[lo];
+    uint triangleIndex = emissive.data.x;
+    if (triangleIndex == excludeTriangleIndex || emissive.params.y <= 0.0f || emissive.params.x <= 1e-7f) continue;
+
+    GPUTriangle tri = triangles[triangleIndex];
+    GPUMaterial material = materials[tri.indicesMaterial.w];
+    float3 p0 = positions[tri.indicesMaterial.x].xyz;
+    float3 p1 = positions[tri.indicesMaterial.y].xyz;
+    float3 p2 = positions[tri.indicesMaterial.z].xyz;
+    float3 triCross = cross(p1 - p0, p2 - p0);
+    float triCrossLen = length(triCross);
+    if (triCrossLen <= 1e-7f) continue;
+
+    float u = rand01(rng);
+    float v = rand01(rng);
+    float su = sqrt(u);
+    float b0 = 1.0f - su;
+    float b1 = v * su;
+    float b2 = 1.0f - b0 - b1;
+
+    float3 lightPoint = p0 * b0 + p1 * b1 + p2 * b2;
+    float3 lightNormal = triCross / triCrossLen;
+
+    float3 emission = material.emissiveFactor.xyz;
+    if (material.emissiveTextureData.y != 0u) {
+      float2 uv0 = texcoords[tri.indicesMaterial.x];
+      float2 uv1 = texcoords[tri.indicesMaterial.y];
+      float2 uv2 = texcoords[tri.indicesMaterial.z];
+      float2 uv = uv0 * b0 + uv1 * b1 + uv2 * b2;
+      emission *= sampleBaseColorTexture(textures, texturePixels, material.emissiveTextureData.x, uv).xyz;
+    }
+    if (all(emission <= 0.0f)) continue;
+
+    toLight = lightPoint - hitPos;
+    float distance2 = max(dot(toLight, toLight), 1e-5f);
+    float distance = sqrt(distance2);
+    if (distance <= 2e-3f) continue;
+    toLight /= distance;
+
+    float nDotL = max(dot(normal, toLight), 0.0f);
+    float lightCos = max(dot(lightNormal, -toLight), 0.0f);
+    if (nDotL <= 0.0f || lightCos <= 0.0f) continue;
+
+    float visibility = shadowVisibility(hitPos, geomNormal, toLight, max(distance - 2e-2f, 1e-3f),
+                                        triangles, materials, rng, isector, scene, pointScene, ftable);
+    if (visibility <= 0.0f) continue;
+
+    pdf = emissive.params.y * distance2 / max(lightCos * emissive.params.x, 1e-5f);
+    if (pdf <= 0.0f) continue;
+
+    radiance = emission;
+    return true;
+  }
+  return false;
 }
 
 float3 fresnelSchlick(float cosTheta, float3 F0) {
@@ -85,15 +233,11 @@ float geometrySmith(float3 N, float3 V, float3 L, float roughness) {
   return geometrySchlickGGX(NdotV, roughness) * geometrySchlickGGX(NdotL, roughness);
 }
 
-float3 evalSimpleSky(float3 dir, constant GPULighting& lighting) {
-  float3 sunDir = normalize(-lighting.mainLightDirection.xyz);
-  float sunIntensity = lighting.mainLightColorIntensity.w;
-  float3 sunColor = lighting.mainLightColorIntensity.xyz;
+float3 evaluateEnvironmentRadiance(float3 dir, constant GPULighting& lighting) {
+  float3 sampleDir = normalize(dir);
+  float y = clamp(sampleDir.y, -1.0f, 1.0f);
   float3 bgColor = lighting.backgroundColor.xyz;
 
-  float y = dir.y;
-
-  // Sky gradient is anchored to backgroundColor: horizon matches it, zenith is a relative shift.
   float3 horizonColor = bgColor;
   float3 zenithColor = mix(bgColor, bgColor * float3(0.35f, 0.55f, 1.05f), 0.75f);
   float3 groundColor = bgColor * float3(0.08f, 0.08f, 0.09f);
@@ -107,24 +251,25 @@ float3 evalSimpleSky(float3 dir, constant GPULighting& lighting) {
     sky = mix(horizonColor * 0.65f, groundColor, t);
   }
 
-  if (sunIntensity > 1e-5f) {
-    float cosAngle = dot(dir, sunDir);
-    float sunRadius = 0.02f;
-    float disc = smoothstep(1.0f - sunRadius, 1.0f - sunRadius * 0.1f, cosAngle);
-    sky += sunColor * sunIntensity * disc * 2.0f;
-    float glow = pow(max(cosAngle, 0.0f), 32.0f);
-    sky += sunColor * glow * sunIntensity * 0.15f;
-    float horizonGlow = pow(max(cosAngle, 0.0f), 4.0f) * max(1.0f - abs(y) * 2.0f, 0.0f);
-    sky += sunColor * horizonGlow * sunIntensity * 0.08f;
-  }
-
-  return sky;
+  float hemi = saturate(sampleDir.y * 0.5f + 0.5f);
+  float3 tintHorizon = bgColor * float3(0.45f, 0.48f, 0.55f);
+  float3 envTint = mix(tintHorizon, lighting.environmentTintIntensity.xyz, hemi) * lighting.environmentTintIntensity.w;
+  return max(sky + envTint, float3(0.0f));
 }
 
-float3 sampleEnvironment(float3 dir, constant GPULighting& lighting) {
-  float hemi = saturate(dir.y * 0.5f + 0.5f);
-  float3 sky = mix(float3(0.04f, 0.04f, 0.05f), lighting.environmentTintIntensity.xyz, hemi);
-  return sky * lighting.environmentTintIntensity.w;
+float3 sampleGGXBounce(float3 N, float3 V, float roughness, thread uint& rng);
+
+float luminance(float3 c) {
+  return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+float computeSpecularSamplingProbability(float3 F, float3 baseColor, float metallic) {
+  float3 kD = (1.0f - F) * (1.0f - metallic);
+  float specWeight = luminance(max(F, float3(0.0f)));
+  float diffuseWeight = luminance(max(baseColor * kD, float3(0.0f)));
+  float totalWeight = specWeight + diffuseWeight;
+  if (totalWeight <= 1e-6f || diffuseWeight <= 1e-6f) return 1.0f;
+  return clamp(specWeight / totalWeight, 0.04f, 0.999f);
 }
 
 float3 cosineWeightedHemisphere(float3 normal, thread uint& rng) {
@@ -168,6 +313,186 @@ float3 sampleGGXBounce(float3 N, float3 V, float roughness, thread uint& rng) {
   return L;
 }
 
+float powerHeuristic(float pdfA, float pdfB) {
+  float a2 = pdfA * pdfA;
+  float b2 = pdfB * pdfB;
+  return a2 / max(a2 + b2, 1e-8f);
+}
+
+float ggxReflectionPdf(float3 N, float3 V, float3 L, float roughness) {
+  float NdotV = max(dot(N, V), 0.0f);
+  float NdotL = max(dot(N, L), 0.0f);
+  if (NdotV <= 0.0f || NdotL <= 0.0f) return 0.0f;
+
+  float3 H = V + L;
+  float HLen2 = dot(H, H);
+  if (HLen2 <= 1e-8f) return 0.0f;
+  H *= rsqrt(HLen2);
+
+  float NdotH = max(dot(N, H), 0.0f);
+  if (NdotH <= 0.0f) return 0.0f;
+
+  float D = distributionGGX(N, H, roughness);
+  float G1 = geometrySchlickGGX(NdotV, roughness);
+  return D * G1 * NdotH / max(4.0f * NdotV, 1e-6f);
+}
+
+float environmentBinSolidAngle(uint row) {
+  float theta0 = kPi * float(row) / float(kEnvironmentSampleHeight);
+  float theta1 = kPi * float(row + 1u) / float(kEnvironmentSampleHeight);
+  return (2.0f * kPi / float(kEnvironmentSampleWidth)) * max(cos(theta0) - cos(theta1), 1e-6f);
+}
+
+uint environmentCellIndex(float3 dir) {
+  float3 sampleDir = normalize(dir);
+  float phi = atan2(sampleDir.z, sampleDir.x);
+  if (phi < 0.0f) phi += 2.0f * kPi;
+  float theta = acos(clamp(sampleDir.y, -1.0f, 1.0f));
+  uint col = min(uint(phi / (2.0f * kPi) * float(kEnvironmentSampleWidth)), kEnvironmentSampleWidth - 1u);
+  uint row = min(uint(theta / kPi * float(kEnvironmentSampleHeight)), kEnvironmentSampleHeight - 1u);
+  return row * kEnvironmentSampleWidth + col;
+}
+
+float environmentDirectionalPdf(float3 dir, device const GPUEnvironmentSampleCell* environmentCells) {
+  uint idx = environmentCellIndex(dir);
+  uint row = idx / kEnvironmentSampleWidth;
+  float pmf = environmentCells[idx].data.x;
+  if (pmf <= 0.0f) return 0.0f;
+  return pmf / environmentBinSolidAngle(row);
+}
+
+bool sampleEnvironmentLight(float3 hitPos, float3 geomNormal, float3 normal,
+                            device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                            device const GPUEnvironmentSampleCell* environmentCells,
+                            constant GPULighting& lighting, thread uint& rng,
+                            thread float3& toLight, thread float3& radiance, thread float& pdf,
+                            intersector<curve_data, triangle_data, instancing> isector,
+                            instance_acceleration_structure scene, instance_acceleration_structure pointScene,
+                            intersection_function_table<curve_data, triangle_data, instancing> ftable) {
+  float uSelect = rand01(rng);
+  uint lo = 0u;
+  uint hi = kEnvironmentSampleWidth * kEnvironmentSampleHeight - 1u;
+  while (lo < hi) {
+    uint mid = (lo + hi) >> 1u;
+    if (uSelect <= environmentCells[mid].data.y) hi = mid;
+    else lo = mid + 1u;
+  }
+
+  uint idx = lo;
+  float pmf = environmentCells[idx].data.x;
+  if (pmf <= 0.0f) return false;
+
+  uint row = idx / kEnvironmentSampleWidth;
+  uint col = idx % kEnvironmentSampleWidth;
+  float phi0 = 2.0f * kPi * float(col) / float(kEnvironmentSampleWidth);
+  float phi1 = 2.0f * kPi * float(col + 1u) / float(kEnvironmentSampleWidth);
+  float theta0 = kPi * float(row) / float(kEnvironmentSampleHeight);
+  float theta1 = kPi * float(row + 1u) / float(kEnvironmentSampleHeight);
+
+  float cosTheta0 = cos(theta0);
+  float cosTheta1 = cos(theta1);
+  float cosTheta = mix(cosTheta0, cosTheta1, rand01(rng));
+  float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+  float phi = mix(phi0, phi1, rand01(rng));
+
+  toLight = float3(cos(phi) * sinTheta, cosTheta, sin(phi) * sinTheta);
+  float nDotL = max(dot(normal, toLight), 0.0f);
+  if (nDotL <= 0.0f) return false;
+
+  float visibility = shadowVisibility(hitPos, geomNormal, toLight, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
+  if (visibility <= 0.0f) return false;
+
+  radiance = evaluateEnvironmentRadiance(toLight, lighting);
+  if (all(radiance <= 0.0f)) return false;
+
+  pdf = pmf / environmentBinSolidAngle(row);
+  return pdf > 0.0f;
+}
+
+BsdfEvalResult evaluateOpaqueBsdf(float3 N, float3 V, float3 L, float3 albedo, float metallic,
+                                  float roughness, float dielectricF0) {
+  BsdfEvalResult out;
+  float NdotV = max(dot(N, V), 0.0f);
+  float NdotL = max(dot(N, L), 0.0f);
+  if (NdotV <= 0.0f || NdotL <= 0.0f) return out;
+
+  float3 F0 = mix(float3(dielectricF0), albedo, metallic);
+  float grazingMax = mix(clamp(dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, metallic);
+  float3 H = normalize(V + L);
+  float NDF = distributionGGX(N, H, roughness);
+  float G = geometrySmith(N, V, L, roughness);
+  float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0, grazingMax);
+  float3 specular = (NDF * G * F) / max(4.0f * NdotV * NdotL, 1e-4f);
+  float3 kS = F;
+  float3 kD = (1.0f - kS) * (1.0f - metallic);
+  float3 diffuse = kD * albedo / kPi;
+
+  float3 viewF = fresnelSchlick(NdotV, F0, grazingMax);
+  float specProb = computeSpecularSamplingProbability(viewF, albedo, metallic);
+  float diffProb = 1.0f - specProb;
+
+  out.value = diffuse + specular;
+  out.diffuse = diffuse;
+  out.specular = specular;
+  out.fresnel = F;
+  out.diffusePdf = NdotL / kPi;
+  out.specularPdf = ggxReflectionPdf(N, V, L, roughness);
+  out.pdf = diffProb * out.diffusePdf + specProb * out.specularPdf;
+  out.NdotL = NdotL;
+  return out;
+}
+
+BsdfEvalResult evaluateDielectricSpecularBsdf(float3 N, float3 V, float3 L, float roughness, float ior) {
+  BsdfEvalResult out;
+  float NdotV = max(dot(N, V), 0.0f);
+  float NdotL = max(dot(N, L), 0.0f);
+  if (NdotV <= 0.0f || NdotL <= 0.0f) return out;
+
+  float f0Scalar = pow((ior - 1.0f) / (ior + 1.0f), 2.0f);
+  float3 F0 = float3(f0Scalar);
+  float3 H = normalize(V + L);
+  float NDF = distributionGGX(N, H, roughness);
+  float G = geometrySmith(N, V, L, roughness);
+  float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0);
+
+  out.value = (NDF * G * F) / max(4.0f * NdotV * NdotL, 1e-4f);
+  out.specular = out.value;
+  out.fresnel = F;
+  out.specularPdf = ggxReflectionPdf(N, V, L, roughness);
+  out.pdf = out.specularPdf;
+  out.NdotL = NdotL;
+  return out;
+}
+
+BsdfSampleResult sampleOpaqueBsdf(float3 N, float3 V, float3 albedo, float metallic,
+                                  float roughness, float dielectricF0, thread uint& rng) {
+  BsdfSampleResult out;
+  float3 F0 = mix(float3(dielectricF0), albedo, metallic);
+  float grazingMax = mix(clamp(dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, metallic);
+  float NdotV = max(dot(N, V), 0.0f);
+  float3 viewF = fresnelSchlick(NdotV, F0, grazingMax);
+  float specProb = computeSpecularSamplingProbability(viewF, albedo, metallic);
+  bool sampledSpecular = rand01(rng) < specProb;
+  if (sampledSpecular) {
+    out.direction = sampleGGXBounce(N, V, roughness, rng);
+    if (dot(out.direction, N) <= 0.0f) out.direction = reflect(-V, N);
+  } else {
+    out.direction = cosineWeightedHemisphere(N, rng);
+  }
+
+  BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, out.direction, albedo, metallic, roughness, dielectricF0);
+  if (eval.NdotL <= 0.0f || eval.pdf <= 0.0f || all(eval.value <= 0.0f)) return out;
+
+  out.valid = true;
+  // Treat pure-specular continuations as delta-like for light-hit MIS. This
+  // keeps visible emitters and analytic lights from collapsing to dark patches
+  // on fully metallic reflections in low-sample renders.
+  out.delta = sampledSpecular && specProb >= 0.999f;
+  out.pdf = eval.pdf;
+  out.throughput = eval.value * eval.NdotL / eval.pdf;
+  return out;
+}
+
 float3 applyNormalMap(float3 geomNormal, float3 shadingNormal, float3 p0, float3 p1, float3 p2, float2 uv0, float2 uv1, float2 uv2,
                       float2 uv, device const GPUTexture* textures, device const float4* texturePixels, uint4 normalTextureData,
                       float normalScale) {
@@ -197,15 +522,15 @@ float3 applyNormalMap(float3 geomNormal, float3 shadingNormal, float3 p0, float3
   return mapped;
 }
 
-float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
+float shadowVisibility(float3 hitPos, float3 geomNormal, float3 toLight, float maxDistance,
                        device const GPUTriangle* triangles, device const GPUMaterial* materials,
                        thread uint& rng, intersector<curve_data, triangle_data, instancing> isector,
                        instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                        intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   ray shadowRay;
-  shadowRay.origin = hitPos;
+  shadowRay.origin = offsetRayOrigin(hitPos, geomNormal, toLight);
   shadowRay.direction = toLight;
-  shadowRay.min_distance = 5e-3f;
+  shadowRay.min_distance = 0.0f;
   shadowRay.max_distance = maxDistance;
 
   for (uint i = 0u; i < 8u; ++i) {
@@ -219,9 +544,9 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
 
     if (mcHit.type == intersection_type::curve) return 0.0f;
 
-    uint objectId = triangles[mcHit.primitive_id].objectFlags.x;
-    float opacity = clamp(materials[objectId].transmissionIor.w, 0.0f, 1.0f);
-    float transmission = clamp(materials[objectId].transmissionIor.x, 0.0f, 1.0f);
+    uint materialIndex = triangles[mcHit.primitive_id].indicesMaterial.w;
+    float opacity = clamp(materials[materialIndex].transmissionIor.w, 0.0f, 1.0f);
+    float transmission = clamp(materials[materialIndex].transmissionIor.x, 0.0f, 1.0f);
 
     if (opacity < 1e-5f && transmission < 1e-5f) {
       // Fully invisible surface: advance shadow ray through without blocking.
@@ -249,7 +574,9 @@ float shadowVisibility(float3 hitPos, float3 toLight, float maxDistance,
   return 0.0f;
 }
 
-float evaluatePunctualLight(device const GPUPunctualLight* lights, uint lightIndex, float3 hitPos, float3 normal,
+float evaluatePunctualLight(device const GPUPunctualLight* lights, uint lightIndex, float3 hitPos, float3 geomNormal, float3 normal,
+                            device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                            thread uint& rng,
                             intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                             intersection_function_table<curve_data, triangle_data, instancing> ftable) {
   GPUPunctualLight light = lights[lightIndex];
@@ -287,19 +614,11 @@ float evaluatePunctualLight(device const GPUPunctualLight* lights, uint lightInd
   float nDotL = max(dot(normal, toLight), 0.0f);
   if (nDotL <= 0.0f) return 0.0f;
 
-  ray shadowRay;
-  shadowRay.origin = hitPos;
-  shadowRay.direction = toLight;
-  shadowRay.min_distance = 5e-3f;
-  shadowRay.max_distance = maxDistance;
-  isector.accept_any_intersection(true);
-  auto mcShadow = isector.intersect(shadowRay, scene, 0xFFu);
-  auto ptShadow = isector.intersect(shadowRay, pointScene, 0xFFu, ftable);
-  isector.accept_any_intersection(false);
-  if (mcShadow.type != intersection_type::none || ptShadow.type != intersection_type::none) return 0.0f;
+  float visibility = shadowVisibility(hitPos, geomNormal, toLight, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
+  if (visibility <= 0.0f) return 0.0f;
 
   float luminance = dot(lightColor, float3(0.2126f, 0.7152f, 0.0722f));
-  return luminance * attenuation * nDotL;
+  return luminance * attenuation * nDotL * visibility;
 }
 
 bool samplePunctualLight(device const GPUPunctualLight* lights, uint lightIndex, float3 hitPos, thread float3& toLight,
@@ -342,6 +661,8 @@ bool samplePunctualLight(device const GPUPunctualLight* lights, uint lightIndex,
 struct SurfaceHitInfo {
   uint hit = 0u;
   uint objectId = 0u;
+  uint triangleIndex = kInvalidTriangleIndex;
+  uint emissiveLightIndex = kInvalidLightIndex;
   float distance = 0.0f;
   float3 hitPos = float3(0.0f);
   float3 geomNormal = float3(0.0f, 1.0f, 0.0f);
@@ -386,7 +707,7 @@ SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame) {
   out.normal = normal;
   out.baseColor = frame.planeColorEnabled.xyz;
   out.metallic = frame.planeParams.y;
-  out.roughness = clamp(frame.planeParams.z, 0.045f, 1.0f);
+  out.roughness = clamp(frame.planeParams.z, 0.001f, 1.0f);
   out.dielectricF0 = frame.planeParams.w;
   out.isInfinitePlane = true;
   return out;
@@ -397,6 +718,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const GPUTriangle* triangles,
                          device const GPUMaterial* materials, device const GPUTexture* textures,
                          device const float4* texturePixels, device const GPUPunctualLight* sceneLights,
+                         device const GPUEmissiveTriangle* emissiveTriangles,
+                         device const GPUEnvironmentSampleCell* environmentCells,
                          device const GPUCurvePrimitive* curvePrimitives,
                          device const GPUPointPrimitive* pointPrimitives,
                          constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
@@ -405,7 +728,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const float* isoScalars, float tanHalfFov);
 
 float3 sampleMissRadiance(float3 dir, constant GPULighting& lighting) {
-  return evalSimpleSky(dir, lighting);
+  return evaluateEnvironmentRadiance(dir, lighting);
 }
 
 SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam, uint segmentId,
@@ -451,7 +774,7 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   out.baseColor = clamp(baseCol, 0.0f, 1.0f);
   out.emissive = material.emissiveFactor.xyz;
   out.metallic = material.metallicRoughnessNormal.x;
-  out.roughness = clamp(material.metallicRoughnessNormal.y, 0.045f, 1.0f);
+  out.roughness = clamp(material.metallicRoughnessNormal.y, 0.001f, 1.0f);
   out.transmission = 0.0f;
   out.ior = 1.5f;
   out.opacity = 1.0f;
@@ -483,7 +806,7 @@ SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIn
   out.baseColor  = clamp(pt.baseColor.xyz, 0.0f, 1.0f);
   out.emissive   = material.emissiveFactor.xyz;
   out.metallic   = material.metallicRoughnessNormal.x;
-  out.roughness  = clamp(material.metallicRoughnessNormal.y, 0.045f, 1.0f);
+  out.roughness  = clamp(material.metallicRoughnessNormal.y, 0.001f, 1.0f);
   out.transmission = 0.0f;
   out.ior        = 1.5f;
   out.opacity    = 1.0f;
@@ -609,13 +932,15 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
     roughness *= mr.y;
     metallic *= mr.z;
   }
-  roughness = clamp(roughness, 0.045f, 1.0f);
+  roughness = clamp(roughness, 0.001f, 1.0f);
   metallic = saturate(metallic);
   normal = applyNormalMap(geomNormal, normal, p0, p1, p2, uv0, uv1, uv2, uv, textures, texturePixels,
                           material.normalTextureData, normalScale);
 
   out.hit = 1u;
   out.objectId = tri.objectFlags.x;
+  out.triangleIndex = triangleIndex;
+  out.emissiveLightIndex = tri.objectFlags.w != 0u ? (tri.objectFlags.w - 1u) : kInvalidLightIndex;
   out.distance = mcHit.distance;
   out.hitPos = hitPos;
   out.geomNormal = geomNormal;
@@ -682,40 +1007,65 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   return out;
 }
 
-float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device const GPUPunctualLight* sceneLights,
+float emissiveTriangleHitPdf(SurfaceHitInfo surf, float3 incomingDir,
+                             device const GPUEmissiveTriangle* emissiveTriangles) {
+  if (surf.emissiveLightIndex == kInvalidLightIndex) return 0.0f;
+
+  GPUEmissiveTriangle emissive = emissiveTriangles[surf.emissiveLightIndex];
+  float area = emissive.params.x;
+  float selectionPdf = emissive.params.y;
+  float lightCos = max(dot(surf.geomNormal, -incomingDir), 0.0f);
+  if (area <= 1e-7f || selectionPdf <= 0.0f || lightCos <= 0.0f) return 0.0f;
+  return selectionPdf * max(surf.distance * surf.distance, 1e-6f) / max(lightCos * area, 1e-5f);
+}
+
+float emissiveSurfaceMISWeight(SurfaceHitInfo surf, float3 incomingDir, float bsdfPdf,
+                               bool prevWasDelta,
+                               device const GPUEmissiveTriangle* emissiveTriangles) {
+  if (prevWasDelta || surf.emissiveLightIndex == kInvalidLightIndex) return 1.0f;
+  float lightPdf = emissiveTriangleHitPdf(surf, incomingDir, emissiveTriangles);
+  if (lightPdf <= 0.0f) return 1.0f;
+  return powerHeuristic(bsdfPdf, lightPdf);
+}
+
+float environmentMISWeight(float3 dir, float bsdfPdf, bool prevWasDelta,
+                           device const GPUEnvironmentSampleCell* environmentCells) {
+  if (prevWasDelta) return 1.0f;
+  float lightPdf = environmentDirectionalPdf(dir, environmentCells);
+  if (lightPdf <= 0.0f) return 1.0f;
+  return powerHeuristic(bsdfPdf, lightPdf);
+}
+
+float areaLightMISWeight(ray currentRay, float bsdfPdf, bool prevWasDelta, constant GPULighting& lighting) {
+  if (prevWasDelta) return 1.0f;
+  float3 radiance;
+  float lightPdf = 0.0f;
+  if (!intersectVisibleAreaLight(currentRay, lighting, radiance, lightPdf) || lightPdf <= 0.0f) return 1.0f;
+  return powerHeuristic(bsdfPdf, lightPdf);
+}
+
+float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 normal, float3 viewDir,
+                                 device const float4* positions, device const float2* texcoords,
                                  device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                                 device const GPUTexture* textures, device const float4* texturePixels,
+                                 device const GPUPunctualLight* sceneLights, device const GPUEmissiveTriangle* emissiveTriangles,
+                                 device const GPUEnvironmentSampleCell* environmentCells,
                                  constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                                  intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                  intersection_function_table<curve_data, triangle_data, instancing> ftable) {
-  float3 N = surf.normal;
-  float3 V = viewDir;
-  float3 albedo = surf.baseColor;
-  float metallic = surf.metallic;
-  float roughness = surf.roughness;
-  float3 F0 = mix(float3(surf.dielectricF0), albedo, metallic);
-  float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, metallic);
   float3 directLighting = float3(0.0f);
-  const bool isInfinitePlane = surf.isInfinitePlane;
-  float3 diffuseAlbedo = albedo * (1.0f - metallic);
+  float3 N = normal;
+  float3 V = viewDir;
 
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
     float3 L = normalize(-lighting.mainLightDirection.xyz);
-    float visibility = shadowVisibility(surf.hitPos, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
-    float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
-    float NdotL = max(dot(N, L), 0.0f);
-    if (NdotL > 0.0f && visibility > 0.0f) {
-      if (isInfinitePlane) {
-        directLighting += (diffuseAlbedo / 3.14159265f) * radiance * NdotL * visibility;
-      } else {
-        float3 H = normalize(V + L);
-        float NDF = distributionGGX(N, H, roughness);
-        float G = geometrySmith(N, V, L, roughness);
-        float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0, grazingMax);
-        float3 specular = (NDF * G * F) / max(4.0f * max(dot(N, V), 0.0f) * NdotL, 1e-4f);
-        float3 kS = F;
-        float3 kD = (1.0f - kS) * (1.0f - metallic);
-        directLighting += ((kD * albedo / 3.14159265f) + specular) * radiance * NdotL * visibility;
+    float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
+    if (visibility > 0.0f) {
+      BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
+      if (eval.NdotL > 0.0f) {
+        float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
+        directLighting += eval.value * radiance * eval.NdotL * visibility;
       }
     }
   }
@@ -726,20 +1076,25 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
       float3 radiance;
       float maxDistance = 1e6f;
       if (!samplePunctualLight(sceneLights, lightIndex, surf.hitPos, L, radiance, maxDistance)) continue;
-      float visibility = shadowVisibility(surf.hitPos, L, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
-      float NdotL = max(dot(N, L), 0.0f);
-      if (NdotL <= 0.0f || visibility <= 0.0f || all(radiance <= 0.0f)) continue;
-      if (isInfinitePlane) {
-        directLighting += (diffuseAlbedo / 3.14159265f) * radiance * NdotL * visibility;
-      } else {
-        float3 H = normalize(V + L);
-        float NDF = distributionGGX(N, H, roughness);
-        float G = geometrySmith(N, V, L, roughness);
-        float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0, grazingMax);
-        float3 specular = (NDF * G * F) / max(4.0f * max(dot(N, V), 0.0f) * NdotL, 1e-4f);
-        float3 kS = F;
-        float3 kD = (1.0f - kS) * (1.0f - metallic);
-        directLighting += ((kD * albedo / 3.14159265f) + specular) * radiance * NdotL * visibility;
+      float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
+      if (visibility <= 0.0f || all(radiance <= 0.0f)) continue;
+      BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
+      if (eval.NdotL <= 0.0f) continue;
+      directLighting += eval.value * radiance * eval.NdotL * visibility;
+    }
+  }
+
+  if (frame.emissiveTriangleCount > 0u) {
+    float3 L;
+    float3 radiance;
+    float lightPdf = 0.0f;
+    if (sampleEmissiveTriangleLight(surf.hitPos, surf.geomNormal, N, positions, texcoords, triangles, materials, textures, texturePixels,
+                                    emissiveTriangles, frame.emissiveTriangleCount, surf.triangleIndex, rng,
+                                    L, radiance, lightPdf, isector, scene, pointScene, ftable)) {
+      BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
+      if (eval.NdotL > 0.0f && eval.pdf > 0.0f) {
+        float weight = powerHeuristic(lightPdf, eval.pdf);
+        directLighting += eval.value * radiance * eval.NdotL * weight / lightPdf;
       }
     }
   }
@@ -747,62 +1102,55 @@ float3 evaluateDirectLightingPBR(SurfaceHitInfo surf, float3 viewDir, device con
   if (frame.enableAreaLight != 0u) {
     float3 L;
     float3 radiance;
-    if (sampleAreaLight(surf.hitPos, N, lighting, triangles, materials, rng, L, radiance, isector, scene, pointScene, ftable)) {
-      float NdotL = max(dot(N, L), 0.0f);
-      if (isInfinitePlane) {
-        directLighting += (diffuseAlbedo / 3.14159265f) * radiance * NdotL;
-      } else {
-        float3 H = normalize(V + L);
-        float NDF = distributionGGX(N, H, roughness);
-        float G = geometrySmith(N, V, L, roughness);
-        float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0, grazingMax);
-        float3 specular = (NDF * G * F) / max(4.0f * max(dot(N, V), 0.0f) * NdotL, 1e-4f);
-        float3 kS = F;
-        float3 kD = (1.0f - kS) * (1.0f - metallic);
-        directLighting += ((kD * albedo / 3.14159265f) + specular) * radiance * NdotL;
+    float lightPdf = 0.0f;
+    if (sampleAreaLight(surf.hitPos, surf.geomNormal, N, lighting, triangles, materials, rng, L, radiance, lightPdf, isector, scene, pointScene, ftable)) {
+      BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
+      if (eval.NdotL > 0.0f && eval.pdf > 0.0f) {
+        float weight = powerHeuristic(lightPdf, eval.pdf);
+        directLighting += eval.value * radiance * eval.NdotL * weight / lightPdf;
       }
     }
   }
 
-  // Environment ambient (IBL approximation).
-  // Metal surfaces have no diffuse term, so without this they stay black everywhere
-  // the GGX specular lobe doesn't directly face a light.  The path-bounce already
-  // picks up the sky stochastically; this term ensures the first convergence isn't
-  // pitch-black.  Scale by 0.3 so near-white metals (Silver, Mirror) don't blow out.
-  float3 envAmbient   = sampleEnvironment(N, lighting);
-  float3 ambientSpec  = F0 * envAmbient * 0.3f;
-  float3 kDa          = (float3(1.0f) - F0) * (1.0f - metallic);
-  float3 ambientDiff  = kDa * albedo * envAmbient * (0.3f / 3.14159265f);
-  directLighting += ambientSpec + ambientDiff;
+  float3 L;
+  float3 radiance;
+  float lightPdf = 0.0f;
+  if (sampleEnvironmentLight(surf.hitPos, surf.geomNormal, N, triangles, materials, environmentCells, lighting, rng,
+                             L, radiance, lightPdf, isector, scene, pointScene, ftable)) {
+    BsdfEvalResult eval = evaluateOpaqueBsdf(N, V, L, surf.baseColor, surf.metallic, surf.roughness, surf.dielectricF0);
+    if (eval.NdotL > 0.0f && eval.pdf > 0.0f) {
+      float weight = powerHeuristic(lightPdf, eval.pdf);
+      directLighting += eval.value * radiance * eval.NdotL * weight / lightPdf;
+    }
+  }
 
   return directLighting;
 }
 
-float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, device const GPUPunctualLight* sceneLights,
+float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 normal, float3 viewDir,
+                                        device const float4* positions, device const float2* texcoords,
                                         device const GPUTriangle* triangles, device const GPUMaterial* materials,
+                                        device const GPUTexture* textures, device const float4* texturePixels,
+                                        device const GPUPunctualLight* sceneLights, device const GPUEmissiveTriangle* emissiveTriangles,
+                                        device const GPUEnvironmentSampleCell* environmentCells,
                                         constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
                                         intersector<curve_data, triangle_data, instancing> isector, instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                         intersection_function_table<curve_data, triangle_data, instancing> ftable) {
-  float3 N = surf.normal;
-  float3 V = viewDir;
-  float roughness = clamp(surf.roughness, 0.01f, 1.0f);
-  float f0Scalar = pow((surf.ior - 1.0f) / (surf.ior + 1.0f), 2.0f);
-  float3 F0 = float3(f0Scalar);
   float3 specularLighting = float3(0.0f);
+  float3 N = normal;
+  float3 V = viewDir;
+  float roughness = clamp(surf.roughness, 0.001f, 1.0f);
 
   float mainIntensity = lighting.mainLightColorIntensity.w;
   if (mainIntensity > 1e-5f) {
     float3 L = normalize(-lighting.mainLightDirection.xyz);
-    float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
-    float visibility = shadowVisibility(surf.hitPos, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
-    float NdotL = max(dot(N, L), 0.0f);
-    if (NdotL > 0.0f && visibility > 0.0f) {
-      float3 H = normalize(V + L);
-      float NDF = distributionGGX(N, H, roughness);
-      float G = geometrySmith(N, V, L, roughness);
-      float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0);
-      float3 specular = (NDF * G * F) / max(4.0f * max(dot(N, V), 0.0f) * NdotL, 1e-4f);
-      specularLighting += specular * radiance * NdotL * visibility;
+    float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, 1e6f, triangles, materials, rng, isector, scene, pointScene, ftable);
+    if (visibility > 0.0f) {
+      BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
+      if (eval.NdotL > 0.0f) {
+        float3 radiance = lighting.mainLightColorIntensity.xyz * mainIntensity;
+        specularLighting += eval.value * radiance * eval.NdotL * visibility;
+      }
     }
   }
 
@@ -812,36 +1160,55 @@ float3 shadeStandardTransmissionSurface(SurfaceHitInfo surf, float3 viewDir, dev
       float3 radiance;
       float maxDistance = 1e6f;
       if (!samplePunctualLight(sceneLights, lightIndex, surf.hitPos, L, radiance, maxDistance)) continue;
-      float visibility = shadowVisibility(surf.hitPos, L, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
-      float NdotL = max(dot(N, L), 0.0f);
-      if (NdotL <= 0.0f || visibility <= 0.0f || all(radiance <= 0.0f)) continue;
-      float3 H = normalize(V + L);
-      float NDF = distributionGGX(N, H, roughness);
-      float G = geometrySmith(N, V, L, roughness);
-      float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0);
-      float3 specular = (NDF * G * F) / max(4.0f * max(dot(N, V), 0.0f) * NdotL, 1e-4f);
-      specularLighting += specular * radiance * NdotL * visibility;
+      float visibility = shadowVisibility(surf.hitPos, surf.geomNormal, L, maxDistance, triangles, materials, rng, isector, scene, pointScene, ftable);
+      if (visibility <= 0.0f || all(radiance <= 0.0f)) continue;
+      BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
+      if (eval.NdotL <= 0.0f) continue;
+      specularLighting += eval.value * radiance * eval.NdotL * visibility;
+    }
+  }
+
+  if (frame.emissiveTriangleCount > 0u) {
+    float3 L;
+    float3 radiance;
+    float lightPdf = 0.0f;
+    if (sampleEmissiveTriangleLight(surf.hitPos, surf.geomNormal, N, positions, texcoords, triangles, materials, textures, texturePixels,
+                                    emissiveTriangles, frame.emissiveTriangleCount, surf.triangleIndex, rng,
+                                    L, radiance, lightPdf, isector, scene, pointScene, ftable)) {
+      BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
+      if (eval.NdotL > 0.0f && eval.pdf > 0.0f) {
+        float weight = powerHeuristic(lightPdf, eval.pdf);
+        specularLighting += eval.value * radiance * eval.NdotL * weight / lightPdf;
+      }
     }
   }
 
   if (frame.enableAreaLight != 0u) {
     float3 L;
     float3 radiance;
-    if (sampleAreaLight(surf.hitPos, N, lighting, triangles, materials, rng, L, radiance, isector, scene, pointScene, ftable)) {
-      float NdotL = max(dot(N, L), 0.0f);
-      if (NdotL > 0.0f && any(radiance > 0.0f)) {
-        float3 H = normalize(V + L);
-        float NDF = distributionGGX(N, H, roughness);
-        float G = geometrySmith(N, V, L, roughness);
-        float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0);
-        float3 specular = (NDF * G * F) / max(4.0f * max(dot(N, V), 0.0f) * NdotL, 1e-4f);
-        specularLighting += specular * radiance * NdotL;
+    float lightPdf = 0.0f;
+    if (sampleAreaLight(surf.hitPos, surf.geomNormal, N, lighting, triangles, materials, rng, L, radiance, lightPdf, isector, scene, pointScene, ftable)) {
+      BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
+      if (eval.NdotL > 0.0f && eval.pdf > 0.0f) {
+        float weight = powerHeuristic(lightPdf, eval.pdf);
+        specularLighting += eval.value * radiance * eval.NdotL * weight / lightPdf;
       }
     }
   }
 
-  float3 ambientSpec = F0 * sampleEnvironment(N, lighting) * 0.15f;
-  return specularLighting + ambientSpec + surf.emissive;
+  float3 L;
+  float3 radiance;
+  float lightPdf = 0.0f;
+  if (sampleEnvironmentLight(surf.hitPos, surf.geomNormal, N, triangles, materials, environmentCells, lighting, rng,
+                             L, radiance, lightPdf, isector, scene, pointScene, ftable)) {
+    BsdfEvalResult eval = evaluateDielectricSpecularBsdf(N, V, L, roughness, surf.ior);
+    if (eval.NdotL > 0.0f && eval.pdf > 0.0f) {
+      float weight = powerHeuristic(lightPdf, eval.pdf);
+      specularLighting += eval.value * radiance * eval.NdotL * weight / lightPdf;
+    }
+  }
+
+  return specularLighting;
 }
 
 float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit, device const float4* positions, device const float4* normals,
@@ -849,6 +1216,8 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
                          device const GPUTriangle* triangles,
                          device const GPUMaterial* materials, device const GPUTexture* textures,
                          device const float4* texturePixels, device const GPUPunctualLight* sceneLights,
+                         device const GPUEmissiveTriangle* emissiveTriangles,
+                         device const GPUEnvironmentSampleCell* environmentCells,
                          device const GPUCurvePrimitive* curvePrimitives,
                          device const GPUPointPrimitive* pointPrimitives,
                          constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
@@ -858,7 +1227,8 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
   float3 currentViewDir = viewDir;
-  bool prevWasInfinitePlane = false;
+  float prevBsdfPdf = 1.0f;
+  bool prevWasDelta = true;
 
   for (uint bounce = 0u; bounce < max(frame.maxBounces, 1u); ++bounce) {
     SurfaceHitInfo surf;
@@ -874,11 +1244,15 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       }
     }
     if (surf.hit == 0u) {
-      float3 miss = sampleMissRadiance(currentRay.direction, lighting);
-      if (prevWasInfinitePlane) {
-        miss = mix(miss, lighting.backgroundColor.xyz, 0.92f);
+      float3 areaRadiance;
+      float areaPdf = 0.0f;
+      if (intersectVisibleAreaLight(currentRay, lighting, areaRadiance, areaPdf)) {
+        float missWeight = areaLightMISWeight(currentRay, prevBsdfPdf, prevWasDelta, lighting);
+        radiance += throughput * areaRadiance * missWeight;
+      } else {
+        float missWeight = environmentMISWeight(currentRay.direction, prevBsdfPdf, prevWasDelta, environmentCells);
+        radiance += throughput * sampleMissRadiance(currentRay.direction, lighting) * missWeight;
       }
-      radiance += throughput * miss;
       break;
     }
 
@@ -890,71 +1264,22 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
         if (rand01(rng) < fresnel) {
           bool front = dot(currentRay.direction, surf.normal) < 0.0f;
           float3 rN = front ? surf.normal : -surf.normal;
-          currentRay.origin = surf.hitPos + rN * 2e-3f;
           currentRay.direction = reflect(currentRay.direction, rN);
+          currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
           currentRay.min_distance = 1e-3f;
           currentRay.max_distance = 1e6f;
           currentViewDir = -currentRay.direction;
-          prevWasInfinitePlane = false;
+          prevBsdfPdf = 1.0f;
+          prevWasDelta = true;
           continue;
         }
       }
       if (rand01(rng) > surf.opacity) {
-        float pushSign = dot(currentRay.direction, surf.normal) > 0.0f ? 1.0f : -1.0f;
-        currentRay.origin = surf.hitPos + pushSign * surf.normal * 2e-3f;
+        currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
         currentRay.min_distance = 1e-3f;
         currentRay.max_distance = 1e6f;
-        prevWasInfinitePlane = false;
         continue;
       }
-    }
-
-    if (surf.transmission > 1e-4f && surf.opacity > 1.0f - 1e-4f) {
-      {
-        SurfaceHitInfo glassSurf = surf;
-        glassSurf.roughness = max(glassSurf.roughness, 0.08f);
-        radiance += throughput * shadeStandardTransmissionSurface(glassSurf, currentViewDir, sceneLights, triangles, materials,
-                                                                  frame, lighting, rng, isector, scene, pointScene, ftable);
-      }
-      float3 N = surf.normal;
-      bool frontFace = dot(currentRay.direction, N) < 0.0f;
-      float3 orientedN = frontFace ? N : -N;
-      float eta = frontFace ? (1.0f / surf.ior) : surf.ior;
-      float cosTheta = clamp(dot(-currentRay.direction, orientedN), 0.0f, 1.0f);
-      float sin2Theta = max(0.0f, 1.0f - cosTheta * cosTheta);
-      bool cannotRefract = eta * eta * sin2Theta > 1.0f;
-      float f0 = pow((surf.ior - 1.0f) / (surf.ior + 1.0f), 2.0f);
-      float fresnel = f0 + (1.0f - f0) * pow(1.0f - cosTheta, 5.0f);
-      if (cannotRefract) {
-        currentRay.origin = surf.hitPos + orientedN * 1e-2f;
-        currentRay.direction = reflect(currentRay.direction, orientedN);
-        currentRay.min_distance = 1e-3f;
-        currentRay.max_distance = 1e6f;
-        currentViewDir = -currentRay.direction;
-        prevWasInfinitePlane = surf.isInfinitePlane;
-        continue;
-      }
-
-      ray reflectedRay;
-      reflectedRay.origin = surf.hitPos + orientedN * 1e-2f;
-      reflectedRay.direction = reflect(currentRay.direction, orientedN);
-      reflectedRay.min_distance = 1e-3f;
-      reflectedRay.max_distance = 1e6f;
-      radiance += throughput *
-                  traceSpecularPath(reflectedRay, max(frame.maxBounces - bounce - 1u, 1u), positions, normals, texcoords, vertexColors,
-                                    triangles, materials, textures, texturePixels, sceneLights, curvePrimitives, pointPrimitives,
-                                    frame, lighting, rng, isector, scene, pointScene, ftable, isoScalars, tanHalfFov) *
-                  fresnel;
-
-      float3 tint = mix(float3(1.0f), surf.baseColor, 0.08f);
-      throughput *= tint * surf.transmission * max(1.0f - fresnel, 1e-3f);
-      currentRay.origin = surf.hitPos - orientedN * 1e-2f;
-      currentRay.direction = normalize(refract(currentRay.direction, orientedN, eta));
-      currentRay.min_distance = 1e-3f;
-      currentRay.max_distance = 1e6f;
-      currentViewDir = -currentRay.direction;
-      prevWasInfinitePlane = surf.isInfinitePlane;
-      continue;
     }
 
     if (surf.unlit) {
@@ -962,46 +1287,72 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       break;
     }
 
-    if (surf.isInfinitePlane) {
-      float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
-      radiance += throughput * (directLighting + surf.emissive);
-      throughput *= surf.baseColor * (1.0f - surf.metallic);
-      currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
-      if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
-      if (bounce >= 2u) {
-        float rrProb = clamp(max(max(throughput.x, throughput.y), throughput.z) + 0.001f, 0.05f, 0.95f);
-        if (rand01(rng) >= rrProb) break;
-        throughput /= rrProb;
+    if (any(surf.emissive > 0.0f)) {
+      float emissionWeight = emissiveSurfaceMISWeight(surf, currentRay.direction, prevBsdfPdf, prevWasDelta, emissiveTriangles);
+      radiance += throughput * surf.emissive * emissionWeight;
+    }
+
+    if (surf.transmission > 1e-4f && surf.opacity > 1.0f - 1e-4f) {
+      float3 N = surf.normal;
+      bool frontFace = dot(currentRay.direction, N) < 0.0f;
+      float3 orientedN = frontFace ? N : -N;
+      radiance += throughput * shadeStandardTransmissionSurface(surf, orientedN, currentViewDir, positions, texcoords, triangles, materials,
+                                                                textures, texturePixels, sceneLights, emissiveTriangles, environmentCells,
+                                                                frame, lighting, rng, isector, scene, pointScene, ftable);
+
+      float eta = frontFace ? (1.0f / surf.ior) : surf.ior;
+      float cosTheta = clamp(dot(-currentRay.direction, orientedN), 0.0f, 1.0f);
+      float sin2Theta = max(0.0f, 1.0f - cosTheta * cosTheta);
+      bool cannotRefract = eta * eta * sin2Theta > 1.0f;
+      float f0 = pow((surf.ior - 1.0f) / (surf.ior + 1.0f), 2.0f);
+      float fresnel = f0 + (1.0f - f0) * pow(1.0f - cosTheta, 5.0f);
+      if (cannotRefract) {
+        currentRay.direction = reflect(currentRay.direction, orientedN);
+        currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
+        currentRay.min_distance = 1e-3f;
+        currentRay.max_distance = 1e6f;
+        currentViewDir = -currentRay.direction;
+        prevBsdfPdf = 1.0f;
+        prevWasDelta = true;
+        continue;
       }
-      currentRay.origin = surf.hitPos + surf.normal * 1e-3f;
+
+      ray reflectedRay;
+      reflectedRay.direction = reflect(currentRay.direction, orientedN);
+      reflectedRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, reflectedRay.direction);
+      reflectedRay.min_distance = 1e-3f;
+      reflectedRay.max_distance = 1e6f;
+      radiance += throughput *
+                  traceSpecularPath(reflectedRay, max(frame.maxBounces - bounce - 1u, 1u), positions, normals, texcoords, vertexColors,
+                                    triangles, materials, textures, texturePixels, sceneLights, emissiveTriangles, environmentCells, curvePrimitives, pointPrimitives,
+                                    frame, lighting, rng, isector, scene, pointScene, ftable, isoScalars, tanHalfFov) *
+                  fresnel;
+
+      float3 tint = mix(float3(1.0f), surf.baseColor, 0.08f);
+      throughput *= tint * surf.transmission * max(1.0f - fresnel, 1e-3f);
+      currentRay.direction = normalize(refract(currentRay.direction, orientedN, eta));
+      currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
       currentRay.min_distance = 1e-3f;
       currentRay.max_distance = 1e6f;
       currentViewDir = -currentRay.direction;
-      prevWasInfinitePlane = true;
+      prevBsdfPdf = 1.0f;
+      prevWasDelta = true;
       continue;
     }
 
-    float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
-    float3 F0 = mix(float3(surf.dielectricF0), surf.baseColor, surf.metallic);
-    float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, surf.metallic);
-    float NdotV = max(dot(surf.normal, currentViewDir), 0.0f);
-    float3 F = fresnelSchlick(NdotV, F0, grazingMax);
-    radiance += throughput * (directLighting + surf.emissive);
+    float3 bsdfNormal = dot(currentRay.direction, surf.normal) < 0.0f ? surf.normal : -surf.normal;
+    float3 directLighting = evaluateDirectLightingPBR(surf, bsdfNormal, currentViewDir, positions, texcoords, triangles, materials, textures, texturePixels,
+                                                      sceneLights, emissiveTriangles, environmentCells, frame, lighting, rng, isector, scene, pointScene, ftable);
+    radiance += throughput * directLighting;
 
-    float specProb = clamp((F.x + F.y + F.z) / 3.0f + surf.metallic * 0.5f, 0.04f, 0.96f);
+    BsdfSampleResult bsdfSample = sampleOpaqueBsdf(bsdfNormal, currentViewDir, surf.baseColor, surf.metallic,
+                                                   surf.roughness, surf.dielectricF0, rng);
+    if (!bsdfSample.valid) break;
 
-    if (rand01(rng) < specProb) {
-      float3 bounceDir = sampleGGXBounce(surf.normal, currentViewDir, surf.roughness, rng);
-      if (dot(bounceDir, surf.normal) <= 0.0f) {
-        bounceDir = reflect(-currentViewDir, surf.normal);
-      }
-      throughput *= F / specProb;
-      currentRay.direction = bounceDir;
-    } else {
-      float3 kD = (1.0f - F) * (1.0f - surf.metallic);
-      throughput *= surf.baseColor * kD / (1.0f - specProb);
-      currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
-    }
+    throughput *= bsdfSample.throughput;
+    currentRay.direction = bsdfSample.direction;
+    prevBsdfPdf = bsdfSample.pdf;
+    prevWasDelta = bsdfSample.delta;
 
     if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
 
@@ -1011,11 +1362,10 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       throughput /= rrProb;
     }
 
-    currentRay.origin = surf.hitPos + surf.normal * 1e-3f;
+    currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
     currentRay.min_distance = 1e-3f;
     currentRay.max_distance = 1e6f;
     currentViewDir = -currentRay.direction;
-    prevWasInfinitePlane = surf.isInfinitePlane;
   }
 
   return radiance;
@@ -1026,6 +1376,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                          device const GPUTriangle* triangles,
                          device const GPUMaterial* materials, device const GPUTexture* textures,
                          device const float4* texturePixels, device const GPUPunctualLight* sceneLights,
+                         device const GPUEmissiveTriangle* emissiveTriangles,
+                         device const GPUEnvironmentSampleCell* environmentCells,
                          device const GPUCurvePrimitive* curvePrimitives,
                          device const GPUPointPrimitive* pointPrimitives,
                          constant GPUFrameUniforms& frame, constant GPULighting& lighting, thread uint& rng,
@@ -1035,7 +1387,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
   float3 throughput = float3(1.0f);
   float3 radiance = float3(0.0f);
   float3 currentViewDir = -currentRay.direction;
-  bool prevWasInfinitePlane = false;
+  float prevBsdfPdf = 1.0f;
+  bool prevWasDelta = true;
 
   for (uint bounce = 0u; bounce < max(remainingBounces, 1u); ++bounce) {
     SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
@@ -1046,16 +1399,15 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       surf = planeSurf;
     }
     if (surf.hit == 0u) {
-      float3 miss = sampleMissRadiance(currentRay.direction, lighting);
-      if (prevWasInfinitePlane) {
-        miss = mix(miss, lighting.backgroundColor.xyz, 0.92f);
+      float3 areaRadiance;
+      float areaPdf = 0.0f;
+      if (intersectVisibleAreaLight(currentRay, lighting, areaRadiance, areaPdf)) {
+        float missWeight = areaLightMISWeight(currentRay, prevBsdfPdf, prevWasDelta, lighting);
+        radiance += throughput * areaRadiance * missWeight;
+      } else {
+        float missWeight = environmentMISWeight(currentRay.direction, prevBsdfPdf, prevWasDelta, environmentCells);
+        radiance += throughput * sampleMissRadiance(currentRay.direction, lighting) * missWeight;
       }
-      radiance += throughput * miss;
-      break;
-    }
-
-    if (surf.unlit) {
-      radiance += throughput * surf.baseColor;
       break;
     }
 
@@ -1067,23 +1419,32 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
         if (rand01(rng) < fresnel) {
           bool front = dot(currentRay.direction, surf.normal) < 0.0f;
           float3 rN = front ? surf.normal : -surf.normal;
-          currentRay.origin = surf.hitPos + rN * 2e-3f;
           currentRay.direction = reflect(currentRay.direction, rN);
+          currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
           currentRay.min_distance = 1e-3f;
           currentRay.max_distance = 1e6f;
           currentViewDir = -currentRay.direction;
-          prevWasInfinitePlane = false;
+          prevBsdfPdf = 1.0f;
+          prevWasDelta = true;
           continue;
         }
       }
       if (rand01(rng) > surf.opacity) {
-        float pushSign = dot(currentRay.direction, surf.normal) > 0.0f ? 1.0f : -1.0f;
-        currentRay.origin = surf.hitPos + pushSign * surf.normal * 2e-3f;
+        currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
         currentRay.min_distance = 1e-3f;
         currentRay.max_distance = 1e6f;
-        prevWasInfinitePlane = false;
         continue;
       }
+    }
+
+    if (surf.unlit) {
+      radiance += throughput * surf.baseColor;
+      break;
+    }
+
+    if (any(surf.emissive > 0.0f)) {
+      float emissionWeight = emissiveSurfaceMISWeight(surf, currentRay.direction, prevBsdfPdf, prevWasDelta, emissiveTriangles);
+      radiance += throughput * surf.emissive * emissionWeight;
     }
 
     if (surf.transmission > 1e-4f && surf.opacity > 1.0f - 1e-4f) {
@@ -1098,59 +1459,35 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       float fresnel = f0 + (1.0f - f0) * pow(1.0f - cosTheta, 5.0f);
 
       if (cannotRefract || rand01(rng) < fresnel) {
-        currentRay.origin = surf.hitPos + orientedN * 1e-2f;
         currentRay.direction = reflect(currentRay.direction, orientedN);
       } else {
         float3 tint = mix(float3(1.0f), surf.baseColor, 0.08f);
         throughput *= tint * surf.transmission;
-        currentRay.origin = surf.hitPos - orientedN * 1e-2f;
         currentRay.direction = normalize(refract(currentRay.direction, orientedN, eta));
       }
 
+      currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
       currentRay.min_distance = 1e-3f;
       currentRay.max_distance = 1e6f;
       currentViewDir = -currentRay.direction;
-      prevWasInfinitePlane = surf.isInfinitePlane;
+      prevBsdfPdf = 1.0f;
+      prevWasDelta = true;
       continue;
     }
 
-    if (surf.isInfinitePlane) {
-      float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
-      radiance += throughput * (directLighting + surf.emissive);
-      throughput *= surf.baseColor * (1.0f - surf.metallic);
-      currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
-      if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
-      if (bounce >= 2u) {
-        float rrProb = clamp(max(max(throughput.x, throughput.y), throughput.z) + 0.001f, 0.05f, 0.95f);
-        if (rand01(rng) >= rrProb) break;
-        throughput /= rrProb;
-      }
-      currentRay.origin = surf.hitPos + surf.normal * 1e-3f;
-      currentRay.min_distance = 1e-3f;
-      currentRay.max_distance = 1e6f;
-      currentViewDir = -currentRay.direction;
-      prevWasInfinitePlane = true;
-      continue;
-    }
+    float3 bsdfNormal = dot(currentRay.direction, surf.normal) < 0.0f ? surf.normal : -surf.normal;
+    float3 directLighting = evaluateDirectLightingPBR(surf, bsdfNormal, currentViewDir, positions, texcoords, triangles, materials, textures, texturePixels,
+                                                      sceneLights, emissiveTriangles, environmentCells, frame, lighting, rng, isector, scene, pointScene, ftable);
+    radiance += throughput * directLighting;
 
-    float3 directLighting = evaluateDirectLightingPBR(surf, currentViewDir, sceneLights, triangles, materials, frame, lighting, rng, isector, scene, pointScene, ftable);
-    float3 F0 = mix(float3(surf.dielectricF0), surf.baseColor, surf.metallic);
-    float grazingMax = mix(clamp(surf.dielectricF0 * 25.0f, 0.0f, 1.0f), 1.0f, surf.metallic);
-    float NdotV = max(dot(surf.normal, currentViewDir), 0.0f);
-    float3 F = fresnelSchlick(NdotV, F0, grazingMax);
-    radiance += throughput * (directLighting + surf.emissive);
+    BsdfSampleResult bsdfSample = sampleOpaqueBsdf(bsdfNormal, currentViewDir, surf.baseColor, surf.metallic,
+                                                   surf.roughness, surf.dielectricF0, rng);
+    if (!bsdfSample.valid) break;
 
-    float specProb = clamp((F.x + F.y + F.z) / 3.0f + surf.metallic * 0.5f, 0.04f, 0.96f);
-    if (rand01(rng) < specProb) {
-      float3 bounceDir = sampleGGXBounce(surf.normal, currentViewDir, surf.roughness, rng);
-      if (dot(bounceDir, surf.normal) <= 0.0f) bounceDir = reflect(-currentViewDir, surf.normal);
-      throughput *= F / specProb;
-      currentRay.direction = bounceDir;
-    } else {
-      float3 kD = (1.0f - F) * (1.0f - surf.metallic);
-      throughput *= surf.baseColor * kD / (1.0f - specProb);
-      currentRay.direction = cosineWeightedHemisphere(surf.normal, rng);
-    }
+    throughput *= bsdfSample.throughput;
+    currentRay.direction = bsdfSample.direction;
+    prevBsdfPdf = bsdfSample.pdf;
+    prevWasDelta = bsdfSample.delta;
 
     if (max(max(throughput.x, throughput.y), throughput.z) < 1e-5f) break;
     if (bounce >= 2u) {
@@ -1159,11 +1496,10 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       throughput /= rrProb;
     }
 
-    currentRay.origin = surf.hitPos + surf.normal * 1e-3f;
+    currentRay.origin = offsetRayOrigin(surf.hitPos, surf.geomNormal, currentRay.direction);
     currentRay.min_distance = 1e-3f;
     currentRay.max_distance = 1e6f;
     currentViewDir = -currentRay.direction;
-    prevWasInfinitePlane = surf.isInfinitePlane;
   }
 
   return radiance;
@@ -1197,6 +1533,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
                                 intersection_function_table<curve_data, triangle_data, instancing> ftable [[buffer(24)]],
                                 device const GPUPointPrimitive* pointPrimitives [[buffer(25)]],
                                 device const float* isoScalars [[buffer(27)]],
+                                device const GPUEmissiveTriangle* emissiveTriangles [[buffer(28)]],
+                                device const GPUEnvironmentSampleCell* environmentCells [[buffer(29)]],
                                 uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= frame.width || gid.y >= frame.height) return;
 
@@ -1253,12 +1591,8 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       if (frame.renderMode == 0u) {
         sampleColor =
             traceStandardPath(currentRay, normalize(camera.position.xyz - surf.hitPos), surf, positions, normals, texcoords, vertexColors,
-                              triangles, materials, textures, texturePixels, sceneLights, curvePrimitives, pointPrimitives,
+                              triangles, materials, textures, texturePixels, sceneLights, emissiveTriangles, environmentCells, curvePrimitives, pointPrimitives,
                               frame, lighting, rng, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
-        float lum = dot(sampleColor, float3(0.212671f, 0.715160f, 0.072169f));
-        if (lum > 5.0f) {
-          sampleColor *= 5.0f / lum;
-        }
       } else {
         if (surf.unlit) {
           sampleColor = surf.baseColor;
@@ -1266,18 +1600,34 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
           float direct = 0.0f;
           if (lighting.mainLightColorIntensity.w > 1e-5f) {
             direct += evaluateDirectionalLight(lighting.mainLightDirection.xyz, lighting.mainLightColorIntensity.w, surf.hitPos,
-                                              surf.normal, triangles, materials, rng, isector, scene, pointScene, ftable);
+                                              surf.geomNormal, surf.normal, triangles, materials, rng, isector, scene, pointScene, ftable);
           }
           if (frame.lightCount > 0u) {
             for (uint lightIndex = 0u; lightIndex < frame.lightCount; ++lightIndex) {
-              direct += evaluatePunctualLight(sceneLights, lightIndex, surf.hitPos, surf.normal, isector, scene, pointScene, ftable);
+              direct += evaluatePunctualLight(sceneLights, lightIndex, surf.hitPos, surf.geomNormal, surf.normal,
+                                             triangles, materials, rng, isector, scene, pointScene, ftable);
             }
           }
           if (frame.enableAreaLight != 0u) {
             float3 areaL;
             float3 areaRadiance;
-            if (sampleAreaLight(surf.hitPos, surf.normal, lighting, triangles, materials, rng, areaL, areaRadiance, isector, scene, pointScene, ftable)) {
-              direct += dot(areaRadiance, float3(0.2126f, 0.7152f, 0.0722f)) * max(dot(surf.normal, areaL), 0.0f);
+            float areaPdf = 0.0f;
+            if (sampleAreaLight(surf.hitPos, surf.geomNormal, surf.normal, lighting, triangles, materials, rng, areaL, areaRadiance, areaPdf,
+                                isector, scene, pointScene, ftable)) {
+              direct += dot(areaRadiance, float3(0.2126f, 0.7152f, 0.0722f)) *
+                        max(dot(surf.normal, areaL), 0.0f) / max(areaPdf, 1e-6f);
+            }
+          }
+          if (frame.emissiveTriangleCount > 0u) {
+            float3 emissiveL;
+            float3 emissiveRadiance;
+            float emissivePdf = 0.0f;
+            if (sampleEmissiveTriangleLight(surf.hitPos, surf.geomNormal, surf.normal, positions, texcoords, triangles, materials, textures, texturePixels,
+                                            emissiveTriangles, frame.emissiveTriangleCount, surf.triangleIndex, rng,
+                                            emissiveL, emissiveRadiance, emissivePdf,
+                                            isector, scene, pointScene, ftable)) {
+              direct += dot(emissiveRadiance, float3(0.2126f, 0.7152f, 0.0722f)) *
+                        max(dot(surf.normal, emissiveL), 0.0f) / max(emissivePdf, 1e-6f);
             }
           }
           float intensity = max(frame.ambientFloor, toonShading(min(direct, 1.0f), frame.toonBandCount));
@@ -1293,7 +1643,13 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
         firstObjectId = surf.objectId;
       }
     } else {
-      sampleColor = sampleMissRadiance(direction, lighting);
+      float3 areaRadiance;
+      float areaPdf = 0.0f;
+      if (intersectVisibleAreaLight(currentRay, lighting, areaRadiance, areaPdf)) {
+        sampleColor = areaRadiance;
+      } else {
+        sampleColor = sampleMissRadiance(direction, lighting);
+      }
       if (firstFrameSample) {
         firstDepth = kBackgroundDepth;
         firstLinearDepth = -1.0f;

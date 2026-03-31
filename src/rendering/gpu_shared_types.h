@@ -59,6 +59,7 @@ struct GPUFrameUniforms {
   uint      frameIndex;
   uint      maxBounces;
   uint      lightCount;
+  uint      emissiveTriangleCount;
   uint      enableSceneLights;
   uint      enableAreaLight;
   uint      toonBandCount;
@@ -72,6 +73,7 @@ struct GPUFrameUniforms {
   uint32_t  frameIndex         = 0;
   uint32_t  maxBounces         = 2;
   uint32_t  lightCount         = 0;
+  uint32_t  emissiveTriangleCount = 0;
   uint32_t  enableSceneLights  = 1;
   uint32_t  enableAreaLight    = 0;
   uint32_t  toonBandCount      = 5;
@@ -168,6 +170,23 @@ struct GPUPunctualLight {
   float4 spotAngles;
 };
 
+struct GPUEmissiveTriangle {
+  // data.x = index into shaderTriangles / accel triangle list.
+  uint4 data;
+  // params.x = triangle area
+  // params.y = normalized selection probability
+  // params.z = cumulative distribution upper bound
+  // params.w = reserved
+  float4 params;
+};
+
+struct GPUEnvironmentSampleCell {
+  // data.x = normalized bin probability mass
+  // data.y = cumulative distribution upper bound
+  // data.zw = reserved
+  float4 data;
+};
+
 struct GPUCurvePrimitive {
   float4 p0_radius;
   float4 p1_type;
@@ -216,6 +235,7 @@ struct SceneGpuAccumulator {
   std::unordered_map<std::string, uint32_t> textureLookup;
   std::unordered_map<std::string, uint32_t> objectIdLookup;
   std::vector<GPUPunctualLight>     lights;
+  std::vector<GPUEmissiveTriangle>  emissiveTriangles;
   std::vector<GPUCurvePrimitive>    curvePrimitives;
   uint32_t nextObjectId = 1u;
 };

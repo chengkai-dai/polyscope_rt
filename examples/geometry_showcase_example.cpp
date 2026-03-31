@@ -52,10 +52,16 @@ struct Mesh {
 static Mesh makeSphere(glm::vec3 centre, float radius,
                        int latDiv = 32, int lonDiv = 48) {
   Mesh m;
-  for (int lat = 0; lat <= latDiv; ++lat) {
-    float theta = kPi * float(lat) / float(latDiv);   // 0 … π
-    for (int lon = 0; lon <= lonDiv; ++lon) {
-      float phi = kTwoPi * float(lon) / float(lonDiv); // 0 … 2π
+  latDiv = std::max(latDiv, 3);
+  lonDiv = std::max(lonDiv, 3);
+
+  const size_t topIndex = 0;
+  m.verts.push_back(centre + glm::vec3{0.0f, radius, 0.0f});
+
+  for (int lat = 1; lat < latDiv; ++lat) {
+    float theta = kPi * float(lat) / float(latDiv);   // 0 .. pi
+    for (int lon = 0; lon < lonDiv; ++lon) {
+      float phi = kTwoPi * float(lon) / float(lonDiv); // 0 .. 2pi
       glm::vec3 p = {
         radius * std::sin(theta) * std::cos(phi),
         radius * std::cos(theta),
@@ -64,15 +70,34 @@ static Mesh makeSphere(glm::vec3 centre, float radius,
       m.verts.push_back(centre + p);
     }
   }
-  auto idx = [&](int la, int lo) -> size_t {
-    return size_t(la * (lonDiv + 1) + lo);
+
+  const size_t bottomIndex = m.verts.size();
+  m.verts.push_back(centre + glm::vec3{0.0f, -radius, 0.0f});
+
+  auto ringIdx = [&](int lat, int lon) -> size_t {
+    int wrappedLon = (lon % lonDiv + lonDiv) % lonDiv;
+    return size_t(1 + (lat - 1) * lonDiv + wrappedLon);
   };
-  for (int la = 0; la < latDiv; ++la) {
-    for (int lo = 0; lo < lonDiv; ++lo) {
-      m.faces.push_back({idx(la,lo),   idx(la+1,lo),   idx(la,  lo+1)});
-      m.faces.push_back({idx(la,lo+1), idx(la+1,lo),   idx(la+1,lo+1)});
+
+  for (int lon = 0; lon < lonDiv; ++lon) {
+    m.faces.push_back({topIndex, ringIdx(1, lon + 1), ringIdx(1, lon)});
+  }
+
+  for (int lat = 1; lat < latDiv - 1; ++lat) {
+    for (int lon = 0; lon < lonDiv; ++lon) {
+      size_t a = ringIdx(lat, lon);
+      size_t b = ringIdx(lat + 1, lon);
+      size_t c = ringIdx(lat + 1, lon + 1);
+      size_t d = ringIdx(lat, lon + 1);
+      m.faces.push_back({a, c, b});
+      m.faces.push_back({a, d, c});
     }
   }
+
+  for (int lon = 0; lon < lonDiv; ++lon) {
+    m.faces.push_back({bottomIndex, ringIdx(latDiv - 1, lon), ringIdx(latDiv - 1, lon + 1)});
+  }
+
   return m;
 }
 
@@ -416,10 +441,12 @@ int main() {
                     3.5f);
 
   // Large area light above spanning all four rows.
-  // Centre (z=-0.35), v-half-width 1.4 → covers z ≈ -1.75 … +1.05.
+  // Centre (z=-0.35), v-half-width 1.4 -> covers z ~= -1.75 ... +1.05.
+  // Area-light emission is one-sided, so keep the basis winding such that it
+  // emits downward into the scene.
   ps::setAreaLight({0.0f, 2.2f, -0.35f},
                    {1.2f, 0.0f, 0.0f},
-                   {0.0f, 0.0f, 1.4f},
+                   {0.0f, 0.0f, -1.4f},
                    {1.5f, 1.46f, 1.43f});
 
   ps::setAmbientFloor(0.07f);

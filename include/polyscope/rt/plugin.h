@@ -60,7 +60,8 @@ size_t addSpotLight(glm::vec3 pos, glm::vec3 dir, glm::vec3 color, float intensi
 void removeLight(size_t handle);
 void removeAllLights();
 
-// Area light
+// Area light. Emission is one-sided; flip the winding of (u, v) to swap the
+// emitting side.
 void setAreaLight(glm::vec3 center, glm::vec3 u, glm::vec3 v, glm::vec3 emission);
 void disableAreaLight();
 

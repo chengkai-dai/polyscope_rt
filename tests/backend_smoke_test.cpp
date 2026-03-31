@@ -44,6 +44,22 @@ rt::RTMesh makeSphere(float radius, uint32_t latSegments, uint32_t lonSegments) 
   return mesh;
 }
 
+rt::RTMesh makeQuad(const char* name, glm::vec3 p0, glm::vec3 p1, glm::vec3 p2, glm::vec3 p3, glm::vec3 normal) {
+  rt::RTMesh mesh;
+  mesh.name = name;
+  mesh.vertices = {p0, p1, p2, p3};
+  mesh.normals = {normal, normal, normal, normal};
+  mesh.texcoords = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+  mesh.indices = {glm::uvec3(0, 1, 2), glm::uvec3(0, 2, 3)};
+  return mesh;
+}
+
+double luminance(const glm::vec3& c) {
+  return 0.2126 * static_cast<double>(c.r) +
+         0.7152 * static_cast<double>(c.g) +
+         0.0722 * static_cast<double>(c.b);
+}
+
 } // namespace
 
 int main() {
@@ -158,6 +174,76 @@ int main() {
     rt::RenderBuffer opaqueBuffer = backend->downloadRenderBuffer();
     const glm::vec3 opaqueCenter = opaqueBuffer.color[(camera.height / 2) * camera.width + (camera.width / 2)];
     require(center.z > opaqueCenter.z + 0.05f, "glass sphere should reveal more background than an opaque sphere");
+
+    // ---- Emissive material should remain visible without explicit lights ----
+    {
+      rt::RTScene emissiveScene;
+      rt::RTMesh emissiveQuad = makeQuad("emissive_quad",
+                                         {-0.8f, -0.8f, 0.0f}, {0.8f, -0.8f, 0.0f},
+                                         {0.8f,  0.8f, 0.0f}, {-0.8f,  0.8f, 0.0f},
+                                         {0.0f, 0.0f, 1.0f});
+      emissiveQuad.baseColorFactor = {0.0f, 0.0f, 0.0f, 1.0f};
+      emissiveQuad.emissiveFactor = {10.0f, 4.0f, 1.0f};
+      emissiveScene.meshes.push_back(emissiveQuad);
+      emissiveScene.hash = 45;
+      backend->setScene(emissiveScene);
+      backend->resetAccumulation();
+
+      rt::RenderConfig emissiveConfig;
+      emissiveConfig.renderMode = rt::RenderMode::Standard;
+      emissiveConfig.samplesPerIteration = 1;
+      emissiveConfig.maxBounces = 1;
+      emissiveConfig.accumulate = false;
+      emissiveConfig.lighting.backgroundColor = {0.0f, 0.0f, 0.0f};
+      emissiveConfig.lighting.environmentIntensity = 0.0f;
+      emissiveConfig.lighting.ambientFloor = 0.0f;
+      emissiveConfig.lighting.mainLightIntensity = 0.0f;
+      emissiveConfig.lighting.enableAreaLight = false;
+
+      backend->renderIteration(emissiveConfig);
+      rt::RenderBuffer emissiveBuffer = backend->downloadRenderBuffer();
+      const glm::vec3 emissiveCenter = emissiveBuffer.color[(camera.height / 2) * camera.width + (camera.width / 2)];
+      require(luminance(emissiveCenter) > 0.08, "emissive surface should stay visibly bright without explicit lights");
+    }
+
+    // ---- Emissive geometry should illuminate nearby diffuse receivers ----
+    {
+      rt::RTScene emissiveLightScene;
+      rt::RTMesh floor = makeQuad("receiver_floor",
+                                  {-1.6f, -0.6f, -1.2f}, {1.6f, -0.6f, -1.2f},
+                                  {1.6f, -0.6f,  1.2f}, {-1.6f, -0.6f,  1.2f},
+                                  {0.0f, 1.0f, 0.0f});
+      floor.baseColorFactor = {0.8f, 0.8f, 0.8f, 1.0f};
+      floor.roughnessFactor = 0.8f;
+      emissiveLightScene.meshes.push_back(floor);
+
+      rt::RTMesh lightQuad = makeQuad("ceiling_light",
+                                      {-0.55f, 1.0f, -0.35f}, {-0.55f, 1.0f, 0.35f},
+                                      { 0.55f, 1.0f,  0.35f}, { 0.55f, 1.0f, -0.35f},
+                                      {0.0f, -1.0f, 0.0f});
+      lightQuad.baseColorFactor = {0.0f, 0.0f, 0.0f, 1.0f};
+      lightQuad.emissiveFactor = {14.0f, 13.0f, 12.0f};
+      emissiveLightScene.meshes.push_back(lightQuad);
+      emissiveLightScene.hash = 46;
+      backend->setScene(emissiveLightScene);
+      backend->resetAccumulation();
+
+      rt::RenderConfig emissiveLightConfig;
+      emissiveLightConfig.renderMode = rt::RenderMode::Standard;
+      emissiveLightConfig.samplesPerIteration = 4;
+      emissiveLightConfig.maxBounces = 1;
+      emissiveLightConfig.accumulate = false;
+      emissiveLightConfig.lighting.backgroundColor = {0.0f, 0.0f, 0.0f};
+      emissiveLightConfig.lighting.environmentIntensity = 0.0f;
+      emissiveLightConfig.lighting.ambientFloor = 0.0f;
+      emissiveLightConfig.lighting.mainLightIntensity = 0.0f;
+      emissiveLightConfig.lighting.enableAreaLight = false;
+
+      backend->renderIteration(emissiveLightConfig);
+      rt::RenderBuffer emissiveLightBuffer = backend->downloadRenderBuffer();
+      const glm::vec3 litReceiver = emissiveLightBuffer.color[(camera.height / 2) * camera.width + (camera.width / 2)];
+      require(luminance(litReceiver) > 0.03, "emissive geometry should directly light nearby diffuse surfaces");
+    }
 
     // ---- Curve primitive pipeline smoke test ----
     {

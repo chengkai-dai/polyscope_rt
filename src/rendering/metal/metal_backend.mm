@@ -3,6 +3,7 @@
 #include "rendering/metal/metal_postprocess.h"
 #include "rendering/metal/metal_scene_builder.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -19,6 +20,110 @@
 #include "glm/glm.hpp"
 
 namespace {
+
+constexpr uint32_t kEnvironmentSampleWidth = 64u;
+constexpr uint32_t kEnvironmentSampleHeight = 32u;
+constexpr uint32_t kEnvironmentSampleCellCount = kEnvironmentSampleWidth * kEnvironmentSampleHeight;
+constexpr float kPi = 3.14159265358979323846f;
+
+float luminance(const simd_float3& color) {
+  return 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
+}
+
+simd_float3 lerp3(const simd_float3& a, const simd_float3& b, float t) {
+  return a + (b - a) * t;
+}
+
+simd_float3 evaluateEnvironmentRadiance(const rt::LightingSettings& lighting, const simd_float3& dir) {
+  const simd_float3 bg = simd_make_float3(lighting.backgroundColor.x, lighting.backgroundColor.y, lighting.backgroundColor.z);
+  const simd_float3 tint = simd_make_float3(lighting.environmentTint.x, lighting.environmentTint.y, lighting.environmentTint.z);
+  const float envIntensity = std::max(lighting.environmentIntensity, 0.0f);
+  const float y = std::clamp(dir.y, -1.0f, 1.0f);
+
+  const simd_float3 horizonColor = bg;
+  const simd_float3 zenithColor = lerp3(bg, bg * simd_make_float3(0.35f, 0.55f, 1.05f), 0.75f);
+  const simd_float3 groundColor = bg * simd_make_float3(0.08f, 0.08f, 0.09f);
+
+  simd_float3 sky;
+  if (y > 0.0f) {
+    const float t = std::pow(y, 0.29f);
+    sky = lerp3(horizonColor, zenithColor, t);
+  } else {
+    const float t = std::pow(std::clamp(-y, 0.0f, 1.0f), 0.92f);
+    sky = lerp3(horizonColor * 0.65f, groundColor, t);
+  }
+
+  const float hemi = std::clamp(y * 0.5f + 0.5f, 0.0f, 1.0f);
+  const simd_float3 tintHorizon = bg * simd_make_float3(0.45f, 0.48f, 0.55f);
+  const simd_float3 envTint = lerp3(tintHorizon, tint, hemi) * envIntensity;
+  return simd_max(sky + envTint, simd_make_float3(0.0f, 0.0f, 0.0f));
+}
+
+std::vector<GPUEnvironmentSampleCell> buildEnvironmentSampleCells(const rt::LightingSettings& lighting) {
+  std::vector<GPUEnvironmentSampleCell> cells(kEnvironmentSampleCellCount);
+  std::vector<float> weights(kEnvironmentSampleCellCount, 0.0f);
+  double totalWeight = 0.0;
+
+  for (uint32_t row = 0; row < kEnvironmentSampleHeight; ++row) {
+    const float theta0 = kPi * static_cast<float>(row) / static_cast<float>(kEnvironmentSampleHeight);
+    const float theta1 = kPi * static_cast<float>(row + 1u) / static_cast<float>(kEnvironmentSampleHeight);
+    const float theta = 0.5f * (theta0 + theta1);
+    const float sinTheta = std::sin(theta);
+    const float cosTheta = std::cos(theta);
+    const float solidAngle =
+        (2.0f * kPi / static_cast<float>(kEnvironmentSampleWidth)) * std::max(std::cos(theta0) - std::cos(theta1), 1e-6f);
+
+    for (uint32_t col = 0; col < kEnvironmentSampleWidth; ++col) {
+      const uint32_t idx = row * kEnvironmentSampleWidth + col;
+      const float phi = 2.0f * kPi * (static_cast<float>(col) + 0.5f) / static_cast<float>(kEnvironmentSampleWidth);
+      const simd_float3 dir = simd_make_float3(std::cos(phi) * sinTheta, cosTheta, std::sin(phi) * sinTheta);
+      const simd_float3 radiance = evaluateEnvironmentRadiance(lighting, dir);
+      const float weight = std::max(luminance(radiance), 0.0f) * solidAngle;
+      weights[idx] = weight;
+      totalWeight += static_cast<double>(weight);
+    }
+  }
+
+  if (totalWeight <= 1e-8) {
+    for (uint32_t idx = 0; idx < kEnvironmentSampleCellCount; ++idx) {
+      cells[idx].data = simd_make_float4(0.0f, idx == 0u ? 1.0f : 0.0f, 0.0f, 0.0f);
+    }
+    return cells;
+  }
+
+  float cumulative = 0.0f;
+  for (uint32_t idx = 0; idx < kEnvironmentSampleCellCount; ++idx) {
+    const float pmf = static_cast<float>(weights[idx] / totalWeight);
+    cumulative += pmf;
+    cells[idx].data = simd_make_float4(pmf, cumulative, 0.0f, 0.0f);
+  }
+  cells.back().data.y = 1.0f;
+  return cells;
+}
+
+void normalizeEmissiveTriangleDistribution(std::vector<GPUEmissiveTriangle>& emissiveTriangles) {
+  if (emissiveTriangles.empty()) return;
+
+  double totalWeight = 0.0;
+  for (const GPUEmissiveTriangle& tri : emissiveTriangles) totalWeight += static_cast<double>(tri.params.y);
+
+  if (totalWeight <= 1e-8) {
+    for (size_t i = 0; i < emissiveTriangles.size(); ++i) {
+      emissiveTriangles[i].params.y = 0.0f;
+      emissiveTriangles[i].params.z = (i == emissiveTriangles.size() - 1u) ? 1.0f : 0.0f;
+    }
+    return;
+  }
+
+  float cumulative = 0.0f;
+  for (GPUEmissiveTriangle& tri : emissiveTriangles) {
+    const float selectionPdf = static_cast<float>(static_cast<double>(tri.params.y) / totalWeight);
+    cumulative += selectionPdf;
+    tri.params.y = selectionPdf;
+    tri.params.z = cumulative;
+  }
+  emissiveTriangles.back().params.z = 1.0f;
+}
 
 class MetalPathTracerBackend final : public rt::IRayTracingBackend {
 public:
@@ -41,6 +146,7 @@ public:
 
       NSError* error = nil;
       std::string resolvedPath = metal_rt::resolveShaderLibraryPath(shaderLibraryPath);
+      std::fprintf(stderr, "[polyscope_rt] Loading Metal shader library: %s\n", resolvedPath.c_str());
       NSString* metallibPath = [NSString stringWithUTF8String:resolvedPath.c_str()];
       library_ = [device_ newLibraryWithURL:[NSURL fileURLWithPath:metallibPath] error:&error];
       if (library_ == nil) {
@@ -101,6 +207,9 @@ public:
       frameBuffer_    = [device_ newBufferWithLength:sizeof(GPUFrameUniforms) options:MTLResourceStorageModeShared];
       lightingBuffer_ = [device_ newBufferWithLength:sizeof(GPULighting)      options:MTLResourceStorageModeShared];
       toonBuffer_     = [device_ newBufferWithLength:sizeof(GPUToonUniforms)  options:MTLResourceStorageModeShared];
+      environmentSampleBuffer_ =
+          [device_ newBufferWithLength:kEnvironmentSampleCellCount * sizeof(GPUEnvironmentSampleCell)
+                               options:MTLResourceStorageModeShared];
     }
   }
 
@@ -215,6 +324,8 @@ public:
       frame.maxBounces = std::max<uint32_t>(frame.maxBounces, 4u);
     }
     frame.lightCount = static_cast<uint32_t>(scene_.lights.size());
+    frame.emissiveTriangleCount = emissiveTriangleCount_;
+    frame.enableSceneLights = scene_.lights.empty() ? 0u : 1u;
     frame.enableAreaLight = config.lighting.enableAreaLight ? 1u : 0u;
     frame.toonBandCount = static_cast<uint32_t>(std::max(0, config.lighting.toonBandCount));
     frame.ambientFloor = std::max(0.0f, config.lighting.ambientFloor);
@@ -248,6 +359,10 @@ public:
     lighting.areaLightV = metal_rt::makeFloat4(config.lighting.areaLightV, 0.0f);
     lighting.areaLightEmission = metal_rt::makeFloat4(config.lighting.areaLightEmission, 0.0f);
     std::memcpy(lightingBuffer_.contents, &lighting, sizeof(GPULighting));
+
+    const std::vector<GPUEnvironmentSampleCell> environmentCells = buildEnvironmentSampleCells(config.lighting);
+    std::memcpy(environmentSampleBuffer_.contents, environmentCells.data(),
+                environmentCells.size() * sizeof(GPUEnvironmentSampleCell));
 
     // --- GPUToonUniforms ---
     GPUToonUniforms toon = metal_rt::makeToonShaderUniforms(config, width_, height_);
@@ -422,6 +537,8 @@ public:
     [encoder setBuffer:pointPrimitiveBuffer_   offset:0 atIndex:25];
     [encoder setAccelerationStructure:pointAcceleration_ atBufferIndex:26];
     [encoder setBuffer:isoScalarsBuffer_       offset:0 atIndex:27];
+    [encoder setBuffer:emissiveTriangleBuffer_ offset:0 atIndex:28];
+    [encoder setBuffer:environmentSampleBuffer_ offset:0 atIndex:29];
     if (triangleBLAS_ != nil && triangleBLAS_ != meshCurveAcceleration_) {
       [encoder useResource:triangleBLAS_ usage:MTLResourceUsageRead];
     }
@@ -686,6 +803,19 @@ private:
                                         length:acc.lights.size() * sizeof(GPUPunctualLight)
                                        options:MTLResourceStorageModeShared];
 
+    if (acc.emissiveTriangles.empty()) {
+      GPUEmissiveTriangle dummy{};
+      dummy.params = simd_make_float4(1.0f, 0.0f, 1.0f, 0.0f);
+      acc.emissiveTriangles.push_back(dummy);
+      emissiveTriangleCount_ = 0u;
+    } else {
+      normalizeEmissiveTriangleDistribution(acc.emissiveTriangles);
+      emissiveTriangleCount_ = static_cast<uint32_t>(acc.emissiveTriangles.size());
+    }
+    emissiveTriangleBuffer_ = [device_ newBufferWithBytes:acc.emissiveTriangles.data()
+                                                   length:acc.emissiveTriangles.size() * sizeof(GPUEmissiveTriangle)
+                                                  options:MTLResourceStorageModeShared];
+
     if (!acc.curvePrimitives.empty()) {
       curvePrimitiveBuffer_ = [device_ newBufferWithBytes:acc.curvePrimitives.data()
                                                    length:acc.curvePrimitives.size() * sizeof(GPUCurvePrimitive)
@@ -946,6 +1076,8 @@ private:
   id<MTLBuffer> textureMetadataBuffer_ = nil;
   id<MTLBuffer> texturePixelBuffer_ = nil;
   id<MTLBuffer> lightBuffer_ = nil;
+  id<MTLBuffer> emissiveTriangleBuffer_ = nil;
+  id<MTLBuffer> environmentSampleBuffer_ = nil;
 
   // Acceleration structures
   id<MTLAccelerationStructure> meshCurveAcceleration_ = nil;
@@ -967,6 +1099,7 @@ private:
   id<MTLBuffer> pointBboxBuffer_ = nil;
   std::vector<GPUPointPrimitive> pointPrimitives_;
   std::vector<MTLAxisAlignedBoundingBox> pointBboxData_;
+  uint32_t emissiveTriangleCount_ = 0u;
 
   id<MTLIntersectionFunctionTable> intersectionFunctionTable_ = nil;
 
