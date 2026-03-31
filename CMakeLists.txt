@@ -55,6 +55,9 @@ add_library(
   src/plugin/polyscope_rt_runtime.cpp
   src/plugin/polyscope_rt_runtime_gui.cpp
   src/scene/polyscope_scene_snapshot.cpp
+  src/rendering/backend_factory.cpp
+  src/rendering/environment_model.cpp
+  src/rendering/scene_packer.cpp
   src/rendering/metal/metal_device.mm
   src/rendering/metal/metal_scene_builder.mm
   src/rendering/metal/metal_standard_preset.mm
@@ -125,6 +128,7 @@ set(METAL_SOURCES
 )
 set(METAL_SHARED_HEADERS
   ${METAL_SHADER_INCLUDE_DIR}/gpu_shared_types.h
+  ${METAL_SHADER_INCLUDE_DIR}/environment_model_shared.h
   ${METAL_SHADER_DIR}/shader_common.h
 )
 set(METAL_AIR_FILES)
@@ -323,4 +327,6 @@ if(BUILD_TESTING)
   polyscope_rt_add_private_test(preset_switching_test tests/preset_switching_test.cpp)
   polyscope_rt_add_private_test(quantity_extraction_test tests/quantity_extraction_test.cpp)
   polyscope_rt_add_private_test(rendering_quality_test tests/rendering_quality_test.cpp)
+  polyscope_rt_add_private_test(environment_model_test tests/environment_model_test.cpp)
+  polyscope_rt_add_private_test(architecture_constraints_test tests/architecture_constraints_test.cpp)
 endif()

@@ -56,6 +56,7 @@ private:
   bool rayTracingEnabled_ = false;
   int previewSamplesPerFrame_ = 1;
   int maxBounces_ = 6;
+  rt::BackendType backendType_ = rt::BackendType::Metal;
   bool autoSyncScene_ = true;
   int sceneSyncIntervalFrames_ = 30;
   int staticDisplayInterval_ = 2;

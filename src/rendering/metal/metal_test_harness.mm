@@ -1,5 +1,6 @@
 #include "rendering/ray_tracing_backend.h"
 #include "rendering/metal/metal_device.h"
+#include "rendering/metal/metal_test_harness_private.h"
 
 #include <cstring>
 #include <stdexcept>
@@ -238,9 +239,8 @@ private:
 
 namespace rt {
 
-std::unique_ptr<IPostProcessTestHarness> createTestHarness(BackendType type, const std::string& shaderLibraryPath) {
-  if (type == BackendType::Metal) return std::make_unique<MetalShaderTestHarness>(shaderLibraryPath);
-  throw std::runtime_error("Unsupported backend type");
+std::unique_ptr<IPostProcessTestHarness> createMetalTestHarnessImpl(const std::string& shaderLibraryPath) {
+  return std::make_unique<MetalShaderTestHarness>(shaderLibraryPath);
 }
 
 } // namespace rt

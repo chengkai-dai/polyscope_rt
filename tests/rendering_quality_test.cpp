@@ -63,6 +63,19 @@ rt::RenderConfig darkConfig() {
   return cfg;
 }
 
+rt::RenderConfig standardConfig() {
+  rt::RenderConfig cfg;
+  cfg.renderMode = rt::RenderMode::Standard;
+  cfg.samplesPerIteration = 1;
+  cfg.maxBounces = 1;
+  cfg.accumulate = false;
+  cfg.lighting.backgroundColor = {0.0f, 0.0f, 0.0f};
+  cfg.lighting.environmentIntensity = 0.0f;
+  cfg.lighting.ambientFloor = 0.0f;
+  cfg.lighting.mainLightIntensity = 1.0f;
+  return cfg;
+}
+
 // Build a tessellated unit sphere with the given lat/lon subdivision.
 rt::RTMesh makeSphere(float r, uint32_t lat, uint32_t lon,
                       bool smoothNormals, const glm::vec4& color) {
@@ -89,6 +102,23 @@ rt::RTMesh makeSphere(float r, uint32_t lat, uint32_t lon,
     }
   m.baseColorFactor = color;
   m.roughnessFactor = 0.7f;
+  return m;
+}
+
+rt::RTMesh makeQuad(const char* name, bool faceCamera, const glm::vec4& color) {
+  rt::RTMesh m;
+  m.name = name;
+  m.vertices = {{-1.0f, -1.0f, 0.0f}, {1.0f, -1.0f, 0.0f}, {1.0f, 1.0f, 0.0f}, {-1.0f, 1.0f, 0.0f}};
+  m.texcoords = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+  if (faceCamera) {
+    m.normals = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
+    m.indices = {glm::uvec3(0, 1, 2), glm::uvec3(0, 2, 3)};
+  } else {
+    m.normals = {{0, 0, -1}, {0, 0, -1}, {0, 0, -1}, {0, 0, -1}};
+    m.indices = {glm::uvec3(0, 2, 1), glm::uvec3(0, 3, 2)};
+  }
+  m.baseColorFactor = color;
+  m.roughnessFactor = 0.6f;
   return m;
 }
 
@@ -386,6 +416,129 @@ void testEmptySceneReturnsBackground(rt::IRayTracingBackend& backend) {
           "empty scene should show background color (blue > red)");
 }
 
+// -------------------------------------------------------------------------
+// Test 8: doubleSided enables back-face shading on thin quads.
+// -------------------------------------------------------------------------
+void testDoubleSidedBackFaceShading(rt::IRayTracingBackend& backend) {
+  auto cam = makeCamera();
+  backend.resize(cam.width, cam.height);
+  backend.updateCamera(cam);
+
+  auto cfg = standardConfig();
+  cfg.lighting.mainLightDirection = {0.0f, 0.0f, -1.0f};
+  cfg.lighting.mainLightIntensity = 1.5f;
+
+  auto renderBackFaceQuad = [&](bool doubleSided, uint32_t hash) {
+    rt::RTScene scene;
+    rt::RTMesh quad = makeQuad(doubleSided ? "double_sided_quad" : "single_sided_quad", false,
+                               {0.9f, 0.9f, 0.9f, 1.0f});
+    quad.doubleSided = doubleSided;
+    scene.meshes.push_back(quad);
+    scene.hash = hash;
+    backend.setScene(scene);
+    backend.resetAccumulation();
+    backend.renderIteration(cfg);
+    return backend.downloadRenderBuffer();
+  };
+
+  rt::RenderBuffer singleSided = renderBackFaceQuad(false, 770);
+  rt::RenderBuffer doubleSided = renderBackFaceQuad(true, 771);
+
+  double singleLum = 0.0;
+  double doubleLum = 0.0;
+  for (const auto& c : singleSided.color) singleLum += c.x + c.y + c.z;
+  for (const auto& c : doubleSided.color) doubleLum += c.x + c.y + c.z;
+
+  require(doubleLum > singleLum + 5.0,
+          "double-sided back-face quad should become visibly brighter than the single-sided version");
+}
+
+// -------------------------------------------------------------------------
+// Test 9: doubleSided emissive quads emit from the back face as well.
+// -------------------------------------------------------------------------
+void testDoubleSidedEmissiveBackFaceVisible(rt::IRayTracingBackend& backend) {
+  auto cam = makeCamera();
+  backend.resize(cam.width, cam.height);
+  backend.updateCamera(cam);
+
+  auto cfg = standardConfig();
+  cfg.lighting.mainLightIntensity = 0.0f;
+
+  auto renderEmissiveBackFace = [&](bool doubleSided, uint32_t hash) {
+    rt::RTScene scene;
+    rt::RTMesh quad = makeQuad(doubleSided ? "double_sided_emissive" : "single_sided_emissive", false,
+                               {0.0f, 0.0f, 0.0f, 1.0f});
+    quad.doubleSided = doubleSided;
+    quad.emissiveFactor = {6.0f, 3.0f, 1.0f};
+    scene.meshes.push_back(quad);
+    scene.hash = hash;
+    backend.setScene(scene);
+    backend.resetAccumulation();
+    backend.renderIteration(cfg);
+    return backend.downloadRenderBuffer();
+  };
+
+  rt::RenderBuffer singleSided = renderEmissiveBackFace(false, 780);
+  rt::RenderBuffer doubleSided = renderEmissiveBackFace(true, 781);
+
+  const size_t centerIndex = (cam.height / 2) * cam.width + (cam.width / 2);
+  const glm::vec3 singleCenter = singleSided.color[centerIndex];
+  const glm::vec3 doubleCenter = doubleSided.color[centerIndex];
+  require(glm::length(doubleCenter) > glm::length(singleCenter) + 0.15f,
+          "double-sided emissive quad should stay visible from the back face");
+}
+
+// -------------------------------------------------------------------------
+// Test 10: normal maps change the rendered shading.
+// -------------------------------------------------------------------------
+void testNormalMapAffectsShading(rt::IRayTracingBackend& backend) {
+  auto cam = makeCamera();
+  backend.resize(cam.width, cam.height);
+  backend.updateCamera(cam);
+
+  auto cfg = standardConfig();
+  cfg.lighting.mainLightDirection = {-0.7f, 0.0f, -0.7f};
+  cfg.lighting.mainLightIntensity = 1.2f;
+
+  auto renderNormalMappedQuad = [&](bool useNormalMap, uint32_t hash) {
+    rt::RTScene scene;
+    rt::RTMesh quad = makeQuad(useNormalMap ? "normal_mapped_quad" : "flat_quad", true,
+                               {0.7f, 0.7f, 0.7f, 1.0f});
+    quad.roughnessFactor = 0.5f;
+    if (useNormalMap) {
+      quad.hasNormalTexture = true;
+      quad.normalTexture.width = 2;
+      quad.normalTexture.height = 2;
+      quad.normalTexture.cacheKey = "test_normal_map";
+      quad.normalTextureScale = 1.0f;
+      const glm::vec3 tangentNormal = glm::normalize(glm::vec3(1.0f, 0.0f, 1.0f));
+      const glm::vec4 encoded = glm::vec4(tangentNormal * 0.5f + 0.5f, 1.0f);
+      quad.normalTexture.pixels.assign(4, encoded);
+    }
+    scene.meshes.push_back(quad);
+    scene.hash = hash;
+    backend.setScene(scene);
+    backend.resetAccumulation();
+    backend.renderIteration(cfg);
+    return backend.downloadRenderBuffer();
+  };
+
+  rt::RenderBuffer flat = renderNormalMappedQuad(false, 790);
+  rt::RenderBuffer mapped = renderNormalMappedQuad(true, 791);
+
+  int diffCount = 0;
+  double mappedLum = 0.0;
+  double flatLum = 0.0;
+  for (size_t i = 0; i < flat.color.size(); ++i) {
+    flatLum += flat.color[i].x + flat.color[i].y + flat.color[i].z;
+    mappedLum += mapped.color[i].x + mapped.color[i].y + mapped.color[i].z;
+    if (glm::length(flat.color[i] - mapped.color[i]) > 0.01f) ++diffCount;
+  }
+
+  require(diffCount > 20, "normal map should measurably alter the shading");
+  require(std::abs(mappedLum - flatLum) > 1.0, "normal map should change the integrated scene luminance");
+}
+
 } // namespace
 
 int main() {
@@ -399,6 +552,9 @@ int main() {
     testMultipleMeshesCoexist(*backend);
     testAccumulationKeepsDepthStable(*backend);
     testEmptySceneReturnsBackground(*backend);
+    testDoubleSidedBackFaceShading(*backend);
+    testDoubleSidedEmissiveBackFaceVisible(*backend);
+    testNormalMapAffectsShading(*backend);
 
     std::cout << "rendering_quality_test passed" << std::endl;
     return 0;

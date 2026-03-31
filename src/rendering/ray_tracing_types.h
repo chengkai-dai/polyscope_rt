@@ -264,4 +264,32 @@ struct RenderBuffer {
   uint32_t accumulatedSamples = 0;
 };
 
+inline AppearanceConfig makeDefaultAppearanceConfig() {
+  AppearanceConfig config;
+  config.mode = RenderMode::Standard;
+  config.enableMetalFX = false;
+  config.lighting = LightingSettings{};
+  config.lighting.mainLightIntensity = 0.0f;
+  config.lighting.environmentIntensity = 0.3f;
+  config.toon = ToonSettings{};
+  config.toon.enabled = false;
+  config.toon.edgeThickness = 1.0f;
+  config.toon.depthThreshold = 0.015f;
+  config.toon.normalThreshold = 0.12f;
+  config.toon.enableDetailContour = true;
+  config.toon.enableObjectContour = true;
+  config.toon.enableNormalEdge = true;
+  config.toon.enableDepthEdge = true;
+  config.toon.detailContourStrength = 1.0f;
+  config.toon.objectContourStrength = 1.0f;
+  config.toon.edgeColor = glm::vec3(0.3f);
+  config.toon.useFxaa = true;
+  config.toon.tonemapExposure = 3.0f;
+  config.toon.tonemapGamma = 2.2f;
+  config.toon.backgroundColor = config.lighting.backgroundColor;
+  config.toon.bandCount = config.lighting.toonBandCount;
+  config.groundPlane = InfinitePlaneSettings{};
+  return config;
+}
+
 } // namespace rt

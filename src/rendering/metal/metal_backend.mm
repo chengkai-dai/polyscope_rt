@@ -1,7 +1,11 @@
 #include "rendering/ray_tracing_backend.h"
+#include "rendering/environment_model.h"
+#include "rendering/environment_model_shared.h"
+#include "rendering/metal/metal_backend_private.h"
 #include "rendering/metal/metal_device.h"
 #include "rendering/metal/metal_postprocess.h"
 #include "rendering/metal/metal_scene_builder.h"
+#include "rendering/scene_packer.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -21,85 +25,7 @@
 
 namespace {
 
-constexpr uint32_t kEnvironmentSampleWidth = 64u;
-constexpr uint32_t kEnvironmentSampleHeight = 32u;
-constexpr uint32_t kEnvironmentSampleCellCount = kEnvironmentSampleWidth * kEnvironmentSampleHeight;
-constexpr float kPi = 3.14159265358979323846f;
-
-float luminance(const simd_float3& color) {
-  return 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
-}
-
-simd_float3 lerp3(const simd_float3& a, const simd_float3& b, float t) {
-  return a + (b - a) * t;
-}
-
-simd_float3 evaluateEnvironmentRadiance(const rt::LightingSettings& lighting, const simd_float3& dir) {
-  const simd_float3 bg = simd_make_float3(lighting.backgroundColor.x, lighting.backgroundColor.y, lighting.backgroundColor.z);
-  const simd_float3 tint = simd_make_float3(lighting.environmentTint.x, lighting.environmentTint.y, lighting.environmentTint.z);
-  const float envIntensity = std::max(lighting.environmentIntensity, 0.0f);
-  const float y = std::clamp(dir.y, -1.0f, 1.0f);
-
-  const simd_float3 horizonColor = bg;
-  const simd_float3 zenithColor = lerp3(bg, bg * 0.82f, 0.55f);
-  const simd_float3 groundColor = bg * 0.09f;
-
-  simd_float3 sky;
-  if (y > 0.0f) {
-    const float t = std::pow(y, 0.29f);
-    sky = lerp3(horizonColor, zenithColor, t);
-  } else {
-    const float t = std::pow(std::clamp(-y, 0.0f, 1.0f), 0.92f);
-    sky = lerp3(horizonColor * 0.62f, groundColor, t);
-  }
-
-  const float hemi = std::clamp(y * 0.5f + 0.5f, 0.0f, 1.0f);
-  const simd_float3 tintHorizon = bg * 0.48f;
-  const simd_float3 envTint = lerp3(tintHorizon, tint, hemi) * envIntensity;
-  return simd_max(sky + envTint, simd_make_float3(0.0f, 0.0f, 0.0f));
-}
-
-std::vector<GPUEnvironmentSampleCell> buildEnvironmentSampleCells(const rt::LightingSettings& lighting) {
-  std::vector<GPUEnvironmentSampleCell> cells(kEnvironmentSampleCellCount);
-  std::vector<float> weights(kEnvironmentSampleCellCount, 0.0f);
-  double totalWeight = 0.0;
-
-  for (uint32_t row = 0; row < kEnvironmentSampleHeight; ++row) {
-    const float theta0 = kPi * static_cast<float>(row) / static_cast<float>(kEnvironmentSampleHeight);
-    const float theta1 = kPi * static_cast<float>(row + 1u) / static_cast<float>(kEnvironmentSampleHeight);
-    const float theta = 0.5f * (theta0 + theta1);
-    const float sinTheta = std::sin(theta);
-    const float cosTheta = std::cos(theta);
-    const float solidAngle =
-        (2.0f * kPi / static_cast<float>(kEnvironmentSampleWidth)) * std::max(std::cos(theta0) - std::cos(theta1), 1e-6f);
-
-    for (uint32_t col = 0; col < kEnvironmentSampleWidth; ++col) {
-      const uint32_t idx = row * kEnvironmentSampleWidth + col;
-      const float phi = 2.0f * kPi * (static_cast<float>(col) + 0.5f) / static_cast<float>(kEnvironmentSampleWidth);
-      const simd_float3 dir = simd_make_float3(std::cos(phi) * sinTheta, cosTheta, std::sin(phi) * sinTheta);
-      const simd_float3 radiance = evaluateEnvironmentRadiance(lighting, dir);
-      const float weight = std::max(luminance(radiance), 0.0f) * solidAngle;
-      weights[idx] = weight;
-      totalWeight += static_cast<double>(weight);
-    }
-  }
-
-  if (totalWeight <= 1e-8) {
-    for (uint32_t idx = 0; idx < kEnvironmentSampleCellCount; ++idx) {
-      cells[idx].data = simd_make_float4(0.0f, idx == 0u ? 1.0f : 0.0f, 0.0f, 0.0f);
-    }
-    return cells;
-  }
-
-  float cumulative = 0.0f;
-  for (uint32_t idx = 0; idx < kEnvironmentSampleCellCount; ++idx) {
-    const float pmf = static_cast<float>(weights[idx] / totalWeight);
-    cumulative += pmf;
-    cells[idx].data = simd_make_float4(pmf, cumulative, 0.0f, 0.0f);
-  }
-  cells.back().data.y = 1.0f;
-  return cells;
-}
+constexpr uint32_t kEnvironmentSampleCellCount = RT_ENVIRONMENT_SAMPLE_WIDTH * RT_ENVIRONMENT_SAMPLE_HEIGHT;
 
 void normalizeEmissiveTriangleDistribution(std::vector<GPUEmissiveTriangle>& emissiveTriangles) {
   if (emissiveTriangles.empty()) return;
@@ -362,7 +288,7 @@ public:
     lighting.areaLightEmission = metal_rt::makeFloat4(config.lighting.areaLightEmission, 0.0f);
     std::memcpy(lightingBuffer_.contents, &lighting, sizeof(GPULighting));
 
-    const std::vector<GPUEnvironmentSampleCell> environmentCells = buildEnvironmentSampleCells(config.lighting);
+    const std::vector<GPUEnvironmentSampleCell> environmentCells = rt::buildEnvironmentSampleCells(config.lighting);
     std::memcpy(environmentSampleBuffer_.contents, environmentCells.data(),
                 environmentCells.size() * sizeof(GPUEnvironmentSampleCell));
 
@@ -719,19 +645,12 @@ private:
   }
 
   void buildSceneBuffers() {
-    SceneGpuAccumulator acc;
-    acc.positions.reserve(4096);
-    acc.normals.reserve(4096);
-    acc.vertexColors.reserve(4096);
-    acc.texcoords.reserve(4096);
-    acc.accelIndices.reserve(4096);
-    acc.shaderTriangles.reserve(4096);
-    acc.materials.reserve(scene_.meshes.size() + scene_.curveNetworks.size() + scene_.vectorFields.size());
-
-    metal_rt::gatherMeshGpuData(acc, scene_);
-    metal_rt::gatherVectorFieldGpuData(acc, scene_);
-    metal_rt::gatherCurveGpuData(acc, scene_, curveControlPoints_, curveRadii_, pointPrimitives_, pointBboxData_);
-    metal_rt::gatherPointBboxData(acc, scene_, pointPrimitives_, pointBboxData_);
+    rt::PackedSceneData packed = rt::packScene(scene_);
+    SceneGpuAccumulator& acc = packed.acc;
+    curveControlPoints_ = std::move(packed.curveControlPoints);
+    curveRadii_ = std::move(packed.curveRadii);
+    pointPrimitives_ = std::move(packed.pointPrimitives);
+    pointBboxData_ = std::move(packed.pointBoundingBoxes);
 
     if (acc.positions.empty()) {
       for (int j = 0; j < 3; ++j) {
@@ -749,7 +668,6 @@ private:
       acc.shaderTriangles.push_back(dummyTri);
     }
 
-    metal_rt::gatherLightData(acc, scene_);
     uploadSceneBuffers(acc);
     buildAccelerationStructure(static_cast<uint32_t>(acc.accelIndices.size()));
   }
@@ -840,11 +758,13 @@ private:
     }
 
     if (!pointPrimitives_.empty()) {
+      const std::vector<MTLAxisAlignedBoundingBox> metalPointBboxes =
+          metal_rt::makeMetalBoundingBoxes(pointBboxData_);
       pointPrimitiveBuffer_ = [device_ newBufferWithBytes:pointPrimitives_.data()
                                                    length:pointPrimitives_.size() * sizeof(GPUPointPrimitive)
                                                   options:MTLResourceStorageModeShared];
-      pointBboxBuffer_ = [device_ newBufferWithBytes:pointBboxData_.data()
-                                              length:pointBboxData_.size() * sizeof(MTLAxisAlignedBoundingBox)
+      pointBboxBuffer_ = [device_ newBufferWithBytes:metalPointBboxes.data()
+                                              length:metalPointBboxes.size() * sizeof(MTLAxisAlignedBoundingBox)
                                              options:MTLResourceStorageModeShared];
     } else {
       GPUPointPrimitive dummy{};
@@ -1100,7 +1020,7 @@ private:
   id<MTLBuffer> pointPrimitiveBuffer_ = nil;
   id<MTLBuffer> pointBboxBuffer_ = nil;
   std::vector<GPUPointPrimitive> pointPrimitives_;
-  std::vector<MTLAxisAlignedBoundingBox> pointBboxData_;
+  std::vector<rt::PackedBoundingBox> pointBboxData_;
   uint32_t emissiveTriangleCount_ = 0u;
 
   id<MTLIntersectionFunctionTable> intersectionFunctionTable_ = nil;
@@ -1173,9 +1093,8 @@ private:
 
 namespace rt {
 
-std::unique_ptr<IRayTracingBackend> createBackend(BackendType type, const std::string& shaderLibraryPath) {
-  if (type == BackendType::Metal) return std::make_unique<MetalPathTracerBackend>(shaderLibraryPath);
-  throw std::runtime_error("Unsupported backend type");
+std::unique_ptr<IRayTracingBackend> createMetalBackendImpl(const std::string& shaderLibraryPath) {
+  return std::make_unique<MetalPathTracerBackend>(shaderLibraryPath);
 }
 
 } // namespace rt

@@ -2,6 +2,7 @@
 #include <metal_raytracing>
 using namespace metal;
 using namespace metal::raytracing;
+#include "environment_model_shared.h"
 #include "gpu_shared_types.h"
 #include "shader_common.h"
 
@@ -15,8 +16,8 @@ float shadowVisibility(float3 hitPos, float3 geomNormal, float3 toLight, float m
 constant float kPi = 3.14159265f;
 constant uint kInvalidTriangleIndex = 0xFFFFFFFFu;
 constant uint kInvalidLightIndex = 0xFFFFFFFFu;
-constant uint kEnvironmentSampleWidth = 64u;
-constant uint kEnvironmentSampleHeight = 32u;
+constant uint kEnvironmentSampleWidth = RT_ENVIRONMENT_SAMPLE_WIDTH;
+constant uint kEnvironmentSampleHeight = RT_ENVIRONMENT_SAMPLE_HEIGHT;
 constant float kRayMinDistance = 1e-3f;
 constant float kRayMaxDistance = 1e6f;
 
@@ -93,6 +94,10 @@ void makeBasis(float3 axis, thread float3& tangent, thread float3& bitangent) {
   float3 up = abs(axis.y) < 0.999f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
   tangent = normalize(cross(up, axis));
   bitangent = cross(axis, tangent);
+}
+
+float3 faceForwardToRay(float3 normal, float3 rayDir) {
+  return dot(normal, rayDir) < 0.0f ? normal : -normal;
 }
 
 bool sampleSunLight(constant GPULighting& lighting, thread uint& rng,
@@ -272,7 +277,9 @@ bool sampleEmissiveTriangleLight(float3 hitPos, float3 geomNormal, float3 normal
     toLight /= distance;
 
     float nDotL = max(dot(normal, toLight), 0.0f);
-    float lightCos = max(dot(lightNormal, -toLight), 0.0f);
+    bool lightDoubleSided = material.materialFlags.y != 0u;
+    float lightCos = lightDoubleSided ? abs(dot(lightNormal, -toLight))
+                                      : max(dot(lightNormal, -toLight), 0.0f);
     if (nDotL <= 0.0f || lightCos <= 0.0f) continue;
 
     float visibility = shadowVisibility(hitPos, geomNormal, toLight, max(distance - 2e-2f, 1e-3f),
@@ -318,27 +325,10 @@ float geometrySmith(float3 N, float3 V, float3 L, float roughness) {
 }
 
 float3 evaluateEnvironmentRadiance(float3 dir, constant GPULighting& lighting) {
-  float3 sampleDir = normalize(dir);
-  float y = clamp(sampleDir.y, -1.0f, 1.0f);
-  float3 bgColor = lighting.backgroundColor.xyz;
-
-  float3 horizonColor = bgColor;
-  float3 zenithColor = mix(bgColor, bgColor * 0.82f, 0.55f);
-  float3 groundColor = bgColor * 0.09f;
-
-  float3 sky;
-  if (y > 0.0f) {
-    float t = pow(y, 0.29f);
-    sky = mix(horizonColor, zenithColor, t);
-  } else {
-    float t = pow(clamp(-y, 0.0f, 1.0f), 0.92f);
-    sky = mix(horizonColor * 0.62f, groundColor, t);
-  }
-
-  float hemi = saturate(sampleDir.y * 0.5f + 0.5f);
-  float3 tintHorizon = bgColor * 0.48f;
-  float3 envTint = mix(tintHorizon, lighting.environmentTintIntensity.xyz, hemi) * lighting.environmentTintIntensity.w;
-  return max(sky + envTint, float3(0.0f));
+  return rtEvaluateEnvironmentRadiance(lighting.backgroundColor.xyz,
+                                       lighting.environmentTintIntensity.xyz,
+                                       lighting.environmentTintIntensity.w,
+                                       normalize(dir));
 }
 
 float3 sampleGGXBounce(float3 N, float3 V, float roughness, thread uint& rng);
@@ -773,6 +763,8 @@ struct SurfaceHitInfo {
   float dielectricF0 = 0.04f;
   float opacity = 1.0f;
   bool unlit = false;
+  bool frontFacing = true;
+  bool doubleSided = false;
   bool isInfinitePlane = false;
   // Isoline data used for contour post-processing (style 2).
   // Populated by intersectSurface when a contour-style iso material is hit.
@@ -780,6 +772,10 @@ struct SurfaceHitInfo {
   float  isoScalarVal = 0.0f;
   float3 isoGradWorld = float3(0.0f);
 };
+
+float3 opaqueBsdfNormal(SurfaceHitInfo surf, float3 rayDir) {
+  return surf.doubleSided ? faceForwardToRay(surf.normal, rayDir) : surf.normal;
+}
 
 SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame) {
   SurfaceHitInfo out;
@@ -802,6 +798,7 @@ SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame) {
   out.hitPos = r.origin + r.direction * t;
   out.geomNormal = normal;
   out.normal = normal;
+  out.frontFacing = dot(normal, -r.direction) >= 0.0f;
   out.baseColor = frame.planeColorEnabled.xyz;
   out.metallic = frame.planeParams.y;
   out.roughness = clamp(frame.planeParams.z, 0.001f, 1.0f);
@@ -871,7 +868,7 @@ SurfaceHitInfo shadeCurveHit(ray currentRay, float hitDistance, float curveParam
   out.transmission = 0.0f;
   out.ior = 1.5f;
   out.opacity = 1.0f;
-  out.unlit = (material.transmissionIor.z > 0.5f);
+  out.unlit = material.materialFlags.x != 0u;
   out.isInfinitePlane = false;
   return out;
 }
@@ -903,7 +900,7 @@ SurfaceHitInfo shadePointHit(ray currentRay, float hitDistance, uint primitiveIn
   out.transmission = 0.0f;
   out.ior        = 1.5f;
   out.opacity    = 1.0f;
-  out.unlit      = (material.transmissionIor.z > 0.5f);
+  out.unlit      = material.materialFlags.x != 0u;
   out.isInfinitePlane = false;
   return out;
 }
@@ -993,7 +990,6 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
     float3 n2 = normals[tri.indicesMaterial.z].xyz;
     normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
   }
-  if (dot(normal, geomNormal) <= 0.0f) normal = -normal;
 
   float3 vc0 = vertexColors[tri.indicesMaterial.x].xyz;
   float3 vc1 = vertexColors[tri.indicesMaterial.y].xyz;
@@ -1001,6 +997,14 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   float3 interpVertexColor = vc0 * w0 + vc1 * w1 + vc2 * w2;
 
   GPUMaterial material = materials[tri.indicesMaterial.w];
+  bool doubleSided = material.materialFlags.y != 0u;
+  bool frontFacing = dot(geomNormal, -currentRay.direction) >= 0.0f;
+  if (doubleSided) {
+    geomNormal = faceForwardToRay(geomNormal, currentRay.direction);
+    normal = faceForwardToRay(normal, currentRay.direction);
+  } else if (dot(normal, geomNormal) <= 0.0f) {
+    normal = -normal;
+  }
   float4 baseColor = material.baseColorFactor * float4(interpVertexColor, 1.0f);
   float metallic = material.metallicRoughnessNormal.x;
   float roughness = material.metallicRoughnessNormal.y;
@@ -1045,7 +1049,12 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   out.transmission = clamp(material.transmissionIor.x, 0.0f, 1.0f);
   out.ior = max(material.transmissionIor.y, 1.0f);
   out.opacity = clamp(material.transmissionIor.w, 0.0f, 1.0f);
-  out.unlit = (material.transmissionIor.z > 0.5f);
+  out.unlit = material.materialFlags.x != 0u;
+  out.frontFacing = frontFacing;
+  out.doubleSided = doubleSided;
+  if (!doubleSided && !frontFacing) {
+    out.emissive = float3(0.0f);
+  }
   out.isInfinitePlane = false;
 
   if (tri.objectFlags.z != 0u) {
@@ -1107,7 +1116,8 @@ float emissiveSurfaceLightPdf(SurfaceHitInfo surf, float3 incomingDir,
   GPUEmissiveTriangle emissive = emissiveTriangles[surf.emissiveLightIndex];
   float area = emissive.params.x;
   float selectionPdf = emissive.params.y;
-  float lightCos = max(dot(surf.geomNormal, -incomingDir), 0.0f);
+  float lightCos = surf.doubleSided ? abs(dot(surf.geomNormal, -incomingDir))
+                                    : max(dot(surf.geomNormal, -incomingDir), 0.0f);
   if (area <= 1e-7f || selectionPdf <= 0.0f || lightCos <= 0.0f) return 0.0f;
   return selectionPdf * max(surf.distance * surf.distance, 1e-6f) / max(lightCos * area, 1e-5f);
 }
@@ -1447,7 +1457,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       continue;
     }
 
-    float3 bsdfNormal = dot(currentRay.direction, surf.normal) < 0.0f ? surf.normal : -surf.normal;
+    float3 bsdfNormal = opaqueBsdfNormal(surf, currentRay.direction);
     float3 directLighting = evaluateDirectLightingPBR(surf, bsdfNormal, currentViewDir, positions, texcoords, triangles, materials, textures, texturePixels,
                                                       sceneLights, emissiveTriangles, environmentCells, frame, lighting, rng, isector, scene, pointScene, ftable);
     radiance += throughput * directLighting;
@@ -1557,7 +1567,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
       continue;
     }
 
-    float3 bsdfNormal = dot(currentRay.direction, surf.normal) < 0.0f ? surf.normal : -surf.normal;
+    float3 bsdfNormal = opaqueBsdfNormal(surf, currentRay.direction);
     float3 directLighting = evaluateDirectLightingPBR(surf, bsdfNormal, currentViewDir, positions, texcoords, triangles, materials, textures, texturePixels,
                                                       sceneLights, emissiveTriangles, environmentCells, frame, lighting, rng, isector, scene, pointScene, ftable);
     radiance += throughput * directLighting;

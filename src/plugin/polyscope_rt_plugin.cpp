@@ -18,9 +18,9 @@ namespace rt {
 namespace options {
 int maxBounces = 6;
 int samplesPerFrame = 1;
-float exposure = 3.5f;
-float gamma = 1.3f;
-float saturation = 1.0f;
+float exposure = ::rt::makeDefaultAppearanceConfig().lighting.standardExposure;
+float gamma = ::rt::makeDefaultAppearanceConfig().lighting.standardGamma;
+float saturation = ::rt::makeDefaultAppearanceConfig().lighting.standardSaturation;
 } // namespace options
 
 namespace {

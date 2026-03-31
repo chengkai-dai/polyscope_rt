@@ -25,11 +25,13 @@
 // ---------------------------------------------------------------------------
 #ifndef __METAL_VERSION__
 namespace gpu_types {
+using float3   = simd_float3;
 using float4   = simd_float4;
 using uint4    = simd_uint4;
 using float2   = simd_float2;
 using float4x4 = simd_float4x4;
 }
+using gpu_types::float3;
 using gpu_types::float4;
 using gpu_types::uint4;
 using gpu_types::float2;
@@ -153,6 +155,10 @@ struct GPUMaterial {
   float4 emissiveFactor;
   uint4  emissiveTextureData;
   uint4  normalTextureData;
+  // materialFlags.x = unlit
+  // materialFlags.y = doubleSided
+  // materialFlags.zw = reserved
+  uint4  materialFlags;
   float4 transmissionIor;
   float4 wireframeEdgeData;
   // isoParams: x=style(0=off,1=stripe,2=contour), y=spacing(period), z=darkness, w=contourThickness

@@ -98,6 +98,7 @@ rt::RTMesh makeMeshFromSimpleTriangleMesh(polyscope::SimpleTriangleMesh& mesh) {
   out.transform = mesh.getTransform();
   out.baseColorFactor = glm::vec4(mesh.getSurfaceColor(), 1.0f);
   out.opacity = mesh.getTransparency();
+  out.doubleSided = mesh.getBackFacePolicy() != polyscope::BackFacePolicy::Cull;
   out.vertices = mesh.vertices.data;
   out.indices = mesh.faces.data;
   return out;
@@ -110,6 +111,7 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
   out.baseColorFactor = glm::vec4(mesh.getSurfaceColor(), 1.0f);
   // Honour the Polyscope UI transparency slider (0=transparent, 1=opaque).
   out.opacity = mesh.getTransparency();
+  out.doubleSided = mesh.getBackFacePolicy() != polyscope::BackFacePolicy::Cull;
   out.vertices = mesh.vertexPositions.data;
 
   const auto& triIndices = mesh.triangleVertexInds.data;
@@ -530,8 +532,21 @@ void addMeshAndHash(PolyscopeSceneSnapshot& snapshot, rt::RTMesh&& mesh, polysco
   hashBytes(snapshot.scene.hash, &mesh.baseColorFactor[0], sizeof(float) * 4);
   hashBytes(snapshot.scene.hash, &mesh.metallicFactor, sizeof(float));
   hashBytes(snapshot.scene.hash, &mesh.roughnessFactor, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.normalTextureScale, sizeof(float));
   hashBytes(snapshot.scene.hash, &mesh.emissiveFactor[0], sizeof(float) * 3);
+  hashBytes(snapshot.scene.hash, &mesh.transmissionFactor, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.indexOfRefraction, sizeof(float));
   hashBytes(snapshot.scene.hash, &mesh.opacity, sizeof(float));
+  hashBytes(snapshot.scene.hash, &mesh.doubleSided, sizeof(bool));
+  hashBytes(snapshot.scene.hash, &mesh.unlit, sizeof(bool));
+  hashBytes(snapshot.scene.hash, &mesh.hasBaseColorTexture, sizeof(bool));
+  hashBytes(snapshot.scene.hash, &mesh.hasMetallicRoughnessTexture, sizeof(bool));
+  hashBytes(snapshot.scene.hash, &mesh.hasEmissiveTexture, sizeof(bool));
+  hashBytes(snapshot.scene.hash, &mesh.hasNormalTexture, sizeof(bool));
+  if (mesh.hasBaseColorTexture) hashString(snapshot.scene.hash, mesh.baseColorTexture.cacheKey);
+  if (mesh.hasMetallicRoughnessTexture) hashString(snapshot.scene.hash, mesh.metallicRoughnessTexture.cacheKey);
+  if (mesh.hasEmissiveTexture) hashString(snapshot.scene.hash, mesh.emissiveTexture.cacheKey);
+  if (mesh.hasNormalTexture) hashString(snapshot.scene.hash, mesh.normalTexture.cacheKey);
   hashBytes(snapshot.scene.hash, &mesh.wireframe, sizeof(bool));
   hashBytes(snapshot.scene.hash, &mesh.edgeColor[0], sizeof(float) * 3);
   hashBytes(snapshot.scene.hash, &mesh.edgeWidth, sizeof(float));

@@ -25,27 +25,7 @@ namespace {
 constexpr const char* kRenderImageName = "Metal Path Tracing";
 
 rt::AppearanceConfig makeDefaultAppearance() {
-  rt::AppearanceConfig config;
-  config.mode = rt::RenderMode::Standard;
-  config.lighting.mainLightIntensity = 0.0f;
-  config.lighting.environmentIntensity = 0.3f;
-  config.toon.enabled = false;
-  config.toon.edgeThickness = 1.0f;
-  config.toon.depthThreshold = 0.015f;
-  config.toon.normalThreshold = 0.12f;
-  config.toon.enableDetailContour = true;
-  config.toon.enableObjectContour = true;
-  config.toon.enableNormalEdge = true;
-  config.toon.enableDepthEdge = true;
-  config.toon.detailContourStrength = 1.0f;
-  config.toon.objectContourStrength = 1.0f;
-  config.toon.edgeColor = glm::vec3(0.3f);
-  config.toon.useFxaa = true;
-  config.toon.tonemapExposure = 3.0f;
-  config.toon.tonemapGamma = 2.2f;
-  config.toon.backgroundColor = config.lighting.backgroundColor;
-  config.toon.bandCount = config.lighting.toonBandCount;
-  return config;
+  return rt::makeDefaultAppearanceConfig();
 }
 
 bool nearlyEqual(float a, float b, float eps = 1e-4f) { return std::abs(a - b) <= eps; }
@@ -247,7 +227,7 @@ bool PolyscopeRtRuntime::ensureBackend() {
   if (backend_) return true;
 
   try {
-    backend_ = rt::createMetalPathTracerBackend(polyscope::rt::getShaderLibraryPath());
+    backend_ = rt::createBackend(backendType_, polyscope::rt::getShaderLibraryPath());
     backendError_.clear();
     return true;
   } catch (const std::exception& e) {
