@@ -257,6 +257,11 @@ struct RenderBuffer {
   std::vector<float> linearDepth;
   std::vector<glm::vec3> normal;
   std::vector<uint32_t> objectId;
+  // Material AOVs are evaluated at the first visible surface hit in the same
+  // space as the resolved surface parameters used by shading:
+  // diffuseAlbedo = baseColor * (1 - metallic)
+  // specularAlbedo = mix(float3(dielectricF0), baseColor, metallic)
+  // roughness = surface roughness after texture modulation and clamping
   std::vector<glm::vec3> diffuseAlbedo;
   std::vector<glm::vec3> specularAlbedo;
   std::vector<float> roughness;

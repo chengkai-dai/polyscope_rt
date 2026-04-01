@@ -185,6 +185,24 @@ void testContourPrimitiveNamesShareObjectId() {
           "contour primitive meshes should collapse to the same object ID");
 }
 
+void testObjectIdsStayStableAcrossEquivalentPackingRuns() {
+  rt::RTScene scene;
+  rt::RTMesh meshA = makeTriangleMesh("mesh_a");
+  rt::RTMesh meshB = makeTriangleMesh("mesh_b");
+  meshB.transform = glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f));
+  scene.meshes.push_back(meshA);
+  scene.meshes.push_back(meshB);
+
+  const rt::PackedSceneData packedA = rt::packScene(scene);
+  const rt::PackedSceneData packedB = rt::packScene(scene);
+  require(packedA.acc.shaderTriangles.size() == packedB.acc.shaderTriangles.size(),
+          "equivalent scenes should produce the same triangle count across packing runs");
+  for (size_t i = 0; i < packedA.acc.shaderTriangles.size(); ++i) {
+    require(packedA.acc.shaderTriangles[i].objectFlags.x == packedB.acc.shaderTriangles[i].objectFlags.x,
+            "object IDs should stay stable across equivalent packing runs");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -195,6 +213,7 @@ int main() {
     testTransformAppliesToPositionsAndNormals();
     testEmissiveTriangleWeightsScaleByAreaAndPower();
     testContourPrimitiveNamesShareObjectId();
+    testObjectIdsStayStableAcrossEquivalentPackingRuns();
     std::cout << "scene_packer_test passed" << std::endl;
     return 0;
   } catch (const std::exception& e) {

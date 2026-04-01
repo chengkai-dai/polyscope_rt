@@ -227,6 +227,12 @@ bool PolyscopeRtRuntime::ensureBackend() {
   if (backend_) return true;
 
   try {
+    const rt::BackendAvailability availability =
+        rt::queryBackendAvailability(backendType_, polyscope::rt::getShaderLibraryPath());
+    if (!availability.available) {
+      setError(availability.reason.empty() ? "Requested backend is unavailable." : availability.reason);
+      return false;
+    }
     backend_ = rt::createBackend(backendType_, polyscope::rt::getShaderLibraryPath());
     backendError_.clear();
     return true;

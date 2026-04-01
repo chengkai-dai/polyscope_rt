@@ -55,14 +55,22 @@ add_library(
   src/plugin/polyscope_rt_runtime.cpp
   src/plugin/polyscope_rt_runtime_gui.cpp
   src/scene/polyscope_scene_snapshot.cpp
+  src/scene/polyscope_scene_snapshot_hash.cpp
+  src/scene/polyscope_scene_snapshot_collectors.cpp
+  src/scene/polyscope_scene_snapshot_vectors.cpp
   src/rendering/backend_factory.cpp
   src/rendering/environment_model.cpp
   src/rendering/scene_packer.cpp
+  src/rendering/scene_packer_shared.cpp
+  src/rendering/scene_packer_mesh.cpp
+  src/rendering/scene_packer_primitives.cpp
   src/rendering/metal/metal_device.mm
   src/rendering/metal/metal_scene_builder.mm
   src/rendering/metal/metal_standard_preset.mm
   src/rendering/metal/metal_toon_preset.mm
   src/rendering/metal/metal_backend.mm
+  src/rendering/metal/metal_backend_scene.mm
+  src/rendering/metal/metal_backend_render.mm
   src/rendering/metal/metal_test_harness.mm
   src/plugin/polyscope_rt_plugin.cpp
 )
@@ -72,6 +80,8 @@ set_source_files_properties(
   src/rendering/metal/metal_standard_preset.mm
   src/rendering/metal/metal_toon_preset.mm
   src/rendering/metal/metal_backend.mm
+  src/rendering/metal/metal_backend_scene.mm
+  src/rendering/metal/metal_backend_render.mm
   src/rendering/metal/metal_test_harness.mm
   PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations"
 )
@@ -130,6 +140,10 @@ set(METAL_SHARED_HEADERS
   ${METAL_SHADER_INCLUDE_DIR}/gpu_shared_types.h
   ${METAL_SHADER_INCLUDE_DIR}/environment_model_shared.h
   ${METAL_SHADER_DIR}/shader_common.h
+  ${METAL_SHADER_DIR}/path_tracer_surface_utils.h
+  ${METAL_SHADER_DIR}/path_tracer_bsdf.h
+  ${METAL_SHADER_DIR}/path_tracer_light_sampling.h
+  ${METAL_SHADER_DIR}/path_tracer_helpers.h
 )
 set(METAL_AIR_FILES)
 foreach(SHADER ${METAL_SOURCES})
@@ -322,14 +336,23 @@ endfunction()
 if(BUILD_TESTING)
   polyscope_rt_add_private_test(polyscope_scene_snapshot_test tests/polyscope_scene_snapshot_test.cpp)
   polyscope_rt_add_private_test(polyscope_rt_namespace_compatibility_test tests/polyscope_rt_namespace_compatibility_test.cpp)
-  polyscope_rt_add_private_test(backend_smoke_test tests/backend_smoke_test.cpp)
+  polyscope_rt_add_private_test(backend_download_test tests/backend_download_test.cpp)
+  polyscope_rt_add_private_test(backend_factory_test tests/backend_factory_test.cpp)
+  polyscope_rt_add_private_test(mesh_shading_test tests/mesh_shading_test.cpp)
+  polyscope_rt_add_private_test(double_sided_test tests/double_sided_test.cpp)
+  polyscope_rt_add_private_test(normal_map_test tests/normal_map_test.cpp)
+  polyscope_rt_add_private_test(material_aov_test tests/material_aov_test.cpp)
+  polyscope_rt_add_private_test(emissive_lighting_test tests/emissive_lighting_test.cpp)
+  polyscope_rt_add_private_test(visible_light_test tests/visible_light_test.cpp)
+  polyscope_rt_add_private_test(geometry_primitives_test tests/geometry_primitives_test.cpp)
+  polyscope_rt_add_private_test(transmission_test tests/transmission_test.cpp)
   polyscope_rt_add_private_test(postprocess_test tests/postprocess_test.cpp)
   polyscope_rt_add_private_test(point_cloud_rendering_test tests/point_cloud_rendering_test.cpp)
   polyscope_rt_add_private_test(vector_field_rendering_test tests/vector_field_rendering_test.cpp)
   polyscope_rt_add_private_test(preset_switching_test tests/preset_switching_test.cpp)
   polyscope_rt_add_private_test(quantity_extraction_test tests/quantity_extraction_test.cpp)
-  polyscope_rt_add_private_test(rendering_quality_test tests/rendering_quality_test.cpp)
   polyscope_rt_add_private_test(environment_model_test tests/environment_model_test.cpp)
   polyscope_rt_add_private_test(architecture_constraints_test tests/architecture_constraints_test.cpp)
+  polyscope_rt_add_private_test(snapshot_hash_test tests/snapshot_hash_test.cpp)
   polyscope_rt_add_private_test(scene_packer_test tests/scene_packer_test.cpp)
 endif()

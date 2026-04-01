@@ -20,10 +20,9 @@ inline bool isSkippableBackendError(const std::string& message) {
 }
 
 inline bool isBackendAvailable(rt::BackendType type) {
-  try {
-    auto backend = rt::createBackend(type);
-    return true;
-  } catch (...) {
-    return false;
-  }
+  return rt::queryBackendAvailability(type).available;
+}
+
+inline bool isTestHarnessAvailable(rt::BackendType type) {
+  return rt::queryTestHarnessAvailability(type).available;
 }

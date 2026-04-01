@@ -37,6 +37,16 @@ void testRuntimeUsesBackendFactory() {
           "runtime should not call the Metal-only backend factory directly");
   require(contents.find("createBackend(") != std::string::npos,
           "runtime should go through the backend-neutral factory");
+  require(contents.find("queryBackendAvailability(") != std::string::npos,
+          "runtime should query backend availability before attempting creation");
+}
+
+void testBackendNeutralPublicHeaderStaysMetalFree() {
+  const std::string contents = readTextFile("src/rendering/ray_tracing_backend.h");
+  require(contents.find("Metal/Metal.h") == std::string::npos,
+          "ray_tracing_backend.h must not include Metal headers");
+  require(contents.find("MTL") == std::string::npos,
+          "ray_tracing_backend.h must not expose Metal-specific types");
 }
 
 void testPluginOptionDefaultsMatchAuthoritativeDefaults() {
@@ -55,6 +65,7 @@ int main() {
   try {
     testBackendNeutralScenePackerHeader();
     testRuntimeUsesBackendFactory();
+    testBackendNeutralPublicHeaderStaysMetalFree();
     testPluginOptionDefaultsMatchAuthoritativeDefaults();
     std::cout << "architecture_constraints_test passed" << std::endl;
     return 0;

@@ -62,10 +62,22 @@ public:
 // ---------------------------------------------------------------------------
 enum class BackendType { Metal, Vulkan };
 
+struct BackendAvailability {
+  BackendType type = BackendType::Metal;
+  std::string name;
+  bool available = false;
+  std::string reason;
+};
+
+BackendAvailability queryBackendAvailability(BackendType type, const std::string& shaderLibraryPath = {});
+BackendAvailability queryTestHarnessAvailability(BackendType type, const std::string& shaderLibraryPath = {});
+
 std::unique_ptr<IRayTracingBackend>    createBackend(BackendType type, const std::string& shaderLibraryPath = {});
 std::unique_ptr<IPostProcessTestHarness> createTestHarness(BackendType type, const std::string& shaderLibraryPath = {});
 
-// Convenience aliases for backward compatibility.
+// Compatibility-only aliases and wrappers.
+// Prefer createBackend()/createTestHarness() and queryBackendAvailability().
+// Internal code and tests should not depend on these compatibility paths.
 using MetalPostprocessTestInput  = PostprocessTestInput;
 using MetalPostprocessTestOutput = PostprocessTestOutput;
 using IMetalShaderTestHarness    = IPostProcessTestHarness;

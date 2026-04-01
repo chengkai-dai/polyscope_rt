@@ -12,6 +12,14 @@
 
 namespace metal_rt {
 
+struct MetalDeviceAvailability {
+  bool available = false;
+  std::string reason;
+};
+
+MetalDeviceAvailability queryRayTracingDeviceAvailability();
+id<MTLDevice> createRayTracingDeviceOrThrow();
+
 std::string resolveShaderLibraryPath(const std::string& requestedPath);
 std::string buildNSErrorMessage(NSError* error);
 

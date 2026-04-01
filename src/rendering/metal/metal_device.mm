@@ -68,6 +68,37 @@ std::vector<std::filesystem::path> shaderLibraryCandidates(const std::string& re
 
 namespace metal_rt {
 
+MetalDeviceAvailability queryRayTracingDeviceAvailability() {
+  @autoreleasepool {
+    MetalDeviceAvailability availability;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil) {
+      availability.reason = "Metal is unavailable on this machine.";
+      return availability;
+    }
+    if (@available(macOS 11.0, *)) {
+      if (![device supportsRaytracing]) {
+        availability.reason = "This Metal device does not report ray tracing support.";
+        return availability;
+      }
+    }
+    availability.available = true;
+    return availability;
+  }
+}
+
+id<MTLDevice> createRayTracingDeviceOrThrow() {
+  MetalDeviceAvailability availability = queryRayTracingDeviceAvailability();
+  if (!availability.available) {
+    throw std::runtime_error(availability.reason);
+  }
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (device == nil) {
+    throw std::runtime_error("Metal is unavailable on this machine.");
+  }
+  return device;
+}
+
 std::string resolveShaderLibraryPath(const std::string& requestedPath) {
   std::error_code ec;
   std::vector<std::filesystem::path> candidates = shaderLibraryCandidates(requestedPath);

@@ -7,6 +7,7 @@
 
 namespace rt {
 
+BackendAvailability queryMetalTestHarnessAvailability(const std::string& shaderLibraryPath = {});
 std::unique_ptr<IPostProcessTestHarness> createMetalTestHarnessImpl(const std::string& shaderLibraryPath = {});
 
 } // namespace rt

@@ -19,15 +19,7 @@ class MetalShaderTestHarness final : public rt::IPostProcessTestHarness {
 public:
   explicit MetalShaderTestHarness(const std::string& shaderLibraryPath) {
     @autoreleasepool {
-      device_ = MTLCreateSystemDefaultDevice();
-      if (device_ == nil) {
-        throw std::runtime_error("Metal is unavailable on this machine.");
-      }
-      if (@available(macOS 11.0, *)) {
-        if (![device_ supportsRaytracing]) {
-          throw std::runtime_error("This Metal device does not report ray tracing support.");
-        }
-      }
+      device_ = metal_rt::createRayTracingDeviceOrThrow();
 
       commandQueue_ = [device_ newCommandQueue];
       if (commandQueue_ == nil) {
@@ -238,6 +230,28 @@ private:
 } // namespace
 
 namespace rt {
+
+BackendAvailability queryMetalTestHarnessAvailability(const std::string& shaderLibraryPath) {
+  BackendAvailability availability;
+  availability.type = BackendType::Metal;
+  availability.name = "Metal";
+
+  metal_rt::MetalDeviceAvailability deviceAvailability = metal_rt::queryRayTracingDeviceAvailability();
+  if (!deviceAvailability.available) {
+    availability.reason = std::move(deviceAvailability.reason);
+    return availability;
+  }
+
+  try {
+    metal_rt::resolveShaderLibraryPath(shaderLibraryPath);
+  } catch (const std::exception& e) {
+    availability.reason = e.what();
+    return availability;
+  }
+
+  availability.available = true;
+  return availability;
+}
 
 std::unique_ptr<IPostProcessTestHarness> createMetalTestHarnessImpl(const std::string& shaderLibraryPath) {
   return std::make_unique<MetalShaderTestHarness>(shaderLibraryPath);
