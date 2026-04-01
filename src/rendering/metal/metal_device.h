@@ -37,7 +37,7 @@ uint32_t registerTextureInAcc(SceneGpuAccumulator& acc, const rt::RTTexture& tex
 
 template <typename ConfigLike>
 GPUToonUniforms makeToonShaderUniforms(const ConfigLike& config, uint32_t width, uint32_t height) {
-  GPUToonUniforms toon;
+  GPUToonUniforms toon{};
   toon.width = width;
   toon.height = height;
   toon.contourMethod = 2u;

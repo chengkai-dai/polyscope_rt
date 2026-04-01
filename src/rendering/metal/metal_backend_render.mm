@@ -93,6 +93,7 @@ void MetalPathTracerBackend::resetAccumulation() {
   if (roughnessAuxBuffer_ != nil) std::memset(roughnessAuxBuffer_.contents, 0, roughnessAuxBuffer_.length);
   if (motionVectorBuffer_ != nil) std::memset(motionVectorBuffer_.contents, 0, motionVectorBuffer_.length);
   hasPrevViewProj_ = false;
+  if (denoiser_) denoiser_->resetHistory();
 }
 
 void MetalPathTracerBackend::renderIteration(const RenderConfig& config) {
@@ -181,99 +182,18 @@ void MetalPathTracerBackend::renderIteration(const RenderConfig& config) {
         (config.renderMode == RenderMode::Toon) ? toonPreset_.get() : standardPreset_.get();
     activePreset->encode(cmdBuf, ppBufs, width_, height_, config);
 
-    if (config.enableMetalFX && config.metalFXOutputWidth > 0 && config.metalFXOutputHeight > 0 &&
-        bufferToTexturePipelineState_ != nil && textureToBufferPipelineState_ != nil) {
-      ensureMetalFXResources(config.metalFXOutputWidth, config.metalFXOutputHeight);
+    if (denoiser_) {
+      metal_rt::MetalDenoiserInputs denoiserInputs;
+      denoiserInputs.rawColor = rawColorBuffer_;
+      denoiserInputs.depth = depthBuffer_;
+      denoiserInputs.normal = normalBuffer_;
+      denoiserInputs.diffuseAlbedo = diffuseAlbedoBuffer_;
+      denoiserInputs.specularAlbedo = specularAlbedoBuffer_;
+      denoiserInputs.roughness = roughnessAuxBuffer_;
+      denoiserInputs.motionVector = motionVectorBuffer_;
 
-      if (metalFXDenoisedScaler_ != nil) {
-        auto encodeBufferToHalf4Texture = [&](id<MTLBuffer> buf, id<MTLTexture> tex) {
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-          [enc setComputePipelineState:bufferToTexturePipelineState_];
-          [enc setBuffer:buf offset:0 atIndex:0];
-          [enc setTexture:tex atIndex:0];
-          metal_rt::dispatchThreads(enc, bufferToTexturePipelineState_, width_, height_);
-          [enc endEncoding];
-        };
-
-        encodeBufferToHalf4Texture(rawColorBuffer_, metalFXInputTexture_);
-        encodeBufferToHalf4Texture(normalBuffer_, metalFXNormalTexture_);
-        encodeBufferToHalf4Texture(diffuseAlbedoBuffer_, metalFXDiffuseAlbedoTexture_);
-        encodeBufferToHalf4Texture(specularAlbedoBuffer_, metalFXSpecularAlbedoTexture_);
-
-        if (depthToTexturePipelineState_ != nil) {
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-          [enc setComputePipelineState:depthToTexturePipelineState_];
-          [enc setBuffer:depthBuffer_ offset:0 atIndex:0];
-          [enc setTexture:metalFXDepthTexture_ atIndex:0];
-          metal_rt::dispatchThreads(enc, depthToTexturePipelineState_, width_, height_);
-          [enc endEncoding];
-        }
-        if (motionToTexturePipelineState_ != nil) {
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-          [enc setComputePipelineState:motionToTexturePipelineState_];
-          [enc setBuffer:motionVectorBuffer_ offset:0 atIndex:0];
-          [enc setTexture:metalFXMotionTexture_ atIndex:0];
-          metal_rt::dispatchThreads(enc, motionToTexturePipelineState_, width_, height_);
-          [enc endEncoding];
-        }
-        if (roughnessToTexturePipelineState_ != nil) {
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-          [enc setComputePipelineState:roughnessToTexturePipelineState_];
-          [enc setBuffer:roughnessAuxBuffer_ offset:0 atIndex:0];
-          [enc setTexture:metalFXRoughnessTexture_ atIndex:0];
-          metal_rt::dispatchThreads(enc, roughnessToTexturePipelineState_, width_, height_);
-          [enc endEncoding];
-        }
-
-        GPUCamera* cam = static_cast<GPUCamera*>(cameraBuffer_.contents);
-        metalFXDenoisedScaler_.colorTexture = metalFXInputTexture_;
-        metalFXDenoisedScaler_.depthTexture = metalFXDepthTexture_;
-        metalFXDenoisedScaler_.motionTexture = metalFXMotionTexture_;
-        metalFXDenoisedScaler_.normalTexture = metalFXNormalTexture_;
-        metalFXDenoisedScaler_.diffuseAlbedoTexture = metalFXDiffuseAlbedoTexture_;
-        metalFXDenoisedScaler_.specularAlbedoTexture = metalFXSpecularAlbedoTexture_;
-        metalFXDenoisedScaler_.roughnessTexture = metalFXRoughnessTexture_;
-        metalFXDenoisedScaler_.outputTexture = metalFXOutputTexture_;
-        metalFXDenoisedScaler_.jitterOffsetX = frame.jitterOffset.x;
-        metalFXDenoisedScaler_.jitterOffsetY = frame.jitterOffset.y;
-        metalFXDenoisedScaler_.shouldResetHistory = !hasPrevViewProj_;
-        metalFXDenoisedScaler_.worldToViewMatrix = cam->viewMatrix;
-        metalFXDenoisedScaler_.viewToClipMatrix = cam->projectionMatrix;
-        [metalFXDenoisedScaler_ encodeToCommandBuffer:cmdBuf];
-
-        {
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-          [enc setComputePipelineState:textureToBufferPipelineState_];
-          [enc setTexture:metalFXOutputTexture_ atIndex:0];
-          [enc setBuffer:metalFXOutputBuffer_ offset:0 atIndex:0];
-          metal_rt::dispatchThreads(enc, textureToBufferPipelineState_, metalFXOutputWidth_, metalFXOutputHeight_);
-          [enc endEncoding];
-        }
-
-        {
-          GPUToonUniforms mfxToon{};
-          mfxToon.width = metalFXOutputWidth_;
-          mfxToon.height = metalFXOutputHeight_;
-          mfxToon.exposure = config.renderMode == RenderMode::Toon
-                                 ? std::max(0.1f, config.toon.tonemapExposure)
-                                 : std::max(0.1f, config.lighting.standardExposure);
-          mfxToon.gamma = config.renderMode == RenderMode::Toon
-                              ? std::max(0.1f, config.toon.tonemapGamma)
-                              : std::max(0.1f, config.lighting.standardGamma);
-          mfxToon.saturation = config.renderMode == RenderMode::Toon
-                                   ? 1.0f
-                                   : std::max(0.0f, config.lighting.standardSaturation);
-          std::memcpy(metalFXToonBuffer_.contents, &mfxToon, sizeof(GPUToonUniforms));
-
-          metal_rt::PostProcessBuffers mfxBufs;
-          mfxBufs.rawColor = metalFXOutputBuffer_;
-          mfxBufs.toonUniforms = metalFXToonBuffer_;
-          mfxBufs.output = metalFXTonemappedBuffer_;
-          standardPreset_->encode(cmdBuf, mfxBufs, metalFXOutputWidth_, metalFXOutputHeight_, config);
-        }
-      }
-    } else if (lastEnableMetalFX_) {
-      teardownMetalFXResources();
+      GPUCamera* cam = static_cast<GPUCamera*>(cameraBuffer_.contents);
+      (void)denoiser_->encode(cmdBuf, denoiserInputs, width_, height_, frame, *cam, config, *standardPreset_);
     }
 
     [cmdBuf commit];
@@ -283,7 +203,6 @@ void MetalPathTracerBackend::renderIteration(const RenderConfig& config) {
   latestBuffer_.accumulatedSamples += frame.samplesPerIteration;
   frameIndex_ += 1;
   lastUseFxaa_ = config.toon.useFxaa;
-  lastEnableMetalFX_ = config.enableMetalFX && metalFXDenoisedScaler_ != nil;
   lastUseToon_ = (config.renderMode == RenderMode::Toon);
 
   GPUCamera* cam = static_cast<GPUCamera*>(cameraBuffer_.contents);
@@ -353,11 +272,11 @@ RenderBuffer MetalPathTracerBackend::downloadRenderBuffer() const {
   const auto* specularAlbedo = static_cast<const simd_float4*>(specularAlbedoBuffer_.contents);
   const auto* roughness = static_cast<const float*>(roughnessAuxBuffer_.contents);
 
-  if (lastEnableMetalFX_ && metalFXTonemappedBuffer_ != nil) {
-    const uint32_t outW = metalFXOutputWidth_;
-    const uint32_t outH = metalFXOutputHeight_;
+  if (denoiser_ != nullptr && denoiser_->isActive() && denoiser_->tonemappedBuffer() != nil) {
+    const uint32_t outW = denoiser_->outputWidth();
+    const uint32_t outH = denoiser_->outputHeight();
     const size_t outPixels = static_cast<size_t>(outW) * static_cast<size_t>(outH);
-    const auto* mfxOutput = static_cast<const simd_float4*>(metalFXTonemappedBuffer_.contents);
+    const auto* mfxOutput = static_cast<const simd_float4*>(denoiser_->tonemappedBuffer().contents);
 
     latestBuffer_.width = outW;
     latestBuffer_.height = outH;
@@ -443,81 +362,6 @@ RenderBuffer MetalPathTracerBackend::downloadRenderBuffer() const {
   }
 
   return latestBuffer_;
-}
-
-id<MTLTexture> MetalPathTracerBackend::createPrivateTexture(MTLPixelFormat format, uint32_t w, uint32_t h) {
-  MTLTextureDescriptor* desc =
-      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
-  desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-  desc.storageMode = MTLStorageModePrivate;
-  return [device_ newTextureWithDescriptor:desc];
-}
-
-void MetalPathTracerBackend::ensureMetalFXResources(uint32_t outputWidth, uint32_t outputHeight) {
-  if (metalFXDenoisedScaler_ != nil && metalFXOutputWidth_ == outputWidth && metalFXOutputHeight_ == outputHeight &&
-      metalFXInputTexture_.width == width_ && metalFXInputTexture_.height == height_) {
-    return;
-  }
-
-  metalFXOutputWidth_ = outputWidth;
-  metalFXOutputHeight_ = outputHeight;
-
-  metalFXInputTexture_ = createPrivateTexture(MTLPixelFormatRGBA16Float, width_, height_);
-  metalFXOutputTexture_ = createPrivateTexture(MTLPixelFormatRGBA16Float, outputWidth, outputHeight);
-  metalFXDepthTexture_ = createPrivateTexture(MTLPixelFormatR32Float, width_, height_);
-  metalFXMotionTexture_ = createPrivateTexture(MTLPixelFormatRG16Float, width_, height_);
-  metalFXNormalTexture_ = createPrivateTexture(MTLPixelFormatRGBA16Float, width_, height_);
-  metalFXDiffuseAlbedoTexture_ = createPrivateTexture(MTLPixelFormatRGBA16Float, width_, height_);
-  metalFXSpecularAlbedoTexture_ = createPrivateTexture(MTLPixelFormatRGBA16Float, width_, height_);
-  metalFXRoughnessTexture_ = createPrivateTexture(MTLPixelFormatR16Float, width_, height_);
-
-  const NSUInteger outputPixels = static_cast<NSUInteger>(outputWidth) * static_cast<NSUInteger>(outputHeight);
-  metalFXOutputBuffer_ = [device_ newBufferWithLength:outputPixels * sizeof(simd_float4) options:MTLResourceStorageModeShared];
-  metalFXTonemappedBuffer_ =
-      [device_ newBufferWithLength:outputPixels * sizeof(simd_float4) options:MTLResourceStorageModeShared];
-  metalFXToonBuffer_ = [device_ newBufferWithLength:sizeof(GPUToonUniforms) options:MTLResourceStorageModeShared];
-
-  MTLFXTemporalDenoisedScalerDescriptor* desc = [[MTLFXTemporalDenoisedScalerDescriptor alloc] init];
-  desc.inputWidth = width_;
-  desc.inputHeight = height_;
-  desc.outputWidth = outputWidth;
-  desc.outputHeight = outputHeight;
-  desc.colorTextureFormat = MTLPixelFormatRGBA16Float;
-  desc.outputTextureFormat = MTLPixelFormatRGBA16Float;
-  desc.depthTextureFormat = MTLPixelFormatR32Float;
-  desc.motionTextureFormat = MTLPixelFormatRG16Float;
-  desc.normalTextureFormat = MTLPixelFormatRGBA16Float;
-  desc.diffuseAlbedoTextureFormat = MTLPixelFormatRGBA16Float;
-  desc.specularAlbedoTextureFormat = MTLPixelFormatRGBA16Float;
-  desc.roughnessTextureFormat = MTLPixelFormatR16Float;
-  desc.autoExposureEnabled = YES;
-
-  metalFXDenoisedScaler_ = [desc newTemporalDenoisedScalerWithDevice:device_];
-  if (metalFXDenoisedScaler_ != nil) {
-    metalFXDenoisedScaler_.motionVectorScaleX = static_cast<float>(width_);
-    metalFXDenoisedScaler_.motionVectorScaleY = static_cast<float>(height_);
-    metalFXDenoisedScaler_.depthReversed = NO;
-  } else {
-    NSLog(@"[MetalFX] denoised scaler creation failed (input=%ux%u output=%ux%u)", width_, height_, outputWidth,
-          outputHeight);
-  }
-}
-
-void MetalPathTracerBackend::teardownMetalFXResources() {
-  metalFXDenoisedScaler_ = nil;
-  metalFXInputTexture_ = nil;
-  metalFXOutputTexture_ = nil;
-  metalFXDepthTexture_ = nil;
-  metalFXMotionTexture_ = nil;
-  metalFXNormalTexture_ = nil;
-  metalFXDiffuseAlbedoTexture_ = nil;
-  metalFXSpecularAlbedoTexture_ = nil;
-  metalFXRoughnessTexture_ = nil;
-  metalFXOutputBuffer_ = nil;
-  metalFXTonemappedBuffer_ = nil;
-  metalFXToonBuffer_ = nil;
-  metalFXOutputWidth_ = 0;
-  metalFXOutputHeight_ = 0;
 }
 
 } // namespace rt::metal_backend_internal

@@ -6,10 +6,10 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <MetalFX/MetalFX.h>
 #import <simd/simd.h>
 
 #include "rendering/gpu_shared_types.h"
+#include "rendering/metal/metal_denoiser.h"
 #include "rendering/metal/metal_postprocess.h"
 #include "rendering/ray_tracing_backend.h"
 #include "rendering/scene_packer.h"
@@ -29,10 +29,6 @@ public:
   RenderBuffer downloadRenderBuffer() const override;
 
 private:
-  id<MTLTexture> createPrivateTexture(MTLPixelFormat format, uint32_t w, uint32_t h);
-  void ensureMetalFXResources(uint32_t outputWidth, uint32_t outputHeight);
-  void teardownMetalFXResources();
-
   void encodePathTracePass(id<MTLCommandBuffer> cmdBuf);
 
   void buildSceneBuffers();
@@ -96,39 +92,18 @@ private:
 
   mutable id<MTLCommandBuffer> lastCommandBuffer_ = nil;
   bool lastUseFxaa_ = false;
-  bool lastEnableMetalFX_ = false;
   bool lastUseToon_ = false;
-
-  id<MTLComputePipelineState> bufferToTexturePipelineState_ = nil;
-  id<MTLComputePipelineState> textureToBufferPipelineState_ = nil;
-  id<MTLComputePipelineState> depthToTexturePipelineState_ = nil;
-  id<MTLComputePipelineState> roughnessToTexturePipelineState_ = nil;
-  id<MTLComputePipelineState> motionToTexturePipelineState_ = nil;
 
   id<MTLBuffer> diffuseAlbedoBuffer_ = nil;
   id<MTLBuffer> specularAlbedoBuffer_ = nil;
   id<MTLBuffer> roughnessAuxBuffer_ = nil;
   id<MTLBuffer> motionVectorBuffer_ = nil;
-
-  id<MTLTexture> metalFXInputTexture_ = nil;
-  id<MTLTexture> metalFXOutputTexture_ = nil;
-  id<MTLTexture> metalFXDepthTexture_ = nil;
-  id<MTLTexture> metalFXMotionTexture_ = nil;
-  id<MTLTexture> metalFXNormalTexture_ = nil;
-  id<MTLTexture> metalFXDiffuseAlbedoTexture_ = nil;
-  id<MTLTexture> metalFXSpecularAlbedoTexture_ = nil;
-  id<MTLTexture> metalFXRoughnessTexture_ = nil;
-  id<MTLBuffer> metalFXOutputBuffer_ = nil;
-  id<MTLBuffer> metalFXTonemappedBuffer_ = nil;
-  id<MTLBuffer> metalFXToonBuffer_ = nil;
-  id<MTLFXTemporalDenoisedScaler> metalFXDenoisedScaler_ = nil;
-  uint32_t metalFXOutputWidth_ = 0;
-  uint32_t metalFXOutputHeight_ = 0;
   simd_float4x4 prevViewProj_;
   bool hasPrevViewProj_ = false;
 
   std::unique_ptr<metal_rt::IMetalPostProcessPreset> standardPreset_;
   std::unique_ptr<metal_rt::IMetalPostProcessPreset> toonPreset_;
+  std::unique_ptr<metal_rt::MetalTemporalDenoiser> denoiser_;
 
   RTScene scene_;
   RTCamera camera_;

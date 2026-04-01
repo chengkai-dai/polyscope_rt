@@ -46,6 +46,25 @@ std::vector<float> faceScalarsToVertex(const std::vector<float>& faceScalars,
                                        const std::vector<uint32_t>& triFaceInds,
                                        size_t nVerts, float fallback);
 
+inline rt::RTQuantitySource makeQuantitySource(std::string_view ownerStructureName,
+                                               std::string_view quantityName,
+                                               rt::RTQuantitySourceKind kind) {
+  rt::RTQuantitySource source;
+  source.ownerStructureName = ownerStructureName;
+  source.quantityName = quantityName;
+  source.kind = kind;
+  return source;
+}
+
+template <typename QuantitiesMap, typename QuantityPtr>
+std::string findQuantityName(const QuantitiesMap& quantities, const QuantityPtr* target) {
+  if (target == nullptr) return {};
+  for (const auto& [name, qPtr] : quantities) {
+    if (qPtr.get() == target) return name;
+  }
+  return {};
+}
+
 rt::RTMesh makeMeshFromSimpleTriangleMesh(polyscope::SimpleTriangleMesh& mesh);
 rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh);
 rt::RTMesh makeMeshFromVolumeMesh(polyscope::VolumeMesh& mesh);
@@ -54,22 +73,7 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network);
 
 template <typename T>
 void applyMaterialPreset(T& target, std::string_view materialName) {
-  using polyscope::rt::applyPhysicalParamsFromPreset;
-  using polyscope::rt::Ceramic;
-  using polyscope::rt::Clay;
-  using polyscope::rt::Plastic;
-  using polyscope::rt::PerfectDiffuse;
-  using polyscope::rt::Rubber;
-
-  if (materialName == "clay") { applyPhysicalParamsFromPreset(target, Clay()); return; }
-  if (materialName == "flat") { applyPhysicalParamsFromPreset(target, PerfectDiffuse()); return; }
-  if (materialName == "candy") { auto p = Plastic(); p.roughness = 0.08f; applyPhysicalParamsFromPreset(target, p); return; }
-  if (materialName == "wax") { auto p = Plastic(); p.roughness = 0.35f; applyPhysicalParamsFromPreset(target, p); return; }
-  if (materialName == "mud") { applyPhysicalParamsFromPreset(target, Rubber()); return; }
-  if (materialName == "ceramic") { applyPhysicalParamsFromPreset(target, Ceramic()); return; }
-  if (materialName == "jade") { auto p = Plastic(); p.roughness = 0.12f; applyPhysicalParamsFromPreset(target, p); return; }
-  if (materialName == "normal") { auto p = Plastic(); p.roughness = 0.6f; applyPhysicalParamsFromPreset(target, p); return; }
-  applyPhysicalParamsFromPreset(target, PerfectDiffuse());
+  polyscope::rt::applyPolyscopeMaterialPreset(target, materialName);
 }
 
 void applyMaterialOverride(rt::RTMesh& mesh, const std::unordered_map<std::string, rt::MaterialOverride>& overrides);

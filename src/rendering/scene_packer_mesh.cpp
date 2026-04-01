@@ -8,6 +8,17 @@
 namespace rt {
 namespace scene_packer_detail {
 
+namespace {
+
+void appendVectorFieldVertex(SceneGpuAccumulator& acc, const glm::vec3& position, const glm::vec3& normal) {
+  acc.positions.push_back(simd_make_float4(position.x, position.y, position.z, 1.0f));
+  acc.normals.push_back(simd_make_float4(normal.x, normal.y, normal.z, 0.0f));
+  acc.vertexColors.push_back(simd_make_float4(1, 1, 1, 1));
+  acc.texcoords.push_back(simd_make_float2(0, 0));
+}
+
+} // namespace
+
 void gatherMeshGpuData(SceneGpuAccumulator& acc, const RTScene& scene) {
   for (const RTMesh& mesh : scene.meshes) {
     if (mesh.vertices.empty() || mesh.indices.empty()) continue;
@@ -186,15 +197,8 @@ void gatherVectorFieldGpuData(SceneGpuAccumulator& acc, const RTScene& scene) {
         const glm::vec3 r0 = root + n * shaftR;
         const glm::vec3 r1 = shaftEnd + n * shaftR;
 
-        acc.positions.push_back(simd_make_float4(r0.x, r0.y, r0.z, 1.0f));
-        acc.normals.push_back(simd_make_float4(n.x, n.y, n.z, 0.0f));
-        acc.vertexColors.push_back(simd_make_float4(1, 1, 1, 1));
-        acc.texcoords.push_back(simd_make_float2(0, 0));
-
-        acc.positions.push_back(simd_make_float4(r1.x, r1.y, r1.z, 1.0f));
-        acc.normals.push_back(simd_make_float4(n.x, n.y, n.z, 0.0f));
-        acc.vertexColors.push_back(simd_make_float4(1, 1, 1, 1));
-        acc.texcoords.push_back(simd_make_float2(0, 0));
+        appendVectorFieldVertex(acc, r0, n);
+        appendVectorFieldVertex(acc, r1, n);
       }
       for (int side = 0; side < kSides; ++side) {
         const uint32_t a = baseV + static_cast<uint32_t>(side * 2);
@@ -213,6 +217,24 @@ void gatherVectorFieldGpuData(SceneGpuAccumulator& acc, const RTScene& scene) {
         acc.accelIndices.push_back({b, c, d});
       }
 
+      const uint32_t rootCapBase = static_cast<uint32_t>(acc.positions.size());
+      for (int side = 0; side < kSides; ++side) {
+        const float theta = static_cast<float>(side) / kSides * 6.2831853f;
+        const glm::vec3 radial = tang * std::cos(theta) + bitang * std::sin(theta);
+        appendVectorFieldVertex(acc, root + radial * shaftR, -axis);
+      }
+      const uint32_t rootCapCenter = static_cast<uint32_t>(acc.positions.size());
+      appendVectorFieldVertex(acc, root, -axis);
+      for (int side = 0; side < kSides; ++side) {
+        const uint32_t a = rootCapBase + static_cast<uint32_t>(side);
+        const uint32_t b = rootCapBase + static_cast<uint32_t>((side + 1) % kSides);
+        GPUTriangle t{};
+        t.indicesMaterial = simd_make_uint4(rootCapCenter, b, a, materialIndex);
+        t.objectFlags = simd_make_uint4(objectId, 1u, 0u, 0u);
+        acc.shaderTriangles.push_back(t);
+        acc.accelIndices.push_back({rootCapCenter, b, a});
+      }
+
       const uint32_t coneBase = static_cast<uint32_t>(acc.positions.size());
       const float slopeAngle = std::atan2(coneBaseR, tipLen);
       for (int side = 0; side < kSides; ++side) {
@@ -222,10 +244,7 @@ void gatherVectorFieldGpuData(SceneGpuAccumulator& acc, const RTScene& scene) {
         const glm::vec3 radial = tang * cs + bitang * sn;
         const glm::vec3 rp = shaftEnd + radial * coneBaseR;
         const glm::vec3 cn = glm::normalize(radial * std::cos(slopeAngle) + axis * std::sin(slopeAngle));
-        acc.positions.push_back(simd_make_float4(rp.x, rp.y, rp.z, 1.0f));
-        acc.normals.push_back(simd_make_float4(cn.x, cn.y, cn.z, 0.0f));
-        acc.vertexColors.push_back(simd_make_float4(1, 1, 1, 1));
-        acc.texcoords.push_back(simd_make_float2(0, 0));
+        appendVectorFieldVertex(acc, rp, cn);
       }
       const uint32_t coneApexBase = static_cast<uint32_t>(acc.positions.size());
       for (int side = 0; side < kSides; ++side) {
@@ -234,10 +253,7 @@ void gatherVectorFieldGpuData(SceneGpuAccumulator& acc, const RTScene& scene) {
             glm::normalize(tang * std::cos(thetaMid) + bitang * std::sin(thetaMid));
         const glm::vec3 apexN =
             glm::normalize(radialMid * std::cos(slopeAngle) + axis * std::sin(slopeAngle));
-        acc.positions.push_back(simd_make_float4(tipEnd.x, tipEnd.y, tipEnd.z, 1.0f));
-        acc.normals.push_back(simd_make_float4(apexN.x, apexN.y, apexN.z, 0.0f));
-        acc.vertexColors.push_back(simd_make_float4(1, 1, 1, 1));
-        acc.texcoords.push_back(simd_make_float2(0, 0));
+        appendVectorFieldVertex(acc, tipEnd, apexN);
       }
 
       for (int side = 0; side < kSides; ++side) {
@@ -249,6 +265,24 @@ void gatherVectorFieldGpuData(SceneGpuAccumulator& acc, const RTScene& scene) {
         t.objectFlags = simd_make_uint4(objectId, 1u, 0u, 0u);
         acc.shaderTriangles.push_back(t);
         acc.accelIndices.push_back({a, b, apexI});
+      }
+
+      const uint32_t coneCapBase = static_cast<uint32_t>(acc.positions.size());
+      for (int side = 0; side < kSides; ++side) {
+        const float theta = static_cast<float>(side) / kSides * 6.2831853f;
+        const glm::vec3 radial = tang * std::cos(theta) + bitang * std::sin(theta);
+        appendVectorFieldVertex(acc, shaftEnd + radial * coneBaseR, -axis);
+      }
+      const uint32_t coneCapCenter = static_cast<uint32_t>(acc.positions.size());
+      appendVectorFieldVertex(acc, shaftEnd, -axis);
+      for (int side = 0; side < kSides; ++side) {
+        const uint32_t a = coneCapBase + static_cast<uint32_t>(side);
+        const uint32_t b = coneCapBase + static_cast<uint32_t>((side + 1) % kSides);
+        GPUTriangle t{};
+        t.indicesMaterial = simd_make_uint4(coneCapCenter, b, a, materialIndex);
+        t.objectFlags = simd_make_uint4(objectId, 1u, 0u, 0u);
+        acc.shaderTriangles.push_back(t);
+        acc.accelIndices.push_back({coneCapCenter, b, a});
       }
     }
   }

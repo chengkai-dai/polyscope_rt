@@ -73,17 +73,7 @@ MetalPathTracerBackend::MetalPathTracerBackend(const std::string& shaderLibraryP
     toonPreset_ = metal_rt::createToonPreset();
     standardPreset_->createPipelines(device_, library_);
     toonPreset_->createPipelines(device_, library_);
-
-    auto tryCreatePipeline = [&](NSString* name) -> id<MTLComputePipelineState> {
-      id<MTLFunction> fn = [library_ newFunctionWithName:name];
-      if (fn == nil) return nil;
-      return [device_ newComputePipelineStateWithFunction:fn error:&error];
-    };
-    bufferToTexturePipelineState_ = tryCreatePipeline(@"bufferToTextureKernel");
-    textureToBufferPipelineState_ = tryCreatePipeline(@"textureToBufferKernel");
-    depthToTexturePipelineState_ = tryCreatePipeline(@"depthToTextureKernel");
-    roughnessToTexturePipelineState_ = tryCreatePipeline(@"roughnessToTextureKernel");
-    motionToTexturePipelineState_ = tryCreatePipeline(@"motionToTextureKernel");
+    denoiser_ = std::make_unique<metal_rt::MetalTemporalDenoiser>(device_, library_);
 
     cameraBuffer_ = [device_ newBufferWithLength:sizeof(GPUCamera) options:MTLResourceStorageModeShared];
     frameBuffer_ = [device_ newBufferWithLength:sizeof(GPUFrameUniforms) options:MTLResourceStorageModeShared];

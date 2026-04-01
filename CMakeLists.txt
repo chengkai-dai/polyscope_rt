@@ -66,6 +66,7 @@ add_library(
   src/rendering/scene_packer_primitives.cpp
   src/rendering/metal/metal_device.mm
   src/rendering/metal/metal_scene_builder.mm
+  src/rendering/metal/metal_denoiser.mm
   src/rendering/metal/metal_standard_preset.mm
   src/rendering/metal/metal_toon_preset.mm
   src/rendering/metal/metal_backend.mm
@@ -77,6 +78,7 @@ add_library(
 set_source_files_properties(
   src/rendering/metal/metal_device.mm
   src/rendering/metal/metal_scene_builder.mm
+  src/rendering/metal/metal_denoiser.mm
   src/rendering/metal/metal_standard_preset.mm
   src/rendering/metal/metal_toon_preset.mm
   src/rendering/metal/metal_backend.mm

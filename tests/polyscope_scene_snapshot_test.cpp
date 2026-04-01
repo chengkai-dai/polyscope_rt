@@ -138,6 +138,12 @@ int main() {
     require(vf.roots.size() == 3, "RTVectorField should have 3 roots (one per vertex)");
     require(vf.directions.size() == 3, "RTVectorField should have 3 directions");
     require(vf.radius > 0.0f, "RTVectorField radius should be positive");
+    require(vf.quantitySource.ownerStructureName == "vf_mesh",
+            "RTVectorField should retain the owner surface mesh name");
+    require(vf.quantitySource.quantityName == "vf",
+            "RTVectorField should retain the source quantity name");
+    require(vf.quantitySource.kind == rt::RTQuantitySourceKind::SurfaceVertexVector,
+            "RTVectorField should retain the source quantity kind");
 
     // Disabling the quantity should remove it from the snapshot.
     vfQty->setEnabled(false);

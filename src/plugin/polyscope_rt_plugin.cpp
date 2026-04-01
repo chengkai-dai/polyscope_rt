@@ -7,7 +7,12 @@
 #include <utility>
 #include <vector>
 
+#include "polyscope/curve_network.h"
+#include "polyscope/point_cloud.h"
 #include "polyscope/polyscope.h"
+#include "polyscope/simple_triangle_mesh.h"
+#include "polyscope/surface_mesh.h"
+#include "polyscope/volume_mesh.h"
 
 #include "plugin/polyscope_rt_runtime.h"
 #include "rendering/ray_tracing_types.h"
@@ -57,6 +62,36 @@ void bootstrapRuntime() {
   if (g_runtime) return;
   g_runtime = new PolyscopeRtRuntime();
   g_ownsRuntime = true;
+}
+
+void setRasterMeshColor(const std::string& structureName, const glm::vec3& color) {
+  if (::polyscope::hasSurfaceMesh(structureName)) {
+    ::polyscope::getSurfaceMesh(structureName)->setSurfaceColor(color);
+  } else if (::polyscope::hasSimpleTriangleMesh(structureName)) {
+    ::polyscope::getSimpleTriangleMesh(structureName)->setSurfaceColor(color);
+  } else if (::polyscope::hasVolumeMesh(structureName)) {
+    ::polyscope::getVolumeMesh(structureName)->setColor(color);
+  }
+}
+
+void setRasterMeshMaterial(const std::string& structureName, const std::string& materialName) {
+  if (::polyscope::hasSurfaceMesh(structureName)) {
+    ::polyscope::getSurfaceMesh(structureName)->setMaterial(materialName);
+  } else if (::polyscope::hasSimpleTriangleMesh(structureName)) {
+    ::polyscope::getSimpleTriangleMesh(structureName)->setMaterial(materialName);
+  } else if (::polyscope::hasVolumeMesh(structureName)) {
+    ::polyscope::getVolumeMesh(structureName)->setMaterial(materialName);
+  }
+}
+
+void setRasterMeshTransparency(const std::string& structureName, float transparency) {
+  if (::polyscope::hasSurfaceMesh(structureName)) {
+    ::polyscope::getSurfaceMesh(structureName)->setTransparency(transparency);
+  } else if (::polyscope::hasSimpleTriangleMesh(structureName)) {
+    ::polyscope::getSimpleTriangleMesh(structureName)->setTransparency(transparency);
+  } else if (::polyscope::hasVolumeMesh(structureName)) {
+    ::polyscope::getVolumeMesh(structureName)->setTransparency(transparency);
+  }
 }
 
 void syncOptionsToRuntime() {
@@ -285,10 +320,13 @@ void setMaterial(const std::string& meshName, float metallic, float roughness) {
 
 void setBaseColor(const std::string& meshName, glm::vec4 color) {
   g_materialOverrides[meshName].baseColor = color;
+  setRasterMeshColor(meshName, glm::vec3(color));
 }
 
 void setEmissive(const std::string& meshName, glm::vec3 emissive) {
   g_materialOverrides[meshName].emissive = emissive;
+  setRasterMeshColor(meshName, glm::clamp(emissive, glm::vec3(0.0f), glm::vec3(1.0f)));
+  setRasterMeshMaterial(meshName, "flat");
 }
 
 void setUnlitColor(const std::string& meshName, glm::vec3 color) {
@@ -298,6 +336,9 @@ void setUnlitColor(const std::string& meshName, glm::vec3 color) {
   ov.metallic = 0.0f;
   ov.roughness = 1.0f;
   ov.unlit = true;
+  setRasterMeshColor(meshName, color);
+  setRasterMeshMaterial(meshName, "flat");
+  setRasterMeshTransparency(meshName, 1.0f);
 }
 
 void setTransmission(const std::string& meshName, float transmission, float ior) {

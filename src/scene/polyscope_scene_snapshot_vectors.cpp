@@ -4,36 +4,47 @@ namespace snapshot_detail {
 
 std::vector<rt::RTVectorField> makeRTVectorFields(polyscope::SurfaceMesh& mesh) {
   std::vector<rt::RTVectorField> fields;
+  const std::string ownerName = mesh.getName();
   for (auto& [qName, qPtr] : mesh.quantities) {
     if (!qPtr->isEnabled()) continue;
 
     if (auto* q = dynamic_cast<polyscope::SurfaceVertexVectorQuantity*>(qPtr.get())) {
       auto field = vectorQuantityToRT(*q);
       field.name = qName;
+      field.quantitySource =
+          makeQuantitySource(ownerName, qName, rt::RTQuantitySourceKind::SurfaceVertexVector);
       if (!field.roots.empty()) fields.push_back(std::move(field));
       continue;
     }
     if (auto* q = dynamic_cast<polyscope::SurfaceFaceVectorQuantity*>(qPtr.get())) {
       auto field = vectorQuantityToRT(*q);
       field.name = qName;
+      field.quantitySource =
+          makeQuantitySource(ownerName, qName, rt::RTQuantitySourceKind::SurfaceFaceVector);
       if (!field.roots.empty()) fields.push_back(std::move(field));
       continue;
     }
     if (auto* q = dynamic_cast<polyscope::SurfaceFaceTangentVectorQuantity*>(qPtr.get())) {
       auto field = tangentVectorQuantityToRT(*q);
       field.name = qName;
+      field.quantitySource =
+          makeQuantitySource(ownerName, qName, rt::RTQuantitySourceKind::SurfaceFaceTangentVector);
       if (!field.roots.empty()) fields.push_back(std::move(field));
       continue;
     }
     if (auto* q = dynamic_cast<polyscope::SurfaceVertexTangentVectorQuantity*>(qPtr.get())) {
       auto field = tangentVectorQuantityToRT(*q);
       field.name = qName;
+      field.quantitySource = makeQuantitySource(ownerName, qName,
+                                                rt::RTQuantitySourceKind::SurfaceVertexTangentVector);
       if (!field.roots.empty()) fields.push_back(std::move(field));
       continue;
     }
     if (auto* q = dynamic_cast<polyscope::SurfaceOneFormTangentVectorQuantity*>(qPtr.get())) {
       auto field = tangentVectorQuantityToRT(*q);
       field.name = qName;
+      field.quantitySource =
+          makeQuantitySource(ownerName, qName, rt::RTQuantitySourceKind::SurfaceOneFormTangentVector);
       if (!field.roots.empty()) fields.push_back(std::move(field));
       continue;
     }

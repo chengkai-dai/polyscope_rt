@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 #include "polyscope/rt/material_library.h"
 #include "rendering/ray_tracing_types.h"
 
@@ -23,6 +25,39 @@ inline void applyPhysicalParamsFromPreset(::rt::RTCurveNetwork& curve, const Mat
   curve.metallic = preset.metallic;
   curve.roughness = preset.roughness;
   curve.unlit = preset.unlit;
+}
+
+inline MaterialPreset presetFromPolyscopeMaterial(std::string_view materialName) {
+  if (materialName == "clay") return Clay();
+  if (materialName == "flat") return PerfectDiffuse();
+  if (materialName == "candy") {
+    auto p = Plastic();
+    p.roughness = 0.08f;
+    return p;
+  }
+  if (materialName == "wax") {
+    auto p = Plastic();
+    p.roughness = 0.35f;
+    return p;
+  }
+  if (materialName == "mud") return Rubber();
+  if (materialName == "ceramic") return Ceramic();
+  if (materialName == "jade") {
+    auto p = Plastic();
+    p.roughness = 0.12f;
+    return p;
+  }
+  if (materialName == "normal") {
+    auto p = Plastic();
+    p.roughness = 0.6f;
+    return p;
+  }
+  return PerfectDiffuse();
+}
+
+template <typename T>
+inline void applyPolyscopeMaterialPreset(T& target, std::string_view materialName) {
+  applyPhysicalParamsFromPreset(target, presetFromPolyscopeMaterial(materialName));
 }
 
 } // namespace rt

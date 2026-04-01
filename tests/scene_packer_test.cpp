@@ -203,6 +203,39 @@ void testObjectIdsStayStableAcrossEquivalentPackingRuns() {
   }
 }
 
+void testVectorFieldArrowAddsClosedCapGeometry() {
+  rt::RTScene scene;
+  rt::RTVectorField vf;
+  vf.name = "vf_caps";
+  vf.roots = {{0.0f, 0.0f, 0.0f}};
+  vf.directions = {{0.0f, 1.0f, 0.0f}};
+  vf.radius = 0.1f;
+  scene.vectorFields.push_back(vf);
+
+  const rt::PackedSceneData packed = rt::packScene(scene);
+  require(packed.acc.materials.size() == 1u, "vector field should pack one material");
+  require(packed.acc.shaderTriangles.size() == 40u,
+          "vector field arrow should pack side geometry plus closed root/base caps");
+
+  bool foundRootCenter = false;
+  bool foundConeBaseCenter = false;
+  for (size_t i = 0; i < packed.acc.positions.size(); ++i) {
+    const glm::vec3 position = unpackVec3(packed.acc.positions[i]);
+    const glm::vec3 normal = unpackVec3(packed.acc.normals[i]);
+    if (glm::length(position - glm::vec3(0.0f, 0.0f, 0.0f)) < 1e-6f) {
+      foundRootCenter = true;
+      require(normal.y < -0.99f, "root cap center should face backward along the arrow axis");
+    }
+    if (glm::length(position - glm::vec3(0.0f, 0.8f, 0.0f)) < 1e-6f) {
+      foundConeBaseCenter = true;
+      require(normal.y < -0.99f, "cone base cap center should face backward along the arrow axis");
+    }
+  }
+
+  require(foundRootCenter, "vector field arrow should contain a root cap center vertex");
+  require(foundConeBaseCenter, "vector field arrow should contain a cone base cap center vertex");
+}
+
 } // namespace
 
 int main() {
@@ -214,6 +247,7 @@ int main() {
     testEmissiveTriangleWeightsScaleByAreaAndPower();
     testContourPrimitiveNamesShareObjectId();
     testObjectIdsStayStableAcrossEquivalentPackingRuns();
+    testVectorFieldArrowAddsClosedCapGeometry();
     std::cout << "scene_packer_test passed" << std::endl;
     return 0;
   } catch (const std::exception& e) {

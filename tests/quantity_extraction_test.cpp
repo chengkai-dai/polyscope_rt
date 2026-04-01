@@ -96,6 +96,12 @@ void testFaceScalarToVertexColors() {
           "vertices on different-scalar faces should have different colors");
   require(m.baseColorFactor == glm::vec4(1.0f),
           "face scalar quantity should set baseColorFactor to (1,1,1,1)");
+  require(m.colorQuantitySource.ownerStructureName == "fsq_mesh",
+          "mesh should retain the owner structure name for scalar-derived colors");
+  require(m.colorQuantitySource.quantityName == "face_s",
+          "mesh should retain the source scalar quantity name");
+  require(m.colorQuantitySource.kind == rt::RTQuantitySourceKind::SurfaceFaceScalar,
+          "mesh should mark scalar-derived colors with the correct source kind");
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +123,10 @@ void testFaceColorToVertexColors() {
   require(m.vertexColors[1].r > 0.5f, "vertex only on red face should be reddish");
   // Vertex 3 is only on face 1 (blue) → high B
   require(m.vertexColors[3].b > 0.5f, "vertex only on blue face should be bluish");
+  require(m.colorQuantitySource.quantityName == "face_c",
+          "mesh should retain the source face color quantity name");
+  require(m.colorQuantitySource.kind == rt::RTQuantitySourceKind::SurfaceFaceColor,
+          "mesh should mark face-color-derived colors with the correct source kind");
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +147,10 @@ void testFaceScalarIsolineParams() {
   require(m.isoScalars.size() == 4, "isoScalars should have one entry per vertex");
   requireNear(m.isoSpacing,  0.25f, 1e-4f, "isoSpacing should reflect the set period");
   requireNear(m.isoDarkness, 0.7f,  1e-4f, "isoDarkness should reflect the set darkness");
+  require(m.isolineQuantitySource.quantityName == "face_iso",
+          "mesh should retain the source scalar quantity for isolines");
+  require(m.isolineQuantitySource.kind == rt::RTQuantitySourceKind::SurfaceFaceScalar,
+          "isoline source kind should reflect the originating face scalar quantity");
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +168,10 @@ void testPointCloudColorQuantityPriority() {
   auto snapScalar = capturePolyscopeSceneSnapshot();
   require(!snapScalar.scene.pointClouds.front().colors.empty(),
           "enabled scalar quantity should produce per-point colors");
+  require(snapScalar.scene.pointClouds.front().colorQuantitySource.quantityName == "pc_scalar",
+          "point cloud should retain the scalar quantity used for colorization");
+  require(snapScalar.scene.pointClouds.front().colorQuantitySource.kind == rt::RTQuantitySourceKind::PointScalar,
+          "point cloud scalar colorization should retain the correct source kind");
 
   // Now also add a color quantity that overrides with pure green.
   auto* colorQty = pc->addColorQuantity(
@@ -166,6 +184,10 @@ void testPointCloudColorQuantityPriority() {
   require(!colors.empty(), "color quantity should produce per-point colors");
   require(colors[0].g > 0.9f, "color quantity (green) should dominate per-point output");
   require(colors[0].r < 0.1f, "color quantity should suppress non-green channels");
+  require(snapColor.scene.pointClouds.front().colorQuantitySource.quantityName == "pc_color",
+          "point cloud should retain the color quantity used for override");
+  require(snapColor.scene.pointClouds.front().colorQuantitySource.kind == rt::RTQuantitySourceKind::PointColor,
+          "point cloud color override should retain the correct source kind");
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +240,10 @@ void testCurveNodeColorExtracted() {
   // Gradient: tail != tip for node color quantities.
   require(cn.primitiveColors[cylOffset] != cn.primitiveColors1[cylOffset],
           "node color: tail and tip colors should differ for a gradient segment");
+  require(cn.colorQuantitySource.quantityName == "nc",
+          "curve network should retain the node color quantity name");
+  require(cn.colorQuantitySource.kind == rt::RTQuantitySourceKind::CurveNodeColor,
+          "curve network should retain the node color quantity kind");
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +337,10 @@ void testCurveEdgeScalarExtracted() {
   const size_t cylOffset10 = cn.primitives.size() - 2;
   require(cn.primitiveColors[cylOffset10] == cn.primitiveColors1[cylOffset10],
           "edge scalar: cylinder tail and tip should be identical (uniform per segment)");
+  require(cn.colorQuantitySource.quantityName == "es",
+          "curve network should retain the edge scalar quantity name");
+  require(cn.colorQuantitySource.kind == rt::RTQuantitySourceKind::CurveEdgeScalar,
+          "curve network should retain the edge scalar quantity kind");
 }
 
 // ---------------------------------------------------------------------------

@@ -120,23 +120,26 @@ struct GPUToonUniforms {
   uint  enableNormalEdge;
   uint  enableDepthEdge;
 #else
-  uint32_t width                 = 1;
-  uint32_t height                = 1;
-  uint32_t contourMethod         = 2;
-  uint32_t useFxaa               = 1;
-  float    detailContourStrength = 1.0f;
-  float    depthThreshold        = 1.0f;
-  float    normalThreshold       = 0.5f;
-  float    edgeThickness         = 1.0f;
-  float    exposure              = 3.0f;
-  float    gamma                 = 2.2f;
-  float    saturation            = 1.0f;
-  float    objectContourStrength = 1.0f;
-  float    objectThreshold       = 1.0f;
-  uint32_t enableDetailContour   = 1u;
-  uint32_t enableObjectContour   = 1u;
-  uint32_t enableNormalEdge      = 1u;
-  uint32_t enableDepthEdge       = 1u;
+  // Host-side layout mirror for the Metal uniform block. Keep this struct free
+  // of product-default semantics; authoritative render defaults live in
+  // ray_tracing_types.h and are copied in explicitly by the backend.
+  uint32_t width;
+  uint32_t height;
+  uint32_t contourMethod;
+  uint32_t useFxaa;
+  float    detailContourStrength;
+  float    depthThreshold;
+  float    normalThreshold;
+  float    edgeThickness;
+  float    exposure;
+  float    gamma;
+  float    saturation;
+  float    objectContourStrength;
+  float    objectThreshold;
+  uint32_t enableDetailContour;
+  uint32_t enableObjectContour;
+  uint32_t enableNormalEdge;
+  uint32_t enableDepthEdge;
 #endif
   float4 backgroundColor;
   float4 edgeColor;

@@ -47,6 +47,16 @@ void testBackendNeutralPublicHeaderStaysMetalFree() {
           "ray_tracing_backend.h must not include Metal headers");
   require(contents.find("MTL") == std::string::npos,
           "ray_tracing_backend.h must not expose Metal-specific types");
+  require(contents.find("createMetalPathTracerBackend(") == std::string::npos,
+          "ray_tracing_backend.h should not expose Metal-only compatibility factories");
+  require(contents.find("createMetalShaderTestHarness(") == std::string::npos,
+          "ray_tracing_backend.h should not expose Metal-only compatibility harness factories");
+  require(contents.find("MetalPostprocessTestInput") == std::string::npos,
+          "ray_tracing_backend.h should not expose Metal-only compatibility aliases");
+  require(contents.find("MetalPostprocessTestOutput") == std::string::npos,
+          "ray_tracing_backend.h should not expose Metal-only compatibility aliases");
+  require(contents.find("IMetalShaderTestHarness") == std::string::npos,
+          "ray_tracing_backend.h should not expose Metal-only compatibility aliases");
 }
 
 void testPluginOptionDefaultsMatchAuthoritativeDefaults() {

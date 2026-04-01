@@ -23,6 +23,31 @@ struct RTTexture {
   std::vector<glm::vec4> pixels;
 };
 
+enum class RTQuantitySourceKind : uint32_t {
+  None = 0,
+  SurfaceVertexColor,
+  SurfaceVertexScalar,
+  SurfaceFaceColor,
+  SurfaceFaceScalar,
+  SurfaceVertexVector,
+  SurfaceFaceVector,
+  SurfaceVertexTangentVector,
+  SurfaceFaceTangentVector,
+  SurfaceOneFormTangentVector,
+  PointColor,
+  PointScalar,
+  CurveNodeColor,
+  CurveEdgeColor,
+  CurveNodeScalar,
+  CurveEdgeScalar,
+};
+
+struct RTQuantitySource {
+  std::string ownerStructureName;
+  std::string quantityName;
+  RTQuantitySourceKind kind = RTQuantitySourceKind::None;
+};
+
 struct RTPunctualLight {
   // Analytic light source with no explicit scene geometry. Mirrors the common
   // DCC / renderer distinction between punctual lights and emissive meshes.
@@ -74,6 +99,9 @@ struct RTMesh {
   float isoDarkness = 0.5f;         // dark band multiplier (from getIsolineDarkness())
   float isoContourThickness = 0.3f; // contour line width factor (from getIsolineContourThickness())
   int   isoStyle = 1;               // 1=stripe, 2=contour (from getIsolineStyle())
+  // Source quantity that produced vertexColors and optional isoline data.
+  RTQuantitySource colorQuantitySource;
+  RTQuantitySource isolineQuantitySource;
 };
 
 enum class RTCurvePrimitiveType : uint32_t {
@@ -111,6 +139,7 @@ struct RTCurveNetwork {
   std::vector<glm::vec3> nodePositions; // world-space positions, one per node
   std::vector<uint32_t>  edgeTailInds;  // index into nodePositions for each edge tail
   std::vector<uint32_t>  edgeTipInds;   // index into nodePositions for each edge tip
+  RTQuantitySource colorQuantitySource;
 };
 
 struct RTPointCloud {
@@ -123,6 +152,7 @@ struct RTPointCloud {
   float metallic = 0.0f;
   float roughness = 0.8f;
   bool unlit = false;
+  RTQuantitySource colorQuantitySource;
 };
 
 // An enabled vector-field quantity from a SurfaceMesh.  Each arrow is a
@@ -136,6 +166,7 @@ struct RTVectorField {
   float radius   = 0.005f;            // shaft radius (world units)
   float metallic = 0.0f;
   float roughness = 0.4f;
+  RTQuantitySource quantitySource;
 };
 
 struct RTScene {
@@ -173,7 +204,7 @@ struct LightingSettings {
   float ambientFloor = 0.1f;
   float standardExposure = 4.0f;
   float standardGamma = 2.2f;
-  float standardSaturation = 1.0f;
+  float standardSaturation = 1.5f;
   int toonBandCount = 5;
   glm::vec3 areaLightCenter{0.0f, 2.72f, -1.35f};
   glm::vec3 areaLightU{0.55f, 0.0f, 0.0f};

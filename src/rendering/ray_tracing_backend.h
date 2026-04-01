@@ -75,18 +75,4 @@ BackendAvailability queryTestHarnessAvailability(BackendType type, const std::st
 std::unique_ptr<IRayTracingBackend>    createBackend(BackendType type, const std::string& shaderLibraryPath = {});
 std::unique_ptr<IPostProcessTestHarness> createTestHarness(BackendType type, const std::string& shaderLibraryPath = {});
 
-// Compatibility-only aliases and wrappers.
-// Prefer createBackend()/createTestHarness() and queryBackendAvailability().
-// Internal code and tests should not depend on these compatibility paths.
-using MetalPostprocessTestInput  = PostprocessTestInput;
-using MetalPostprocessTestOutput = PostprocessTestOutput;
-using IMetalShaderTestHarness    = IPostProcessTestHarness;
-
-inline std::unique_ptr<IRayTracingBackend> createMetalPathTracerBackend(const std::string& shaderLibraryPath = {}) {
-  return createBackend(BackendType::Metal, shaderLibraryPath);
-}
-inline std::unique_ptr<IMetalShaderTestHarness> createMetalShaderTestHarness(const std::string& shaderLibraryPath = {}) {
-  return createTestHarness(BackendType::Metal, shaderLibraryPath);
-}
-
 } // namespace rt

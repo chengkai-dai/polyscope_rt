@@ -53,11 +53,14 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
   }
 
   const size_t nVerts = mesh.vertexPositions.data.size();
+  const std::string dominantQuantityName = findQuantityName(mesh.quantities, mesh.dominantQuantity);
 
   if (auto* vcq = dynamic_cast<polyscope::SurfaceVertexColorQuantity*>(mesh.dominantQuantity)) {
     vcq->colors.ensureHostBufferPopulated();
     out.vertexColors = vcq->colors.data;
     out.baseColorFactor = glm::vec4(1.0f);
+    out.colorQuantitySource =
+        makeQuantitySource(mesh.getName(), dominantQuantityName, rt::RTQuantitySourceKind::SurfaceVertexColor);
   } else if (auto* vsq = dynamic_cast<polyscope::SurfaceVertexScalarQuantity*>(mesh.dominantQuantity)) {
     const auto& scalars = vsq->values.data;
     const auto [vizMin, vizMax] = vsq->getMapRange();
@@ -69,12 +72,15 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
       out.vertexColors.push_back(cmap.getValue(t));
     }
     out.baseColorFactor = glm::vec4(1.0f);
+    out.colorQuantitySource =
+        makeQuantitySource(mesh.getName(), dominantQuantityName, rt::RTQuantitySourceKind::SurfaceVertexScalar);
     if (vsq->getIsolinesEnabled()) {
       out.isoScalars = scalars;
       out.isoSpacing = static_cast<float>(vsq->getIsolinePeriod());
       out.isoDarkness = static_cast<float>(vsq->getIsolineDarkness());
       out.isoContourThickness = static_cast<float>(vsq->getIsolineContourThickness());
       out.isoStyle = (vsq->getIsolineStyle() == polyscope::IsolineStyle::Contour) ? 2 : 1;
+      out.isolineQuantitySource = out.colorQuantitySource;
     }
   } else if (auto* fcq = dynamic_cast<polyscope::SurfaceFaceColorQuantity*>(mesh.dominantQuantity)) {
     fcq->colors.ensureHostBufferPopulated();
@@ -82,6 +88,8 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
     faceColorsToVertex(fcq->colors.data, triIndices, mesh.triangleFaceInds.data,
                        nVerts, mesh.getSurfaceColor(), out.vertexColors);
     out.baseColorFactor = glm::vec4(1.0f);
+    out.colorQuantitySource =
+        makeQuantitySource(mesh.getName(), dominantQuantityName, rt::RTQuantitySourceKind::SurfaceFaceColor);
   } else if (auto* fsq = dynamic_cast<polyscope::SurfaceFaceScalarQuantity*>(mesh.dominantQuantity)) {
     mesh.triangleFaceInds.ensureHostBufferPopulated();
     const auto& faceScalars = fsq->values.data;
@@ -98,6 +106,8 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
       out.vertexColors.push_back(cmap.getValue(t));
     }
     out.baseColorFactor = glm::vec4(1.0f);
+    out.colorQuantitySource =
+        makeQuantitySource(mesh.getName(), dominantQuantityName, rt::RTQuantitySourceKind::SurfaceFaceScalar);
 
     if (fsq->getIsolinesEnabled()) {
       out.isoScalars = vertScalars;
@@ -105,6 +115,7 @@ rt::RTMesh makeMeshFromSurfaceMesh(polyscope::SurfaceMesh& mesh) {
       out.isoDarkness = static_cast<float>(fsq->getIsolineDarkness());
       out.isoContourThickness = static_cast<float>(fsq->getIsolineContourThickness());
       out.isoStyle = (fsq->getIsolineStyle() == polyscope::IsolineStyle::Contour) ? 2 : 1;
+      out.isolineQuantitySource = out.colorQuantitySource;
     }
   }
 
@@ -130,9 +141,9 @@ rt::RTPointCloud makeRTPointCloud(polyscope::PointCloud& cloud) {
   out.metallic = tmp.metallicFactor;
   out.roughness = tmp.roughnessFactor;
   out.unlit = tmp.unlit;
+  const std::string ownerName = cloud.getName();
 
   for (auto& [qName, qPtr] : cloud.quantities) {
-    (void)qName;
     if (!qPtr->isEnabled()) continue;
     auto* colorQ = dynamic_cast<polyscope::PointCloudColorQuantity*>(qPtr.get());
     if (!colorQ) continue;
@@ -140,12 +151,13 @@ rt::RTPointCloud makeRTPointCloud(polyscope::PointCloud& cloud) {
     const auto& rawColors = colorQ->colors.data;
     out.colors.reserve(rawColors.size());
     for (const auto& c : rawColors) out.colors.push_back(c);
+    out.colorQuantitySource =
+        makeQuantitySource(ownerName, qName, rt::RTQuantitySourceKind::PointColor);
     break;
   }
 
   if (out.colors.empty()) {
     for (auto& [qName, qPtr] : cloud.quantities) {
-      (void)qName;
       if (!qPtr->isEnabled()) continue;
       auto* scalarQ = dynamic_cast<polyscope::PointCloudScalarQuantity*>(qPtr.get());
       if (!scalarQ) continue;
@@ -161,6 +173,8 @@ rt::RTPointCloud makeRTPointCloud(polyscope::PointCloud& cloud) {
         const double t = (v - lo) / range;
         out.colors.push_back(cmap.getValue(t));
       }
+      out.colorQuantitySource =
+          makeQuantitySource(ownerName, qName, rt::RTQuantitySourceKind::PointScalar);
       break;
     }
   }
@@ -244,6 +258,7 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
 
   const glm::vec3 fallback = glm::vec3(network.getColor());
   const size_t nSpheres = sphereNodeIndices.size();
+  const std::string dominantQuantityName = findQuantityName(network.quantities, network.dominantQuantity);
 
   auto colormapScalars = [&](const std::vector<float>& scalars,
                              const polyscope::render::ValueColorMap& cmap,
@@ -261,6 +276,8 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
   if (auto* q = dynamic_cast<polyscope::CurveNetworkNodeColorQuantity*>(network.dominantQuantity)) {
     q->colors.ensureHostBufferPopulated();
     const auto& nc = q->colors.data;
+    out.colorQuantitySource =
+        makeQuantitySource(network.getName(), dominantQuantityName, rt::RTQuantitySourceKind::CurveNodeColor);
     out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
     out.primitiveColors1.reserve(nSpheres + cylinderEdgeIndex.size());
     for (size_t ni : sphereNodeIndices) {
@@ -278,6 +295,8 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
   } else if (auto* q = dynamic_cast<polyscope::CurveNetworkEdgeColorQuantity*>(network.dominantQuantity)) {
     q->colors.ensureHostBufferPopulated();
     const auto& ec = q->colors.data;
+    out.colorQuantitySource =
+        makeQuantitySource(network.getName(), dominantQuantityName, rt::RTQuantitySourceKind::CurveEdgeColor);
     std::vector<glm::vec3> nodeColorSum(nNodes, glm::vec3(0.0f));
     std::vector<int> nodeColorCnt(nNodes, 0);
     for (size_t i = 0; i < edgeCount; ++i) {
@@ -307,6 +326,8 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     const auto [vizMin, vizMax] = q->getMapRange();
     const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
     const std::vector<glm::vec3> nc = colormapScalars(q->values.data, cmap, vizMin, vizMax);
+    out.colorQuantitySource =
+        makeQuantitySource(network.getName(), dominantQuantityName, rt::RTQuantitySourceKind::CurveNodeScalar);
     out.primitiveColors.reserve(nSpheres + cylinderEdgeIndex.size());
     out.primitiveColors1.reserve(nSpheres + cylinderEdgeIndex.size());
     for (size_t ni : sphereNodeIndices) {
@@ -326,6 +347,8 @@ rt::RTCurveNetwork makeCurveNetwork(polyscope::CurveNetwork& network) {
     const auto [vizMin, vizMax] = q->getMapRange();
     const auto& cmap = polyscope::render::engine->getColorMap(q->getColorMap());
     const auto& ev = q->values.data;
+    out.colorQuantitySource =
+        makeQuantitySource(network.getName(), dominantQuantityName, rt::RTQuantitySourceKind::CurveEdgeScalar);
     const double range = (vizMax > vizMin) ? (vizMax - vizMin) : 1.0;
     std::vector<float> nodeScalarSum(nNodes, 0.0f);
     std::vector<int> nodeScalarCnt(nNodes, 0);
