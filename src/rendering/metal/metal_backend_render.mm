@@ -139,6 +139,7 @@ void MetalPathTracerBackend::renderIteration(const RenderConfig& config) {
 
   GPULighting lighting;
   lighting.backgroundColor = metal_rt::makeFloat4(config.lighting.backgroundColor, 1.0f);
+  lighting.sceneUpDir = metal_rt::makeFloat4(glm::normalize(config.lighting.sceneUpDir), 0.0f);
   lighting.mainLightDirection =
       metal_rt::makeFloat4(glm::normalize(config.lighting.mainLightDirection),
                            std::max(config.lighting.mainLightAngularRadius, 0.0f));

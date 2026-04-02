@@ -33,6 +33,7 @@ float3 evaluateEnvironmentRadiance(float3 dir, constant GPULighting& lighting) {
   return rtEvaluateEnvironmentRadiance(lighting.backgroundColor.xyz,
                                        lighting.environmentTintIntensity.xyz,
                                        lighting.environmentTintIntensity.w,
+                                       lighting.sceneUpDir.xyz,
                                        normalize(dir));
 }
 

@@ -30,10 +30,11 @@ void testEnvironmentRadianceProfileIsShared() {
   const float3 background = float3{lighting.backgroundColor.x, lighting.backgroundColor.y, lighting.backgroundColor.z};
   const float3 tint = float3{lighting.environmentTint.x, lighting.environmentTint.y, lighting.environmentTint.z};
   const float envIntensity = lighting.environmentIntensity;
+  const float3 sceneUp = float3{lighting.sceneUpDir.x, lighting.sceneUpDir.y, lighting.sceneUpDir.z};
 
-  const float3 zenith = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, float3{0.0f, 1.0f, 0.0f});
-  const float3 horizon = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, float3{1.0f, 0.0f, 0.0f});
-  const float3 ground = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, float3{0.0f, -1.0f, 0.0f});
+  const float3 zenith = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, sceneUp, float3{0.0f, 1.0f, 0.0f});
+  const float3 horizon = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, sceneUp, float3{1.0f, 0.0f, 0.0f});
+  const float3 ground = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, sceneUp, float3{0.0f, -1.0f, 0.0f});
 
   const float zenithLum = rtEnvironmentLuminance(zenith);
   const float horizonLum = rtEnvironmentLuminance(horizon);
@@ -43,12 +44,30 @@ void testEnvironmentRadianceProfileIsShared() {
   require(horizonLum > groundLum, "shared environment model should keep the horizon above the ground bounce");
 }
 
+void testEnvironmentRadianceRespectsSceneUpDir() {
+  rt::LightingSettings lighting;
+  const float3 background = float3{lighting.backgroundColor.x, lighting.backgroundColor.y, lighting.backgroundColor.z};
+  const float3 tint = float3{lighting.environmentTint.x, lighting.environmentTint.y, lighting.environmentTint.z};
+  const float envIntensity = lighting.environmentIntensity;
+  const float3 zUp = float3{0.0f, 0.0f, 1.0f};
+
+  const float3 zenith = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, zUp, float3{0.0f, 0.0f, 1.0f});
+  const float3 horizon = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, zUp, float3{1.0f, 0.0f, 0.0f});
+  const float3 ground = rtEvaluateEnvironmentRadiance(background, tint, envIntensity, zUp, float3{0.0f, 0.0f, -1.0f});
+
+  require(rtEnvironmentLuminance(zenith) > rtEnvironmentLuminance(ground),
+          "scene up direction should rotate the environment profile with the chosen up axis");
+  require(rtEnvironmentLuminance(horizon) > rtEnvironmentLuminance(ground),
+          "rotated horizon should remain brighter than the ground hemisphere");
+}
+
 } // namespace
 
 int main() {
   try {
     testEnvironmentPdfIsNormalized();
     testEnvironmentRadianceProfileIsShared();
+    testEnvironmentRadianceRespectsSceneUpDir();
     std::cout << "environment_model_test passed" << std::endl;
     return 0;
   } catch (const std::exception& e) {

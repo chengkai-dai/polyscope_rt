@@ -54,19 +54,22 @@ float3 opaqueBsdfNormal(SurfaceHitInfo surf, float3 rayDir) {
   return surf.doubleSided ? faceForwardToRay(surf.normal, rayDir) : surf.normal;
 }
 
-SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame) {
+SurfaceHitInfo intersectGroundPlane(ray r, constant GPUFrameUniforms& frame, constant GPULighting& lighting) {
   SurfaceHitInfo out;
   if (frame.planeColorEnabled.w < 0.5f) return out;
 
-  float3 normal = float3(0, 1, 0);
+  float3 normal = normalize(lighting.sceneUpDir.xyz);
   float planeHeight = frame.planeParams.x;
+  float3 axisMask = abs(normal);
+  float originCoord = axisMask.x > 0.5f ? r.origin.x : (axisMask.y > 0.5f ? r.origin.y : r.origin.z);
+  float dirCoord = axisMask.x > 0.5f ? r.direction.x : (axisMask.y > 0.5f ? r.direction.y : r.direction.z);
+  float normalSign = axisMask.x > 0.5f ? normal.x : (axisMask.y > 0.5f ? normal.y : normal.z);
 
-  if (r.origin.y <= planeHeight) return out;
+  if ((originCoord - planeHeight) * normalSign <= 0.0f) return out;
 
-  float denom = dot(r.direction, normal);
-  if (fabs(denom) < 1e-6f) return out;
+  if (fabs(dirCoord) < 1e-6f) return out;
 
-  float t = (planeHeight - dot(r.origin, normal)) / denom;
+  float t = (planeHeight - originCoord) / dirCoord;
   if (t < r.min_distance || t > r.max_distance) return out;
 
   out.hit = 1u;
@@ -255,9 +258,9 @@ SurfaceHitInfo intersectSurface(ray currentRay, device const float4* positions, 
   float3 hitPos = currentRay.origin + currentRay.direction * mcHit.distance;
 
   float2 bary = mcHit.triangle_barycentric_coord;
-  float w0 = 1.0f - bary.x - bary.y;
   float w1 = bary.x;
   float w2 = bary.y;
+  float w0 = 1.0f - w1 - w2;
 
   float3 geomNormal = normalize(cross(p1 - p0, p2 - p0));
   float3 normal = geomNormal;
@@ -617,7 +620,7 @@ SurfaceHitInfo intersectPathSurface(ray currentRay, device const float4* positio
                                     device const float4* texturePixels,
                                     device const GPUCurvePrimitive* curvePrimitives,
                                     device const GPUPointPrimitive* pointPrimitives,
-                                    constant GPUFrameUniforms& frame,
+                                    constant GPUFrameUniforms& frame, constant GPULighting& lighting,
                                     intersector<curve_data, triangle_data, instancing> isector,
                                     instance_acceleration_structure scene, instance_acceleration_structure pointScene,
                                     intersection_function_table<curve_data, triangle_data, instancing> ftable,
@@ -625,7 +628,7 @@ SurfaceHitInfo intersectPathSurface(ray currentRay, device const float4* positio
   SurfaceHitInfo surf = intersectSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
                                          curvePrimitives, pointPrimitives, isector, scene, pointScene, ftable, isoScalars);
   applyContour(surf, currentRay.direction, tanHalfFov, frame.height);
-  SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame);
+  SurfaceHitInfo planeSurf = intersectGroundPlane(currentRay, frame, lighting);
   if (planeSurf.hit != 0u && (surf.hit == 0u || planeSurf.distance < surf.distance)) {
     surf = planeSurf;
   }
@@ -656,7 +659,7 @@ float3 traceStandardPath(ray currentRay, float3 viewDir, SurfaceHitInfo firstHit
       surf = firstHit;
     } else {
       surf = intersectPathSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                  curvePrimitives, pointPrimitives, frame, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
+                                  curvePrimitives, pointPrimitives, frame, lighting, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
     }
     if (surf.hit == 0u) {
       radiance += throughput * evaluateVisibleMissLight(currentRay, prevLightState, lighting, environmentCells);
@@ -782,7 +785,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
 
   for (uint bounce = 0u; bounce < max(remainingBounces, 1u); ++bounce) {
     SurfaceHitInfo surf = intersectPathSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                               curvePrimitives, pointPrimitives, frame, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
+                                               curvePrimitives, pointPrimitives, frame, lighting, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
     if (surf.hit == 0u) {
       radiance += throughput * evaluateVisibleMissLight(currentRay, prevLightState, lighting, environmentCells);
       break;
@@ -944,7 +947,7 @@ float3 traceSpecularPath(ray currentRay, uint remainingBounces, device const flo
     float tanHalfFov = tan(0.5f * camera.clipData.x);
 
     SurfaceHitInfo surf = intersectPathSurface(currentRay, positions, normals, texcoords, vertexColors, triangles, materials, textures, texturePixels,
-                                               curvePrimitives, pointPrimitives, frame, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
+                                               curvePrimitives, pointPrimitives, frame, lighting, isector, scene, pointScene, ftable, isoScalars, tanHalfFov);
     if (surf.hit != 0u) {
       if (frame.renderMode == 0u) {
         sampleColor =

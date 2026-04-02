@@ -24,6 +24,7 @@ std::vector<GPUEnvironmentSampleCell> buildEnvironmentSampleCells(const Lighting
   double totalWeight = 0.0;
 
   float3 backgroundColor = float3{lighting.backgroundColor.x, lighting.backgroundColor.y, lighting.backgroundColor.z};
+  float3 sceneUpDir = float3{lighting.sceneUpDir.x, lighting.sceneUpDir.y, lighting.sceneUpDir.z};
   float3 environmentTint = float3{lighting.environmentTint.x, lighting.environmentTint.y, lighting.environmentTint.z};
   float environmentIntensity = std::max(lighting.environmentIntensity, 0.0f);
 
@@ -41,7 +42,8 @@ std::vector<GPUEnvironmentSampleCell> buildEnvironmentSampleCells(const Lighting
       const uint32_t idx = row * sampleWidth + col;
       const float phi = 2.0f * kPi * (static_cast<float>(col) + 0.5f) / static_cast<float>(sampleWidth);
       const float3 dir = float3{std::cos(phi) * sinTheta, cosTheta, std::sin(phi) * sinTheta};
-      const float3 radiance = rtEvaluateEnvironmentRadiance(backgroundColor, environmentTint, environmentIntensity, dir);
+      const float3 radiance =
+          rtEvaluateEnvironmentRadiance(backgroundColor, environmentTint, environmentIntensity, sceneUpDir, dir);
       const float weight = std::max(rtEnvironmentLuminance(radiance), 0.0f) * solidAngle;
       weights[idx] = weight;
       totalWeight += static_cast<double>(weight);

@@ -48,6 +48,7 @@ uint64_t computeRenderStateHash(const rt::RenderConfig& config) {
   hashBytes(seed, config.renderMode);
   hashBytes(seed, config.maxBounces);
   hashBytes(seed, config.lighting.backgroundColor);
+  hashBytes(seed, config.lighting.sceneUpDir);
   hashBytes(seed, config.lighting.mainLightDirection);
   hashBytes(seed, config.lighting.mainLightColor);
   hashBytes(seed, config.lighting.mainLightIntensity);
@@ -434,16 +435,18 @@ rt::RenderConfig PolyscopeRtRuntime::buildRenderConfig(uint32_t samplesPerIterat
   config.groundPlane = appearance_.groundPlane;
 
   // Sync ground plane height with polyscope's bounding box.
+  glm::vec3 sceneUpDir{0.0f, 1.0f, 0.0f};
   int iP = 1;
   float sign = 1.0f;
   switch (polyscope::view::upDir) {
-    case polyscope::UpDir::NegXUp: sign = -1.0f; [[fallthrough]];
-    case polyscope::UpDir::XUp:    iP = 0; break;
-    case polyscope::UpDir::NegYUp: sign = -1.0f; [[fallthrough]];
-    case polyscope::UpDir::YUp:    iP = 1; break;
-    case polyscope::UpDir::NegZUp: sign = -1.0f; [[fallthrough]];
-    case polyscope::UpDir::ZUp:    iP = 2; break;
+    case polyscope::UpDir::NegXUp: iP = 0; sign = -1.0f; sceneUpDir = glm::vec3(-1.0f, 0.0f, 0.0f); break;
+    case polyscope::UpDir::XUp:    iP = 0; sceneUpDir = glm::vec3(1.0f, 0.0f, 0.0f); break;
+    case polyscope::UpDir::NegYUp: iP = 1; sign = -1.0f; sceneUpDir = glm::vec3(0.0f, -1.0f, 0.0f); break;
+    case polyscope::UpDir::YUp:    iP = 1; sceneUpDir = glm::vec3(0.0f, 1.0f, 0.0f); break;
+    case polyscope::UpDir::NegZUp: iP = 2; sign = -1.0f; sceneUpDir = glm::vec3(0.0f, 0.0f, -1.0f); break;
+    case polyscope::UpDir::ZUp:    iP = 2; sceneUpDir = glm::vec3(0.0f, 0.0f, 1.0f); break;
   }
+  config.lighting.sceneUpDir = sceneUpDir;
 
   const auto& [bboxMin, bboxMax] = polyscope::state::boundingBox;
   float bboxBottom = (sign > 0.0f) ? bboxMin[iP] : bboxMax[iP];

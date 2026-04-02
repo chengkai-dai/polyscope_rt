@@ -91,6 +91,7 @@ struct GPUFrameUniforms {
 
 struct GPULighting {
   float4 backgroundColor;
+  float4 sceneUpDir;
   float4 mainLightDirection;
   float4 mainLightColorIntensity;
   float4 environmentTintIntensity;
